@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shopagent"
+version = "0.1.0"
+description = "Conversational shopping assistant (Agentic Commerce Training)"
+requires-python = ">=3.11"
+# Runtime dependencies are pinned in requirements.txt, which stays the single
+# source of truth for this training project.
+
+[tool.setuptools.packages.find]
+where = ["src"]

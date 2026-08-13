@@ -1,0 +1,14 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# local-only working notes: plans, wrap-ups (never pushed)
+notes/
+
+# build artifacts
+*.egg-info/
+build/
+dist/
