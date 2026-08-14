@@ -206,6 +206,41 @@ def test_cached_discount_is_per_model(monkeypatch):
     assert pricey.cost_usd == pytest.approx(cheap.cost_usd * 5)
 
 
+def test_cached_tokens_above_prompt_tokens_do_not_go_negative(fake_pricing):
+    """Malformed input must never produce a negative cost.
+
+    A negative call cost would silently *lower* the session total, so one bad
+    entry would corrupt every number after it.
+    """
+    call = CallUsage(
+        FAKE_MODEL, prompt_tokens=100, completion_tokens=0, cached_tokens=500
+    )
+
+    assert call.cost_usd >= 0
+    # clamped to prompt_tokens: 100 * 0.10 / 1M
+    assert call.cost_usd == pytest.approx(0.00001)
+    # the raw field stays untouched so the anomaly remains visible
+    assert call.cached_tokens == 500
+
+
+def test_negative_cached_tokens_are_clamped_to_zero(fake_pricing):
+    call = CallUsage(
+        FAKE_MODEL, prompt_tokens=100, completion_tokens=0, cached_tokens=-50
+    )
+
+    # billed as if nothing was cached: 100 * 1.0 / 1M
+    assert call.cost_usd == pytest.approx(0.0001)
+
+
+def test_session_total_stays_correct_with_malformed_entry(fake_pricing):
+    """A bad entry must not drag the session total below the valid calls."""
+    tracker = UsageTracker()
+    tracker.record(FAKE_MODEL, 1_000, 500)                      # $0.002
+    tracker.record(FAKE_MODEL, 100, 0, cached_tokens=99_999)    # clamped
+
+    assert tracker.total_cost_usd >= 0.002
+
+
 def test_real_prices_have_three_entries():
     """Sanity: every PRICING entry must be (input, output, cached_input)."""
     for model, pricing in usage_mod.PRICING.items():

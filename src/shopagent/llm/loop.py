@@ -75,8 +75,9 @@ def main() -> None:
         parts: list[str] = []
 
         print("\nshopagent> ", end="", flush=True)
+        stream = client.stream_chat(messages)
         try:
-            for delta in client.stream_chat(messages):
+            for delta in stream:
                 print(delta, end="", flush=True)
                 parts.append(delta)
             print()
@@ -90,6 +91,13 @@ def main() -> None:
             messages.pop()
             _print_cost(tracker, calls_before)
             continue
+        finally:
+            # Close the generator explicitly so its finally branch runs here and
+            # now. Without this, an interrupt raised in the loop body above
+            # leaves the generator suspended, and recording the call would
+            # depend on CPython's refcounting collecting it — true today, but
+            # not a language guarantee.
+            stream.close()
 
         answer = "".join(parts)
         if answer:

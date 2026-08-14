@@ -55,10 +55,15 @@ class CallUsage:
         if pricing is None:
             return 0.0
         input_per_1m, output_per_1m, cached_input_per_1m = pricing
-        uncached_tokens = self.prompt_tokens - self.cached_tokens
+        # cached_tokens is meant to be a subset of prompt_tokens. Bad upstream
+        # data or a hand-written call can break that, and an unclamped value
+        # yields a negative cost that quietly lowers the session total. The
+        # field itself is left untouched so the anomaly stays visible.
+        cached_tokens = min(max(self.cached_tokens, 0), max(self.prompt_tokens, 0))
+        uncached_tokens = self.prompt_tokens - cached_tokens
         return (
             uncached_tokens * input_per_1m
-            + self.cached_tokens * cached_input_per_1m
+            + cached_tokens * cached_input_per_1m
             + self.completion_tokens * output_per_1m
         ) / 1_000_000
 
