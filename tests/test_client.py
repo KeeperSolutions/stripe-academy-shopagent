@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from shopagent.llm import usage as usage_mod
-from shopagent.llm.client import LLMClient
+from shopagent.llm.client import AssistantMessage, LLMClient, ToolCall
 from shopagent.llm.usage import UsageTracker
 
 MODEL = "fake-model"
@@ -150,3 +150,163 @@ def test_temperature_is_omitted_when_none(client):
 
     list(client.stream_chat(MSGS, temperature=0))
     assert sent["temperature"] == 0, "zero is falsy — it must not be swallowed"
+
+
+# --- chat_with_tools (D2) ----------------------------------------------
+#
+# Non-streaming on purpose: assembling tool calls from streamed deltas means
+# accumulating name and fragmented arguments per index, which D2 does not do.
+
+
+def _sdk_tool_call(call_id, name, arguments, type_="function"):
+    return SimpleNamespace(
+        id=call_id,
+        type=type_,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def _response(content=None, tool_calls=None, usage=None):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content=content, tool_calls=tool_calls
+        ))],
+        usage=usage if usage is not None else _usage(),
+    )
+
+
+def _install_response(client, response):
+    sent = {}
+
+    def capture(**kw):
+        sent.update(kw)
+        return response
+
+    client._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=capture))
+    )
+    return sent
+
+
+def test_chat_with_tools_returns_plain_text_when_no_tool_is_called(client):
+    _install_response(client, _response(content="Hello."))
+
+    reply = client.chat_with_tools(MSGS, tools=[])
+
+    assert reply.content == "Hello."
+    assert reply.tool_calls == []
+
+
+def test_chat_with_tools_unpacks_id_name_and_raw_arguments(client):
+    _install_response(client, _response(
+        tool_calls=[_sdk_tool_call("call_1", "get_time", '{"timezone": "UTC"}')]
+    ))
+
+    reply = client.chat_with_tools(MSGS, tools=[{"type": "function"}])
+
+    assert reply.tool_calls == [ToolCall("call_1", "get_time", '{"timezone": "UTC"}')]
+
+
+def test_arguments_stay_a_raw_string(client):
+    """The registry validates them; parsing here would duplicate that, badly."""
+    _install_response(client, _response(
+        tool_calls=[_sdk_tool_call("call_1", "echo", "{not json")]
+    ))
+
+    reply = client.chat_with_tools(MSGS, tools=[{"type": "function"}])
+
+    assert reply.tool_calls[0].arguments == "{not json"
+
+
+def test_content_may_be_none_alongside_tool_calls(client):
+    _install_response(client, _response(
+        content=None, tool_calls=[_sdk_tool_call("call_1", "get_time", "{}")]
+    ))
+
+    reply = client.chat_with_tools(MSGS, tools=[{"type": "function"}])
+
+    assert reply.content is None
+    assert len(reply.tool_calls) == 1
+
+
+def test_chat_with_tools_records_usage_including_cached_tokens(client):
+    _install_response(client, _response(content="Hi"))
+
+    reply = client.chat_with_tools(MSGS, tools=[])
+
+    assert len(client.tracker.calls) == 1
+    assert reply.usage is client.tracker.calls[0]
+    assert (reply.usage.prompt_tokens, reply.usage.cached_tokens) == (1_000, 800)
+
+
+def test_tools_parameter_is_omitted_when_there_are_none(client):
+    """An empty `tools` list is a 400, not "no tools"."""
+    sent = _install_response(client, _response(content="Hi"))
+
+    client.chat_with_tools(MSGS, tools=[])
+    assert "tools" not in sent
+
+    client.chat_with_tools(MSGS, tools=None)
+    assert "tools" not in sent
+
+    client.chat_with_tools(MSGS, tools=[{"type": "function"}])
+    assert sent["tools"] == [{"type": "function"}]
+
+
+def test_reasoning_effort_is_sent_with_tools_when_configured(client):
+    """gpt-5.6-luna rejects function tools unless reasoning_effort is 'none'."""
+    client.reasoning_effort = "none"
+    sent = _install_response(client, _response(content="Hi"))
+
+    client.chat_with_tools(MSGS, tools=[{"type": "function"}])
+
+    assert sent["reasoning_effort"] == "none"
+
+
+def test_reasoning_effort_is_omitted_when_unset(client):
+    """Models that do not know the parameter return 400 if it is sent."""
+    client.reasoning_effort = None
+    sent = _install_response(client, _response(content="Hi"))
+
+    client.chat_with_tools(MSGS, tools=[{"type": "function"}])
+
+    assert "reasoning_effort" not in sent
+
+
+def test_non_function_tool_calls_are_ignored(client):
+    """The response type is a union; only function calls are dispatchable."""
+    _install_response(client, _response(tool_calls=[
+        _sdk_tool_call("call_1", "get_time", "{}"),
+        SimpleNamespace(id="call_2", type="custom", custom=SimpleNamespace(input="x")),
+    ]))
+
+    reply = client.chat_with_tools(MSGS, tools=[{"type": "function"}])
+
+    assert [c.id for c in reply.tool_calls] == ["call_1"]
+
+
+def test_to_message_carries_tool_calls_in_the_api_shape(client):
+    """Replay the call ids verbatim, or the matching tool messages are orphans."""
+    reply = AssistantMessage(
+        content=None,
+        tool_calls=[ToolCall("call_1", "get_time", '{"timezone": "UTC"}')],
+        usage=client.tracker.record(MODEL, 1, 1),
+    )
+
+    assert reply.to_message() == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_time", "arguments": '{"timezone": "UTC"}'},
+        }],
+    }
+
+
+def test_to_message_omits_the_key_entirely_when_there_are_no_tool_calls(client):
+    reply = AssistantMessage(
+        content="Hello.", tool_calls=[], usage=client.tracker.record(MODEL, 1, 1)
+    )
+
+    assert reply.to_message() == {"role": "assistant", "content": "Hello."}
