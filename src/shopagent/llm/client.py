@@ -183,6 +183,48 @@ class LLMClient:
             content=message.content, tool_calls=tool_calls, usage=call
         )
 
+    def chat_structured(
+        self,
+        messages: Sequence[Message],
+        schema: dict[str, Any],
+        schema_name: str,
+    ) -> tuple[str, CallUsage]:
+        """Force the answer into `schema` and return it as raw JSON text.
+
+        The text is returned unparsed on purpose: the caller owns the Pydantic
+        model and validates against it, so the shape is checked in one place
+        rather than half here and half there.
+
+        `strict` is on. Unlike function tools, `response_format` needs no
+        `reasoning_effort` — that constraint is specific to tools (verified
+        against the live API on 2026-08-17). It does need a schema in strict
+        form; see `llm.structured.strict_schema_for`.
+        """
+        response = self._client.chat.completions.create(
+            model=self.model,
+            messages=list(messages),
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "schema": schema,
+                    "strict": True,
+                },
+            },
+        )
+        call = self._record(response.usage)
+        if call is None:
+            call = self.tracker.record(self.model, 0, 0)
+
+        message = response.choices[0].message
+        refusal = getattr(message, "refusal", None)
+        if refusal:
+            # A refusal arrives instead of content, not as an error status, so
+            # nothing else would notice it — the caller would just see empty
+            # text and report it as malformed JSON.
+            raise ValueError(f"the model refused to answer: {refusal}")
+        return message.content or "", call
+
     def stream_chat(
         self, messages: Sequence[Message], temperature: float | None = None
     ) -> Iterator[str]:
