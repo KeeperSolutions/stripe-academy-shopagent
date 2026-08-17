@@ -65,9 +65,11 @@ ends the conversation.
 name the field, state what was expected and say what to do next. The model is
 their only reader, and its next turn depends on them.
 
-**Tests use no network and do not import the OpenAI SDK.** Fakes mirror the
-shape of real API objects instead — including the awkward ones, such as the
-final streaming chunk that carries usage alongside an empty `choices` list.
+**Tests reach no network and call no SDK method.** Importing `openai` is fine —
+`tests/test_client.py` imports `LLMClient`, which pulls it in — but the client
+object is replaced by a fake before any call. The fakes mirror the shape of real
+API objects, including the awkward ones, such as the final streaming chunk that
+carries usage alongside an empty `choices` list.
 
 ## Commands
 
