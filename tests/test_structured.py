@@ -221,6 +221,27 @@ def test_the_field_descriptions_survive_the_transform():
     assert "cent" in props["max_price_cents"]["description"].lower()
 
 
+def test_the_keywords_description_says_to_keep_the_product_noun():
+    """Measured failure: "blue jacket between $40 and $79.99" came back with
+    category='jackets', color='blue' and keywords=[].
+
+    An earlier wording said only "product words, drop prices, sizes and
+    colours", and the model applied that to the noun that had gone into
+    `category` as well, leaving nothing behind. D3 searches on this list, so an
+    empty one matches nothing for a query that named a product outright.
+
+    The first attempt at a fix then swung the other way: telling the model to
+    "always include the product" emptied the list for "something warm for
+    winter", which names no product noun at all. Both cases need spelling out,
+    so both are pinned here.
+    """
+    description = PRODUCT_QUERY_SCHEMA["properties"]["keywords"]["description"].lower()
+
+    assert "category" in description, "the overlap with category must be spelled out"
+    assert "empty" in description, "and so must the consequence of leaving it empty"
+    assert "describ" in description, "and the case where no product noun is named"
+
+
 # --- the strict transform -----------------------------------------------
 #
 # Confirmed against the live API on 2026-08-17: without these two changes the

@@ -48,9 +48,15 @@ class ProductQuery(BaseModel):
 
     keywords: list[str] = Field(
         description=(
-            "The words to search the catalogue for, e.g. ['running', 'shoes']. "
-            "Product words only — drop prices, sizes and colours, they have "
-            "their own fields."
+            "The words to search the catalogue with. The search matches on this "
+            "list, so an empty list finds nothing. Include the product noun "
+            "itself, even when that same word also fills the category field: "
+            "'blue jacket under $80' is ['jacket'], not []. When the text "
+            "describes what is wanted without naming a product, use the "
+            "describing words: 'something warm for winter' is "
+            "['warm', 'winter']. Leave out prices, sizes and colours, which "
+            "have their own fields. Empty only when the text is not about a "
+            "product at all, such as a greeting."
         ),
     )
     category: str | None = Field(
