@@ -160,6 +160,23 @@ reasoning but keeps conversation state server-side and would hide the loop this
 project exists to show, or switch to a model without the restriction. Neither
 is free, and the decision is deferred rather than made.
 
+**A prompt instruction is not a guardrail.** The system prompt tells the model
+never to do arithmetic in its head. Asked for *"the sine of 30 degrees multiplied
+by 4"* and *"5 factorial"*, it made **zero tool calls** and answered `2` and
+`120` from memory. Both were correct, which is the uncomfortable part — nothing
+in the output marked them as unverified. The calculator genuinely cannot express
+either operation, so the model was choosing between a useless refusal and a
+right answer and chose well; the failure is that it chose *silently*. Two
+tempting fixes are both wrong. Sharpening the wording would make these two
+examples comply and teach nothing, since the instruction being ignored is
+already explicit. Teaching the calculator `sin(...)` means allowing `ast.Call`,
+which is the single rule keeping every injection vector out. The answer belongs
+in `agent/guardrails.py` on D9 — validate the output in code instead of asking
+the model to behave. It is the same shape as the price rule waiting there: an
+amount that appears in an answer without appearing in the context has to be
+blocked, not discouraged. Cheap to learn on a sine; expensive to learn on a
+checkout total.
+
 **Prompt caching never engaged.** The system prompt and both tool schemas repeat
 on every call, which is exactly the shape caching rewards, yet `cached_tokens`
 was `0` in every call measured. The prompt peaked at 975 tokens and OpenAI's
