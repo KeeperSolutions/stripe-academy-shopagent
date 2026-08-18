@@ -154,15 +154,23 @@ def _messages(text: str) -> list[Message]:
 def parse_product_query(text: str, client: LLMClient | None = None) -> ProductQuery:
     """Extract a `ProductQuery` from free text.
 
-    Raises StructuredOutputError if the answer is not JSON, or is JSON that
-    does not satisfy the model. Strict mode makes both unlikely, not
+    Raises StructuredOutputError if the model refuses, or answers with
+    something that is not JSON, or with JSON that does not satisfy the model. Strict mode makes both unlikely, not
     impossible: a refusal, a truncated answer or a schema change all land here,
     and a bare JSONDecodeError three frames down says nothing useful about why.
     """
     client = client if client is not None else LLMClient()
-    content, _usage = client.chat_structured(
-        _messages(text), PRODUCT_QUERY_SCHEMA, "product_query"
-    )
+    try:
+        content, _usage = client.chat_structured(
+            _messages(text), PRODUCT_QUERY_SCHEMA, "product_query"
+        )
+    except ValueError as exc:
+        # A refusal surfaces from the client as a plain ValueError. It is one
+        # of the failures this function documents, so it leaves as the same
+        # type as the others — a caller should not need two except branches
+        # for "no usable answer". Anything that is not a ValueError (a
+        # transport error, say) is a different problem and travels untouched.
+        raise StructuredOutputError(str(exc)) from exc
 
     try:
         payload = json.loads(content)

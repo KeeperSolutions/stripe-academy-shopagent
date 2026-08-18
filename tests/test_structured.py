@@ -163,6 +163,33 @@ def test_a_missing_required_field_names_it():
         parse(payload)
 
 
+def test_a_refusal_from_the_client_becomes_a_structured_output_error():
+    """`chat_structured` raises ValueError when the model refuses.
+
+    This function documents StructuredOutputError as its failure mode, and a
+    refusal is one of the cases the docstring names. Letting a bare ValueError
+    through would make every caller handle two exception types for one outcome.
+    """
+
+    class Refusing:
+        def chat_structured(self, messages, schema, schema_name):
+            raise ValueError("the model refused to answer: I cannot help with that")
+
+    with pytest.raises(StructuredOutputError, match="refus"):
+        parse_product_query("anything", client=Refusing())
+
+
+def test_an_unexpected_client_error_is_not_swallowed_as_a_parse_failure():
+    """Only ValueError is translated; a transport failure must stay itself."""
+
+    class Broken:
+        def chat_structured(self, messages, schema, schema_name):
+            raise ConnectionError("network is down")
+
+    with pytest.raises(ConnectionError):
+        parse_product_query("anything", client=Broken())
+
+
 def test_the_error_carries_what_the_model_actually_returned():
     """Without it, debugging a bad parse means reproducing the call."""
     with pytest.raises(StructuredOutputError, match="not json"):

@@ -173,7 +173,7 @@ def main() -> None:
             print("[conversation history cleared; session cost is kept]")
             continue
         if user_input == "/tools":
-            for spec in (REGISTRY.get(name) for name in REGISTRY.names()):
+            for spec in REGISTRY.specs():
                 print(f"  {spec.name}: {spec.description}")
             continue
 

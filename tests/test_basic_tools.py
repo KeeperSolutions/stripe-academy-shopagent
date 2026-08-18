@@ -19,6 +19,12 @@ from shopagent.tools.basic import MAX_EXPONENT, REGISTRY, calculator, get_time
 # cannot start failing in March.
 TOKYO_OFFSET = timedelta(hours=9)
 
+# Upper bound for "the guard refused instead of computing". Generous on
+# purpose: the guarded path measures in microseconds, so anything under a few
+# seconds still means the arithmetic never ran, while a missing guard takes
+# minutes.
+MAX_GUARD_SECONDS = 5.0
+
 
 # --- get_time ----------------------------------------------------------
 
@@ -57,7 +63,11 @@ def test_unknown_timezone_is_reported_to_the_model_not_raised():
 
 
 def test_unknown_timezone_message_shows_an_example():
-    """"Use an IANA name" is useless to a model that just produced one it thought was IANA."""
+    """Naming the standard is not enough on its own.
+
+    A model that offered 'PST' believed that was an IANA name, so the message
+    has to show the Area/City shape rather than repeat the word IANA.
+    """
     result = REGISTRY.dispatch("get_time", '{"timezone": "PST"}')
 
     assert result.ok is False
@@ -163,7 +173,14 @@ def test_huge_exponent_is_refused_quickly():
 
     elapsed = time.perf_counter() - started
     assert result.ok is False
-    assert elapsed < 1.0, f"took {elapsed:.2f}s — the guard ran too late or not at all"
+    # Timing is the assertion because "refused" and "computed, then refused"
+    # produce the same ToolResult; only the clock separates them. The real
+    # measurement is ~0.01 ms, so this bound is around five orders of
+    # magnitude of headroom — loose enough for a contended CI runner, tight
+    # enough that an unguarded 2**10000000 still trips it.
+    assert elapsed < MAX_GUARD_SECONDS, (
+        f"took {elapsed:.2f}s — the guard ran too late or not at all"
+    )
 
 
 def test_the_exponent_ceiling_reports_the_exponent_itself():
@@ -188,7 +205,7 @@ def test_stacked_exponents_are_refused_quickly():
 
     elapsed = time.perf_counter() - started
     assert result.ok is False
-    assert elapsed < 1.0, f"took {elapsed:.2f}s"
+    assert elapsed < MAX_GUARD_SECONDS, f"took {elapsed:.2f}s"
 
 
 def test_a_result_too_big_to_print_does_not_escape_dispatch():

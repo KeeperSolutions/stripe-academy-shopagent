@@ -125,6 +125,17 @@ def test_get_returns_none_for_an_unknown_name(registry):
     assert registry.get("nope") is None
 
 
+def test_specs_returns_every_registered_spec(registry):
+    """Callers that need the specs should not go through get() and a None check."""
+    registry.register(BOOM_SPEC)
+
+    assert registry.specs() == [ECHO_SPEC, BOOM_SPEC]
+
+
+def test_specs_is_empty_for_an_empty_registry():
+    assert ToolRegistry().specs() == []
+
+
 def test_registering_the_same_name_twice_raises():
     """A collision is a bug in our code, not model input — fail loudly."""
     reg = ToolRegistry()

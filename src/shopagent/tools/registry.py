@@ -160,6 +160,15 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._specs)
 
+    def specs(self) -> list[ToolSpec]:
+        """Every registered tool, in registration order.
+
+        For callers that want the specs themselves. Going through `get()` in a
+        loop would hand them a `ToolSpec | None` that can never actually be
+        None, which reads as a missing check.
+        """
+        return list(self._specs.values())
+
     def openai_schemas(self) -> list[dict[str, Any]]:
         """Every registered tool, ready for the `tools` parameter."""
         return [spec.to_openai_schema() for spec in self._specs.values()]
