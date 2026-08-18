@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(min_length=1)
     openai_model: str = "gpt-5.6-luna"
     embedding_model: str = "text-embedding-3-small"
+    # Sent only alongside function tools. gpt-5.6-luna rejects tools on
+    # /v1/chat/completions with 400 unless this is 'none' ("use /v1/responses
+    # or set reasoning_effort to 'none'"), and this project stays on Chat
+    # Completions on purpose. Blank means the parameter is not sent at all,
+    # which is what a model that does not know it needs (e.g. gpt-4o-mini).
+    openai_reasoning_effort: OptionalStr = "none"
 
     # --- Infrastructure (D3, D6) ---
     database_url: str = (
