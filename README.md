@@ -30,9 +30,15 @@ docker compose up -d
 docker compose exec db psql -U shopagent -d shopagent \
   -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
-# 5. verify
+# 5. catalog (schema, 30 products, vectors + HNSW index)
+python scripts/create_schema.py
+python scripts/seed_catalog.py
+python scripts/embed_catalog.py
+
+# 6. verify
 docker compose exec db psql -U shopagent -d shopagent \
   -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
+pytest tests/ -v          # 227 tests; add -m network for the 4 that call the API
 ```
 
 Postgres listens on `localhost:5432` (user / password / db: `shopagent`), with data
@@ -137,6 +143,81 @@ enough: the system prompt states the rule with worked examples ("under $100" is
 the way lax mode does, and `ge=0` rejects a negative bound. `"something warm for
 winter, not too expensive"` returned `None` for both price fields rather than
 inventing a number.
+
+### Day 3 — findings
+
+**Semantic search answers a question keyword search cannot see.** The same
+string through both modes, against the same thirty products:
+
+```
+query: "something to run in when it's raining"
+
+  keyword  (ILIKE)     0 results
+  semantic (<=>)       5 results
+     1. Trail Runner GTX       shoes         9499c   GORE-TEX, spray, slick stone
+     2. Storm Pace 4           shoes         8999c   wet mornings, standing water
+     3. Runner's Cap           accessories   2999c   water-repellent brim
+     4. Cloud Sprint 2         shoes         7499c
+     5. Packable Wind Jacket   jackets       4999c
+
+query: "keeping my gear dry on a boat"
+
+  keyword  (ILIKE)     0 results
+  semantic (<=>)       5 results
+     1. Dry Duffel 40L         bags          9999c   welded, roll-top, open deck
+     2. Hydration Vest 5L      equipment    11999c
+     3. Packable Wind Jacket   jackets       4999c
+     4. Compact Dry Bag 10L    equipment     1999c
+     5. Storm Pace 4           shoes         8999c
+```
+
+The zero on the keyword side is the whole point and it is not an accident: the
+letters `rain` appear nowhere in the seed, and `tests/test_seed.py` fails if
+anyone adds them. Nothing lexical connects the query to a GORE-TEX membrane, so
+ILIKE has nothing to match, while the two shoes whose copy is about wet ground
+come back first and second from the vector search. The ranking beyond the top
+two is looser — a cap outranks a shoe on the first query, and a hydration vest
+places second on a query about keeping kit dry — which is the honest shape of
+embedding search on thirty items: the top of the list is right, the tail is
+approximate.
+
+**The whole catalog costs $0.000027 to embed.** Thirty products,
+`name + brand + category + description` joined, 1,336 tokens in one batched
+`text-embedding-3-small` call. Re-running the script spends nothing at all: it
+selects the products whose `embedding` is NULL, finds none, and never opens a
+connection to the API. `--force` is the way to pick up an edited description,
+because editing prose does not make a stored vector NULL. `text-embedding-3-small`
+had to be added to `PRICING` in `llm/usage.py`, with the output price at 0.0 —
+an embedding call has no completion to bill.
+
+**The HNSW index is decorative at this size.** It exists because the syntax is
+worth knowing:
+
+```sql
+CREATE INDEX ix_products_embedding_hnsw ON products USING hnsw (embedding vector_cosine_ops);
+```
+
+With thirty rows Postgres will sequential-scan the table faster than it can
+descend a graph, and the planner is free to ignore the index entirely — which
+it should. The detail that does matter at any size is `vector_cosine_ops`: an
+index built for one operator class is silently unused by a query ranking with a
+different operator, and `search.py` ranks with `<=>`. It is also built after
+the vectors exist, since an index over an all-NULL column has nothing to build.
+
+**Filtering stays in SQL, ranking only changes the ORDER BY.** The trap here is
+easy to fall into and quiet when you do: rank the five nearest products, then
+drop the ones over the price limit in Python, and a search for running shoes
+under $100 returns two results while the shop holds four. Every filter is a
+WHERE predicate, the distance is an ORDER BY, and LIMIT runs last. There is a
+test that pins it — the nearest product by construction is the one too
+expensive to qualify, and it must not come back.
+
+**Prompt caching still has nothing to bite on.** The D2 gap is unchanged, and
+D3 was never going to change it: the catalog is not exposed as tools until D4.
+Measured again on the current build — 535 prompt tokens, `cached_tokens` 0 on
+both a first and an immediately repeated call, against OpenAI's 1,024-token
+minimum. The accounting works and is tested; the prompt is simply too small.
+D5 is where it should finally engage, when MCP supplies the catalog schemas.
 
 ### Known gaps
 
