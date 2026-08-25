@@ -93,6 +93,7 @@ class LLMClient:
         # bare OpenAI() would always fail with "Missing credentials".
         self._client = OpenAI(api_key=settings.openai_api_key)
         self.model = settings.openai_model
+        self.embedding_model = settings.embedding_model
         self.reasoning_effort = settings.openai_reasoning_effort
         self.tracker = tracker if tracker is not None else UsageTracker()
 
@@ -224,6 +225,36 @@ class LLMClient:
             # text and report it as malformed JSON.
             raise ValueError(f"the model refused to answer: {refusal}")
         return message.content or "", call
+
+    def embed(self, texts: Sequence[str]) -> tuple[list[list[float]], CallUsage]:
+        """Embed a batch of texts in one call; return the vectors and the usage.
+
+        One request for the whole batch, not one per text. Thirty separate
+        calls cost thirty round trips and thirty chances to hit a rate limit,
+        for the same tokens.
+
+        Usage is recorded against `embedding_model`, not `model` — they are
+        different models with different prices, and recording an embedding
+        under the chat model's name would put a wrong number in the session
+        total. The embeddings endpoint reports `prompt_tokens` and nothing to
+        complete, so completion is 0.
+
+        The vectors come back sorted by `index`. The API returns them in order
+        already; sorting costs nothing and removes the need to trust that.
+        """
+        if not texts:
+            raise ValueError("embed() needs at least one text; got an empty batch")
+
+        response = self._client.embeddings.create(
+            model=self.embedding_model, input=list(texts)
+        )
+        call = self.tracker.record(
+            model=self.embedding_model,
+            prompt_tokens=response.usage.prompt_tokens,
+            completion_tokens=0,
+        )
+        vectors = [item.embedding for item in sorted(response.data, key=lambda d: d.index)]
+        return vectors, call
 
     def stream_chat(
         self, messages: Sequence[Message], temperature: float | None = None

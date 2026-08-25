@@ -27,6 +27,11 @@ from shopagent.catalog.search import (
 )
 from shopagent.catalog.seed import seed_catalog
 
+# Every test in this file talks to Postgres. See the marker table in
+# pyproject.toml: `pytest tests/` runs these, and skips nothing offline except
+# the API-backed ones.
+pytestmark = pytest.mark.db
+
 
 @pytest.fixture
 def catalog(session):
@@ -70,7 +75,11 @@ def test_an_unfiltered_search_returns_products_and_respects_the_limit(catalog):
 
 def test_a_search_that_matches_nothing_returns_an_empty_list_not_none(catalog):
     results = search_products(
-        query="Cloud Sprint 2", category="bags", max_price_cents=100, session=catalog
+        query="Cloud Sprint 2",
+        category="bags",
+        max_price_cents=100,
+        mode="keyword",
+        session=catalog,
     )
 
     assert results == []
@@ -144,38 +153,46 @@ def test_size_and_colour_match_case_insensitively(catalog):
 
 
 def test_query_matches_a_product_name(catalog):
-    results = search_products(query="Trail Runner", limit=50, session=catalog)
+    results = search_products(
+        query="Trail Runner", limit=50, mode="keyword", session=catalog
+    )
 
     assert names(results) == {"Trail Runner GTX"}
 
 
 def test_query_matches_words_only_in_the_description(catalog):
-    results = search_products(query="carbon plate", limit=50, session=catalog)
+    results = search_products(
+        query="carbon plate", limit=50, mode="keyword", session=catalog
+    )
 
     assert names(results) == {"Summit Peak Pro"}
 
 
 def test_query_matches_a_brand(catalog):
-    results = search_products(query="Cobbleway", limit=50, session=catalog)
+    results = search_products(
+        query="Cobbleway", limit=50, mode="keyword", session=catalog
+    )
 
     assert results
     assert all(result["brand"] == "Cobbleway" for result in results)
 
 
 def test_the_weather_word_finds_nothing_at_all(catalog):
-    """The baseline step 4 has to beat.
+    """The baseline the semantic search has to beat.
 
     Keyword search cannot answer this question, because the catalog never says
-    the word. When the same query returns shoes in step 4, the difference is
-    the embedding and nothing else.
+    the word. `tests/test_embeddings.py` runs the same query semantically and
+    gets the weatherproof shoes; the difference between the two results is the
+    embedding and nothing else.
     """
-    assert search_products(query="rain", limit=50, session=catalog) == []
-    assert search_products(query="raining", limit=50, session=catalog) == []
+    keyword = {"mode": "keyword", "limit": 50, "session": catalog}
+    assert search_products(query="rain", **keyword) == []
+    assert search_products(query="raining", **keyword) == []
 
 
 def test_a_wildcard_in_the_query_is_matched_literally(catalog):
     """A model writing '%' must not turn the search into "everything"."""
-    assert search_products(query="%", limit=50, session=catalog) == []
+    assert search_products(query="%", limit=50, mode="keyword", session=catalog) == []
 
 
 # --- prices that are no longer offered ---------------------------------
@@ -183,7 +200,9 @@ def test_a_wildcard_in_the_query_is_matched_literally(catalog):
 
 def test_a_superseded_price_never_reaches_the_result(catalog):
     """Cloud Sprint 2 size 42 costs 7499 and used to cost 8999."""
-    results = search_products(query="Cloud Sprint", limit=50, session=catalog)
+    results = search_products(
+        query="Cloud Sprint", limit=50, mode="keyword", session=catalog
+    )
 
     prices = {
         variant["price_cents"]
@@ -195,7 +214,9 @@ def test_a_superseded_price_never_reaches_the_result(catalog):
 
 
 def test_the_superseded_price_does_not_duplicate_its_variant(catalog):
-    results = search_products(query="Cloud Sprint", limit=50, session=catalog)
+    results = search_products(
+        query="Cloud Sprint", limit=50, mode="keyword", session=catalog
+    )
 
     skus = [variant["sku"] for variant in every_variant(results)]
 

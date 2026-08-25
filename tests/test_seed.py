@@ -22,6 +22,11 @@ from sqlalchemy import delete, func, select
 from shopagent.catalog.models import Inventory, Price, Product, Variant
 from shopagent.catalog.seed import CATALOG, reset_catalog, seed_catalog
 
+# Every test in this file talks to Postgres. See the marker table in
+# pyproject.toml: `pytest tests/` runs these, and skips nothing offline except
+# the API-backed ones.
+pytestmark = pytest.mark.db
+
 # Derived from the spec rather than typed in, so adding a product does not
 # break the arithmetic. The floors below are what the day actually requires.
 EXPECTED_PRODUCTS = len(CATALOG)

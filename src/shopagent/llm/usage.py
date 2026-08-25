@@ -24,6 +24,12 @@ PRICING: dict[str, tuple[float, float, float]] = {
     "gpt-5.6-terra": (2.00, 12.00, 0.20),
     "gpt-5.6-luna": (0.20, 1.20, 0.02),
     "gpt-4o-mini": (0.15, 0.60, 0.075),
+    # Embedding models bill input only; there is no completion to charge for,
+    # so the output price is 0.0. The cached price is set equal to the input
+    # price rather than to zero: the embeddings endpoint reports no cached
+    # tokens at all, and if a future one did, billing them free would
+    # understate the cost — the failure this table exists to prevent.
+    "text-embedding-3-small": (0.02, 0.00, 0.02),
 }
 
 

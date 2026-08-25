@@ -18,22 +18,31 @@ to an already-truncated set. Ask for five shoes under $50 and you get whatever
 of the first five happened to qualify — usually nothing — while the shop is
 full of matches. Every predicate below therefore reaches the database.
 
-Step 4 adds vector ranking by changing the ordering of the candidate query
-only. The signatures, the result shape and the filters stay as they are.
+Step 4 added vector ranking, and it changed the ORDER BY of the candidate query
+and nothing else. The filters, the two-pass structure and the result shape are
+the same ones step 3 tested. `mode` chooses which kind of matching a query
+means; every other argument behaves identically either way.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import ColumnElement, Select, func, or_, select
 from sqlalchemy.orm import Session
 
+from shopagent.catalog.embeddings import embed_query
 from shopagent.catalog.models import Inventory, Price, Product, Variant
 from shopagent.config import get_settings
 from shopagent.db import session_scope
+
+# How a `query` is matched. "semantic" embeds it and ranks by cosine distance;
+# "keyword" keeps the ILIKE of step 3, which is what the README comparison
+# needs and what still answers an exact-name search ("Trail Runner GTX") more
+# sharply than a vector does.
+SearchMode = Literal["semantic", "keyword"]
 
 # An upper bound on `limit`. The caller on D9 is a language model filling in a
 # number, and "show me everything" turning into 10,000 rows of prompt is a real
@@ -158,6 +167,7 @@ def _priced_variants_of(*only_products: Any) -> Select[Any]:
 def candidate_products_statement(
     *,
     query: str | None = None,
+    query_embedding: Sequence[float] | None = None,
     category: str | None = None,
     max_price_cents: int | None = None,
     min_price_cents: int | None = None,
@@ -169,13 +179,37 @@ def candidate_products_statement(
 
     Public so the SQL can be read — by a test asserting the predicates are in
     the WHERE clause, and by a person compiling it to see what actually runs.
-    Step 4 changes the ORDER BY here and nothing else.
+    It builds SQL and makes no API call: the caller embeds the query and hands
+    the vector in, which is what keeps this function testable offline.
+
+    `query_embedding` decides the kind of match. Given one, the query ranks by
+    cosine distance and `query` is not used as a text filter — gating a
+    semantic search on a literal match would defeat the entire point of it.
+    Given none, a `query` filters with ILIKE, exactly as in step 3.
+
+    The vector changes only the ORDER BY. Every filter still sits in the WHERE
+    clause, and the LIMIT still runs after them, which is the trap the plan
+    warns about: rank first and filter afterwards, and a search for shoes under
+    $100 quietly returns the five nearest shoes minus the ones that were too
+    expensive — often nothing, while the shop is full of matches.
     """
     cheapest = func.min(Price.amount_cents).label("cheapest_cents")
-    return (
-        _priced_variants_of(Product.id, cheapest)
+    semantic = query_embedding is not None
+
+    selected: list[Any] = [Product.id, cheapest]
+    if semantic:
+        # min() over a per-product column is that column; the aggregate is
+        # there because the query groups by product id. `<=>` is pgvector's
+        # cosine distance: 0 is identical, 2 is opposite.
+        distance = func.min(Product.embedding.cosine_distance(query_embedding)).label(
+            "distance"
+        )
+        selected.append(distance)
+
+    statement = (
+        _priced_variants_of(*selected)
         .where(
-            *_product_filters(query=query, category=category),
+            *_product_filters(query=None if semantic else query, category=category),
             *_variant_filters(
                 max_price_cents=max_price_cents,
                 min_price_cents=min_price_cents,
@@ -184,13 +218,21 @@ def candidate_products_statement(
             ),
         )
         .group_by(Product.id)
-        # Cheapest match first, which is both a sensible default for a shopper
-        # and a total order — without it, LIMIT would return an arbitrary
-        # subset that changes between runs. Product.id breaks ties so the
-        # result is reproducible, which the tests depend on.
-        .order_by(cheapest.asc(), Product.id.asc())
-        .limit(limit)
     )
+
+    if semantic:
+        # NULLS LAST spelled out rather than left to the default: a product
+        # that has never been embedded cannot be ranked, and it belongs behind
+        # everything that can, not in front of it.
+        return statement.order_by(
+            distance.asc().nulls_last(), cheapest.asc(), Product.id.asc()
+        ).limit(limit)
+
+    # Cheapest match first, which is both a sensible default for a shopper and
+    # a total order — without it, LIMIT would return an arbitrary subset that
+    # changes between runs. Product.id breaks ties so the result is
+    # reproducible, which the tests depend on.
+    return statement.order_by(cheapest.asc(), Product.id.asc()).limit(limit)
 
 
 def _rows_to_products(rows: Sequence[Any], order: Sequence[int]) -> list[dict]:
@@ -233,15 +275,32 @@ def search_products(
     color: str | None = None,
     limit: int = 5,
     *,
+    mode: SearchMode = "semantic",
+    query_embedding: Sequence[float] | None = None,
     session: Session | None = None,
 ) -> list[dict]:
-    """Find products matching every filter given, cheapest first.
+    """Find products matching every filter given.
+
+    With a `query`, results come back nearest first: the query is embedded and
+    ranked against `products.embedding` by cosine distance. Without one, they
+    come back cheapest first. `mode="keyword"` swaps the ranking for the ILIKE
+    matching of step 3 — kept because the README comparison needs both halves,
+    and because an exact name is still something a substring finds better than
+    a vector.
 
     Returns one dict per product, carrying only the variants that passed the
     variant-level filters — a search for size 42 must not hand the model a 43
     to offer. An empty list means nothing matched; it is never None.
+
+    `query_embedding` skips the embedding call and uses the vector given. It is
+    what lets a caller reuse a vector it already has, and what lets the tests
+    prove the ranking works without spending a token.
     """
     limit = max(1, min(int(limit), MAX_LIMIT))
+
+    if query_embedding is None and mode == "semantic" and query and query.strip():
+        # One API call per search, before any SQL runs.
+        query_embedding = embed_query(query.strip())
 
     variant_filters = _variant_filters(
         max_price_cents=max_price_cents,
@@ -253,6 +312,7 @@ def search_products(
     with _session_for(session) as active_session:
         candidates = candidate_products_statement(
             query=query,
+            query_embedding=query_embedding,
             category=category,
             max_price_cents=max_price_cents,
             min_price_cents=min_price_cents,

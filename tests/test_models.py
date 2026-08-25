@@ -25,6 +25,11 @@ from sqlalchemy.orm import Session
 
 from shopagent.catalog.models import EMBEDDING_DIM, Inventory, Price, Product, Variant
 
+# Every test in this file talks to Postgres. See the marker table in
+# pyproject.toml: `pytest tests/` runs these, and skips nothing offline except
+# the API-backed ones.
+pytestmark = pytest.mark.db
+
 
 def make_product(session: Session, *, sku: str = "SKU-RUN-42") -> Product:
     """A product with one variant, one price and stock — the common fixture body."""

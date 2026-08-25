@@ -21,6 +21,27 @@ from shopagent.catalog.models import Base
 from shopagent.db import ensure_vector_extension, get_engine
 
 
+@pytest.fixture(autouse=True)
+def no_accidental_api_calls(request, monkeypatch):
+    """Make an unmarked test that reaches the OpenAI API fail loudly.
+
+    `search_products` embeds its query by default, so a test that passes one
+    and forgets `mode="keyword"` or `query_embedding=` would quietly spend
+    tokens on every run. That happened once while step 4 was being written,
+    which is why this exists rather than a note asking people to be careful.
+    """
+    if request.node.get_closest_marker("network"):
+        return
+
+    def refuse() -> None:
+        raise AssertionError(
+            "this test tried to call the OpenAI API. Mark it @pytest.mark.network, "
+            'or pass mode="keyword" / query_embedding= to keep it offline.'
+        )
+
+    monkeypatch.setattr("shopagent.catalog.embeddings.default_client", refuse)
+
+
 @pytest.fixture(scope="session")
 def engine():
     """The shared engine, with the schema guaranteed to exist."""
