@@ -91,6 +91,19 @@ output is not valid under strict mode without a transform: it omits
 `additionalProperties: false`, lists only non-defaulted fields in `required`,
 and emits `default` and `title`. Revisit on D5/D9.
 
+**MCP tools are thin wrappers; the business logic stays in `catalog/`.** The
+server may do three things and no more: adapt the shape to the protocol, turn a
+missing row into an exception, and validate arguments the schema cannot express.
+Adapting the shape is why `search_products` returns `{count, results}` — an empty
+list serialises to zero content blocks, and a client reading `content` cannot
+tell "nothing matched" from "nothing happened". Turning `None` into a raise is
+how a client sees `is_error` at all; a returned string describing the failure
+arrives looking exactly like success. Validating is for rules JSON Schema has no
+way to state — a negative price, or a minimum above a maximum — not for anything
+that depends on what the catalog holds. Everything past those three belongs one
+layer down. The test is whether the wrapper would still be correct against a
+different database: if it would not, the logic is in the wrong file.
+
 **A tool's name is written for the model; the function's name is written for
 whoever maintains it, and the two are allowed to differ.** The MCP tool
 `get_product_details` calls `catalog.search.get_product`. `get_product` is right

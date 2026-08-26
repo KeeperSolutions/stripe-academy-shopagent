@@ -26,6 +26,14 @@ is an optimisation for a caller that already holds a vector, which no MCP client
 does. Seven arguments reach the model, and every one is a question a shopper can
 actually answer.
 
+**Three kinds of outcome, and the model has to tell them apart.** A wrong id is
+an error: the model must change the argument or it will never get an answer. A
+filter combination that nothing matches is a *success* carrying zero results:
+the arguments were valid and the shop simply has nothing like that, so the model
+should relax a filter rather than retry. A range that no catalog could ever
+satisfy — a negative price, a minimum above a maximum — is an error again, because
+widening will not help and the model would otherwise loop against an empty shop.
+
 **Nothing here may write to stdout.** stdio transport *is* stdout: a stray
 `print` lands in the middle of a JSON-RPC frame and the client drops the
 connection with a parse error that names neither the print nor the tool. The
@@ -35,8 +43,10 @@ logger writes to stderr, which the client leaves alone.
 from __future__ import annotations
 
 import logging
+import re
+import time
 from importlib.metadata import PackageNotFoundError, version
-from typing import Annotated, Any
+from typing import Annotated, Any, TypedDict
 
 from mcp.server import MCPServer
 from pydantic import Field
@@ -49,6 +59,31 @@ logger = logging.getLogger(__name__)
 # project, because D5 adds a second source of tools (local HTTP commerce) and
 # "shopagent" alone would not say which of the two answered.
 SERVER_NAME = "shopagent-catalog"
+
+# Pydantic's rendering of a validation failure is written for a developer: it
+# ends with a documentation URL and tags each error with an internal type code,
+# and it names the generated argument model rather than the tool. The model is
+# the only reader of this text, and neither part helps it. These two patterns
+# strip exactly that much and leave the field name and the expected type, which
+# are the parts it can act on.
+_PYDANTIC_NOISE = re.compile(r"\s*\[type=[^\]]*\]|\n?\s*For further information visit \S+")
+_PYDANTIC_MODEL_NAME = re.compile(r"(\d+ validation errors? for )\w+Arguments")
+
+
+class SearchResults(TypedDict):
+    """The envelope `search_products` returns.
+
+    Declared as a type rather than built ad hoc so the shape reaches the model
+    twice: the docstring explains what `count` of 0 means, and this puts
+    `count` and `results` in the tool's output schema, where a client can see
+    them without reading prose. `results` stays a free-form list of objects —
+    the product shape belongs to `catalog/search.py`, and restating it here
+    would be a second definition to keep in step with the first.
+    """
+
+    count: int
+    results: list[dict[str, Any]]
+
 
 def _package_version() -> str:
     """Report the installed package version, so it cannot drift from pyproject.
@@ -63,7 +98,118 @@ def _package_version() -> str:
         return "0.0.0+unknown"
 
 
-server = MCPServer(SERVER_NAME, version=_package_version())
+async def log_tool_calls(ctx, call_next):
+    """Log every tool call with its arguments, duration and outcome.
+
+    This is a long-lived process that D5 drives from an agent loop, and when a
+    conversation goes wrong the log is the only record of what the model
+    actually asked for. Timing lives here rather than in each tool because only
+    this layer sees both ends of the call, and outcome lives here because only
+    this layer sees the result after the tool has returned or raised.
+
+    Everything logged is a catalog identifier, a filter or a price — the same
+    things already visible in the tool schema. D6 introduces carts and orders,
+    and the moment a request carries a customer this has to be revisited, since
+    logging an argument is logging whatever the argument happens to contain.
+    """
+    if ctx.method != "tools/call":
+        return await call_next(ctx)
+
+    params = ctx.params or {}
+    name = params.get("name", "<unknown>")
+    arguments = params.get("arguments") or {}
+    started = time.perf_counter()
+
+    try:
+        result = await call_next(ctx)
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        # A raise here is a protocol-level failure, not a tool returning an
+        # error result — worth a distinct log line, because the client sees
+        # something very different in each case.
+        logger.error("tool %s args=%r raised after %.1fms: %s", name, arguments, elapsed_ms, exc)
+        raise
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    failed = bool(result.get("isError")) if isinstance(result, dict) else False
+    logger.log(
+        logging.WARNING if failed else logging.INFO,
+        "tool %s args=%r -> %s in %.1fms",
+        name,
+        arguments,
+        "error" if failed else "ok",
+        elapsed_ms,
+    )
+    return result
+
+
+async def readable_validation_errors(ctx, call_next):
+    """Strip the developer-facing half of a Pydantic validation message.
+
+    An argument of the wrong type never reaches a tool body: the SDK validates
+    against the generated model first and the failure arrives as an error
+    result. That text is Pydantic's own, and it ends with a link to
+    errors.pydantic.dev and an internal type code — a reader who can follow a
+    URL is not the reader this message has.
+
+    The rewrite is deliberately narrow. It fires only on text carrying
+    Pydantic's own header, so the messages the tools below write by hand pass
+    through untouched, and it removes only the trailing noise: the field name
+    and the expected type, which are what the model needs to correct itself,
+    survive. Loosening the schema types to produce a friendlier message was the
+    alternative, and it was rejected — it would make the error more likely in
+    order to make it prettier.
+    """
+    result = await call_next(ctx)
+
+    if ctx.method != "tools/call" or not isinstance(result, dict) or not result.get("isError"):
+        return result
+
+    for block in result.get("content", []):
+        text = block.get("text")
+        if not text or "validation error" not in text:
+            continue
+        text = _PYDANTIC_MODEL_NAME.sub(r"\1the arguments you sent", text)
+        block["text"] = _PYDANTIC_NOISE.sub("", text).rstrip()
+
+    return result
+
+
+# Outermost first: the logger wraps the rewrite, so what it records as the
+# outcome is the result the client actually receives.
+server = MCPServer(
+    SERVER_NAME,
+    version=_package_version(),
+    middleware=[log_tool_calls, readable_validation_errors],
+)
+
+
+def _reject_impossible_price_range(min_price_cents: int | None, max_price_cents: int | None) -> None:
+    """Refuse a price range that no catalog could ever satisfy.
+
+    These are errors rather than empty results, and the difference is what the
+    model should do next. An empty result means relax a filter; there is no
+    relaxing a negative bound, and a minimum above a maximum stays empty however
+    wide the shop is. Left to return nothing, both would read as "this shop has
+    no cheap shoes" and the model would keep searching for something it has
+    made unfindable.
+    """
+    for field, value in (("min_price_cents", min_price_cents), ("max_price_cents", max_price_cents)):
+        if value is not None and value < 0:
+            raise ValueError(
+                f"{field} was {value}, but a price cannot be negative. Prices are "
+                f"in cents, so $100 is 10000 and $49.99 is 4999. Re-send with a "
+                f"value of 0 or more, or leave {field} out to search without that "
+                f"bound."
+            )
+
+    if min_price_cents is not None and max_price_cents is not None and min_price_cents > max_price_cents:
+        raise ValueError(
+            f"min_price_cents ({min_price_cents}) is greater than max_price_cents "
+            f"({max_price_cents}), so no product can match whatever the shop "
+            f"stocks. Both are in cents. Swap the two values if they were the "
+            f"wrong way round, or drop one of them to search with a single bound."
+        )
 
 
 @server.tool()
@@ -80,7 +226,6 @@ def ping() -> str:
     Returns the string "pong". It says nothing whatsoever about the catalog,
     and a successful call is not evidence that any product exists.
     """
-    logger.info("ping")
     return "pong"
 
 
@@ -115,8 +260,9 @@ def search_products(
             description=(
                 "Upper price bound in CENTS, not dollars. $100 is 10000, $49.99 "
                 "is 4999. Passing 100 here means one dollar and will match "
-                "nothing. Applies to the variant price, so a product is "
-                "returned when at least one of its variants is within the bound."
+                "nothing. Must be 0 or more. Applies to the variant price, so a "
+                "product is returned when at least one of its variants is within "
+                "the bound."
             )
         ),
     ] = None,
@@ -124,9 +270,9 @@ def search_products(
         int | None,
         Field(
             description=(
-                "Lower price bound in CENTS, not dollars. $50 is 5000. Use it "
-                "only when the shopper asked for a floor; it is not needed to "
-                'express "cheap".'
+                "Lower price bound in CENTS, not dollars. $50 is 5000. Must be 0 "
+                "or more, and not greater than max_price_cents. Use it only when "
+                'the shopper asked for a floor; it is not needed to express "cheap".'
             )
         ),
     ] = None,
@@ -156,12 +302,12 @@ def search_products(
             description=(
                 "How many products to return. Ask for what the answer needs — 3 "
                 "to offer a short choice, 10 to survey a category. Values are "
-                "clamped to 1-50, so a larger number is not an error but buys "
-                "nothing beyond 50."
+                "clamped to 1-50 rather than refused, so asking for 100 returns "
+                "at most 50 and `count` tells you how many actually came back."
             )
         ),
     ] = 5,
-) -> list[dict[str, Any]]:
+) -> SearchResults:
     """Search the shop catalogue for products matching a description and filters.
 
     This is the tool to reach for whenever a shopper describes what they want,
@@ -175,20 +321,26 @@ def search_products(
     those that passed the variant-level filters — a search for size 42 never
     returns a 43 to offer.
 
-    Returns a list of products, nearest match first when `query` is given and
+    Returns an object with two fields. `count` is how many products came back.
+    `results` is the list of them, nearest match first when `query` is given and
     cheapest first otherwise. Each product carries product_id, name, brand,
     category, description, and a list of variants; each variant carries
     variant_id, sku, size, color, price_cents (an integer number of cents) and
     available (units that can be sold right now).
 
-    An empty list is a normal, successful answer: it means nothing in the shop
-    matches these filters, not that anything went wrong. Say so and suggest
-    relaxing a filter — a wider price bound or a different size — rather than
-    inventing a product. Use the product_id from a result to call
-    get_product_details, and a variant_id to call check_stock.
+    A `count` of 0 is a successful answer, not a failure: the search ran and the
+    shop has nothing matching this combination of filters. Do not retry the same
+    arguments and do not invent a product. Say what was not found and widen
+    exactly one thing — raise max_price_cents, drop size or color, drop category,
+    or describe the need differently in `query` — then search again. Every filter
+    given is a way the result could have been narrowed to nothing.
+
+    Use the product_id from a result to call get_product_details, and a
+    variant_id to call check_stock.
     """
-    logger.info("search_products query=%r category=%r limit=%s", query, category, limit)
-    return catalog.search_products(
+    _reject_impossible_price_range(min_price_cents, max_price_cents)
+
+    results = catalog.search_products(
         query=query,
         category=category,
         max_price_cents=max_price_cents,
@@ -198,6 +350,12 @@ def search_products(
         limit=limit,
     )
 
+    # The envelope exists for the empty case. A bare list of zero products
+    # serialises to zero content blocks, so a client reading `content` sees
+    # nothing at all and cannot tell "no matches" from "the call did nothing".
+    # One object always renders as one block, and `count` states the result in
+    # words the model cannot miss. Nothing about an individual product changes.
+    return SearchResults(count=len(results), results=results)
 
 
 @server.tool()
@@ -231,7 +389,6 @@ def get_product_details(
     search that matched nothing: it means the id itself is wrong, so search
     again rather than retrying with the same number.
     """
-    logger.info("get_product_details product_id=%s", product_id)
     product = catalog.get_product(product_id)
 
     if product is None:
@@ -279,7 +436,6 @@ def check_stock(
     the item being sold out. A variant that exists but has none left is a
     successful result with available 0.
     """
-    logger.info("check_stock variant_id=%s", variant_id)
     stock = catalog.check_stock(variant_id)
 
     if stock is None:
@@ -297,9 +453,7 @@ def main() -> None:
     """Serve over stdio until the client disconnects.
 
     `run` is synchronous and opens the event loop itself, so there is no
-    `anyio.run` here. Logging is configured to stderr on the way in; without a
-    handler the SDK's own warnings would be invisible, which is a bad trade in
-    a process whose only other output channel is a protocol stream.
+    `anyio.run` here. Logging goes to stderr; stdout carries the protocol.
     """
     logging.basicConfig(level=logging.INFO)
     server.run(transport="stdio")

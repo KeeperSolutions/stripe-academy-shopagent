@@ -55,6 +55,12 @@ EXPECTED_SEARCH_PARAMETERS = {
 WITHHELD_SEARCH_PARAMETERS = {"session", "mode", "query_embedding"}
 
 
+def output_schema_of(tool_name):
+    """The output schema one tool advertises."""
+    tools = {tool.name: tool for tool in call(server.list_tools)}
+    return tools[tool_name].output_schema
+
+
 def schema_of(tool_name):
     """The input schema one tool advertises."""
     tools = {tool.name: tool for tool in call(server.list_tools)}
@@ -77,8 +83,18 @@ def call_over_transport(tool_name, arguments):
 
 
 def results_of(result):
-    """The list a search returned, read from the structured payload."""
-    return (result.structured_content or {}).get("result")
+    """The products a search returned, unwrapped from its envelope."""
+    return (result.structured_content or {})["results"]
+
+
+def count_of(result):
+    """The `count` a search reported."""
+    return (result.structured_content or {})["count"]
+
+
+def message_of(result):
+    """The text a failed call put in front of the model."""
+    return result.content[0].text
 
 
 def call(fn):
@@ -373,5 +389,159 @@ def test_a_search_matching_nothing_succeeds_with_an_empty_list(seeded):
     )
 
     assert result.is_error is False
+    assert count_of(result) == 0
     assert results_of(result) == []
 
+
+# --- the envelope, and why it exists -------------------------------------
+
+
+def test_search_results_arrive_wrapped_in_a_count_and_a_list():
+    """The shape the model is promised: an object, not a bare list."""
+    schema = output_schema_of("search_products")
+
+    assert schema["type"] == "object"
+    assert set(schema["properties"]) == {"count", "results"}
+
+
+@pytest.mark.db
+def test_an_empty_search_still_produces_a_content_block(seeded):
+    """The whole reason the envelope exists.
+
+    A bare empty list serialises to zero content blocks, and a client that
+    reads `content` — which is what the D5 adapter will hand the model — then
+    sees literally nothing. "No matches" and "the call did nothing" have to
+    look different, so an empty search must still say something.
+    """
+    result = call_over_transport(
+        "search_products", {"category": "shoes", "size": "99", "color": "chartreuse"}
+    )
+
+    assert result.is_error is False
+    assert len(result.content) == 1
+    assert "count" in message_of(result)
+    assert count_of(result) == 0
+
+
+@pytest.mark.db
+def test_count_agrees_with_the_number_of_results(seeded):
+    """`count` is what the model is told to trust, so it cannot drift."""
+    result = call_over_transport("search_products", {"category": "shoes", "limit": 3})
+
+    assert count_of(result) == len(results_of(result))
+
+
+# --- edge cases: error, or a legitimately empty result? ------------------
+#
+# The line: an error is what the model MUST change to get any answer at all.
+# An empty result is what it gets when the arguments were valid and the shop
+# happens to hold nothing like that. Each test below pins one side of that
+# line, so a later change of mind fails loudly instead of quietly.
+
+
+@pytest.mark.parametrize("field", ["max_price_cents", "min_price_cents"])
+def test_a_negative_price_is_an_error_not_an_empty_shop(field):
+    """No catalogue can hold a product priced below zero.
+
+    Returning nothing would read as "no such cheap product" and invite the
+    model to search lower, which is the one direction that cannot help.
+    """
+    result = call_over_transport("search_products", {field: -500})
+
+    assert result.is_error is True
+    message = message_of(result)
+    assert field in message
+    assert "cent" in message.lower()
+
+
+def test_a_minimum_above_a_maximum_is_an_error():
+    """An impossible range cannot be fixed by widening the search."""
+    result = call_over_transport(
+        "search_products", {"min_price_cents": 90_000, "max_price_cents": 1_000}
+    )
+
+    assert result.is_error is True
+    message = message_of(result)
+    assert "min_price_cents" in message and "max_price_cents" in message
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("limit", [100, 0, -5])
+def test_a_limit_outside_the_range_is_clamped_rather_than_refused(seeded, limit):
+    """Out-of-range is not an error: the model still gets a usable answer.
+
+    `search.py` clamps to 1-50. That is deliberate — refusing would cost the
+    model a turn to learn something the schema already tells it — but it does
+    mean the clamp is silent, which is why the parameter description points at
+    `count` as the authority on how many came back.
+    """
+    result = call_over_transport("search_products", {"category": "shoes", "limit": limit})
+
+    assert result.is_error is False
+    assert 1 <= count_of(result) <= 50
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("query", ["", "   "])
+def test_a_blank_query_browses_instead_of_failing(seeded, query):
+    """An empty query means "no query", and must not cost an embedding call.
+
+    `search_products` embeds whatever it is given, so a blank string reaching
+    the API would be a paid request for nothing. `catalog.search_products`
+    already guards this; the test is here because the guard is invisible from
+    the outside and easy to remove by accident.
+    """
+    result = call_over_transport("search_products", {"query": query, "limit": 2})
+
+    assert result.is_error is False
+    assert count_of(result) > 0
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(
+    ("field", "value"), [("size", "99"), ("color", "chartreuse")]
+)
+def test_a_filter_nothing_matches_is_an_empty_result_not_an_error(seeded, field, value):
+    """Valid arguments, nothing in stock like that. The model should relax one."""
+    result = call_over_transport("search_products", {field: value})
+
+    assert result.is_error is False
+    assert count_of(result) == 0
+
+
+# --- the validation message the model actually reads ---------------------
+
+
+def test_a_wrong_type_keeps_the_field_and_the_expectation():
+    """Middleware trims Pydantic's message; it must not trim the useful half."""
+    result = call_over_transport(
+        "search_products", {"max_price_cents": "one hundred dollars"}
+    )
+
+    assert result.is_error is True
+    message = message_of(result)
+    assert "max_price_cents" in message
+    assert "valid integer" in message
+
+
+def test_a_wrong_type_loses_the_developer_facing_noise():
+    """No documentation URL, no internal type code, no generated model name."""
+    message = message_of(
+        call_over_transport("search_products", {"max_price_cents": "one hundred dollars"})
+    )
+
+    assert "errors.pydantic.dev" not in message
+    assert "[type=" not in message
+    assert "search_productsArguments" not in message
+
+
+def test_the_rewrite_leaves_a_handwritten_message_alone():
+    """The middleware fires on Pydantic's shape only.
+
+    The tools' own messages are already written for the model, and a rewrite
+    that touched them would be silently editing the text this whole step exists
+    to get right.
+    """
+    message = message_of(call_over_transport("search_products", {"max_price_cents": -500}))
+
+    assert message.endswith("out to search without that bound.")
