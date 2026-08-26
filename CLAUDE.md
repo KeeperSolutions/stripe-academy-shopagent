@@ -104,6 +104,18 @@ that depends on what the catalog holds. Everything past those three belongs one
 layer down. The test is whether the wrapper would still be correct against a
 different database: if it would not, the logic is in the wrong file.
 
+**The MCP middleware logs tool arguments, and `query` becomes user input on
+D6.** Every call is logged with its arguments, which is what makes the server
+debuggable once D5 drives it from an agent loop — and `query` is the one
+argument worth reading, because it shows what the model understood the shopper
+to want. Redacting it would blind the log exactly where it earns its keep.
+Today that text is a developer's own, typed into the Inspector or a test. From
+D6 there are real carts and real customers, and `query` becomes something a
+stranger typed: it has to be redacted, hashed, or gated behind a config flag
+before this server sees production traffic. This is an obligation D6 owes, in
+the same way `scripts/seed_catalog.py --reset` owes it a guard — not a bug in
+what is here now.
+
 **A tool's name is written for the model; the function's name is written for
 whoever maintains it, and the two are allowed to differ.** The MCP tool
 `get_product_details` calls `catalog.search.get_product`. `get_product` is right

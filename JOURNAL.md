@@ -398,3 +398,13 @@ cap of 50 — the clamp is verified by reading `max(1, min(int(limit), MAX_LIMIT
 and by the lower bound, where `limit=0` and `limit=-5` both return one result.
 The 50 ceiling is asserted in a test as a range rather than observed, and will
 stay that way until the catalog outgrows it.
+
+**The MCP middleware logs `query`, which stops being safe on D6.** Every tool
+call is logged with its arguments, and that is deliberate: `query` is the one
+argument that shows what the model understood the shopper to want, so redacting
+it would gut the log precisely where D5 needs it. It is safe today only because
+the text is a developer's own — typed into the Inspector or a test. D6 brings
+real carts and real customers, and the same field becomes something a stranger
+wrote. Before this server sees production traffic, `query` needs redaction, a
+hash, or a config flag; the ids, prices and timings can stay. Raised by review
+on PR #4 and deferred on purpose rather than missed.
