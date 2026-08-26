@@ -12,6 +12,7 @@ client to say so. A leaked subprocess is invisible for an hour and then is not.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -28,6 +29,9 @@ from shopagent.mcp_client.adapter import (
     to_openai_tools,
 )
 from shopagent.mcp_client.client import MCPToolClient
+from shopagent.mcp_client.registration import register_mcp_tools
+from shopagent.tools.basic import REGISTRY as BASIC_REGISTRY
+from shopagent.tools.registry import ToolRegistry, ToolSpec
 
 EXPECTED_TOOLS = {"ping", "search_products", "get_product_details", "check_stock"}
 
@@ -332,3 +336,227 @@ def test_starting_twice_is_refused(client):
         client.start()
 
 
+# --- MCP tools inside the local registry (step 2) ------------------------
+
+
+@dataclass
+class FakeClient:
+    """An MCP client that answers from a script instead of a pipe.
+
+    The `is_error` mapping is the thing worth testing here, and provoking a
+    real failure would mean breaking the catalog. A fake makes both outcomes
+    reachable and records what was asked for.
+    """
+
+    tools: list[FakeTool]
+    results: dict[str, Any] = field(default_factory=dict)
+    calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+
+    def list_tools(self) -> list[FakeTool]:
+        return list(self.tools)
+
+    def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+        self.calls.append((name, dict(arguments or {})))
+        return self.results[name]
+
+
+def _fake_client(**results: Any) -> FakeClient:
+    schema = {"type": "object", "properties": {}}
+    return FakeClient(
+        tools=[FakeTool(name, f"Does {name}.", schema) for name in results],
+        results=results,
+    )
+
+
+def test_registering_adds_every_tool_the_server_lists():
+    """Dynamic: four invented names, none of them written into the code."""
+    registry = ToolRegistry()
+    client = _fake_client(
+        alpha=FakeResult(content=[FakeTextBlock("a")]),
+        beta=FakeResult(content=[FakeTextBlock("b")]),
+        gamma=FakeResult(content=[FakeTextBlock("c")]),
+        delta=FakeResult(content=[FakeTextBlock("d")]),
+    )
+
+    registered = register_mcp_tools(registry, client)
+
+    assert [spec.name for spec in registered] == ["alpha", "beta", "gamma", "delta"]
+    assert registry.names() == ["alpha", "beta", "gamma", "delta"]
+
+
+def test_a_registered_mcp_tool_carries_the_servers_schema():
+    """Not a model built here — the server's own schema, unaltered."""
+    registry = ToolRegistry()
+    schema = {"type": "object", "properties": {"n": {"type": "integer"}}}
+    client = FakeClient(tools=[FakeTool("thing", "Does a thing.", schema)])
+
+    (spec,) = register_mcp_tools(registry, client)
+
+    assert spec.validates_locally is False
+    assert spec.parameters_schema is schema
+    assert spec.to_openai_schema()["function"]["parameters"] is schema
+
+
+def test_dispatching_a_registered_tool_reaches_the_client():
+    registry = ToolRegistry()
+    client = _fake_client(alpha=FakeResult(content=[FakeTextBlock('{"ok": 1}')]))
+    register_mcp_tools(registry, client)
+
+    result = registry.dispatch("alpha", {"a": 1, "b": "two"})
+
+    assert result.ok is True
+    assert result.content == '{"ok": 1}'
+    assert client.calls == [("alpha", {"a": 1, "b": "two"})]
+
+
+def test_a_server_error_becomes_a_failed_tool_result():
+    """The mirror of D4's server-side trap, and the reason this module exists.
+
+    Folded into `ok=True` the model would read "no such product" as a product.
+    """
+    registry = ToolRegistry()
+    client = _fake_client(
+        alpha=FakeResult(
+            content=[FakeTextBlock("No product has product_id 9999. Call search_products.")],
+            is_error=True,
+        )
+    )
+    register_mcp_tools(registry, client)
+
+    result = registry.dispatch("alpha", {})
+
+    assert result.ok is False
+    assert result.error is not None
+    assert "alpha" in result.error
+
+
+def test_the_servers_error_text_is_not_rewritten():
+    """D4 wrote those messages for the model; they arrive as written."""
+    message = "No product has product_id 9999. Call search_products to find it."
+    registry = ToolRegistry()
+    client = _fake_client(alpha=FakeResult(content=[FakeTextBlock(message)], is_error=True))
+    register_mcp_tools(registry, client)
+
+    assert registry.dispatch("alpha", {}).content == message
+
+
+def test_a_successful_call_is_not_marked_as_an_error():
+    """The other direction, so the mapping is not trivially always false."""
+    registry = ToolRegistry()
+    client = _fake_client(alpha=FakeResult(content=[FakeTextBlock("fine")], is_error=False))
+    register_mcp_tools(registry, client)
+
+    result = registry.dispatch("alpha", {})
+
+    assert result.ok is True
+    assert result.error is None
+
+
+def test_a_name_that_already_exists_is_refused():
+    """No auto-rename, no prefix: the model must not see a name the server lacks.
+
+    A prefixed tool would be called by the model and rejected by the server as
+    unknown — a failure surfacing one layer away from its cause.
+    """
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="calculator",
+            description="The local one.",
+            fn=lambda **kw: "local",
+            parameters_schema={"type": "object", "properties": {}},
+        )
+    )
+    client = _fake_client(calculator=FakeResult(content=[FakeTextBlock("remote")]))
+
+    with pytest.raises(ValueError, match="already registered"):
+        register_mcp_tools(registry, client)
+
+
+def test_a_clash_leaves_the_local_tool_in_place():
+    """The failure is loud, and it does not half-apply."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="calculator", description="The local one.",
+            fn=lambda **kw: "local", parameters_schema={"type": "object", "properties": {}},
+        )
+    )
+    client = _fake_client(calculator=FakeResult(content=[FakeTextBlock("remote")]))
+
+    with pytest.raises(ValueError):
+        register_mcp_tools(registry, client)
+
+    assert registry.dispatch("calculator", {}).content == "local"
+
+
+def test_a_tool_without_a_description_still_registers():
+    """MCP allows none; the placeholder is visible rather than an empty string."""
+    registry = ToolRegistry()
+    client = FakeClient(tools=[FakeTool("bare", None, {"type": "object", "properties": {}})])
+
+    (spec,) = register_mcp_tools(registry, client)
+
+    assert spec.description == MISSING_DESCRIPTION
+
+
+# --- the real server, through the registry -------------------------------
+
+
+@pytest.fixture
+def registry_with_everything(client):
+    """The registry the loop will get in step 3: local tools plus MCP tools."""
+    registry = ToolRegistry()
+    for spec in BASIC_REGISTRY.specs():
+        registry.register(spec)
+    register_mcp_tools(registry, client)
+    return registry
+
+
+@pytest.mark.db
+def test_the_registry_offers_local_and_remote_tools_together(registry_with_everything):
+    """Six schemas, and the loop cannot tell which two came from a pipe."""
+    schemas = registry_with_everything.openai_schemas()
+
+    assert [entry["function"]["name"] for entry in schemas] == [
+        "get_time",
+        "calculator",
+        "ping",
+        "search_products",
+        "get_product_details",
+        "check_stock",
+    ]
+    assert all(entry["type"] == "function" for entry in schemas)
+    assert all(entry["function"]["parameters"]["type"] == "object" for entry in schemas)
+
+
+@pytest.mark.db
+def test_dispatching_search_products_returns_real_products(registry_with_everything):
+    """`query` is omitted so the run stays free; the MCP tool always embeds one."""
+    result = registry_with_everything.dispatch(
+        "search_products", {"category": "shoes", "limit": 2}
+    )
+
+    assert result.ok is True
+    payload = json.loads(result.content)
+    assert 1 <= payload["count"] <= 2
+    assert all(product["category"] == "shoes" for product in payload["results"])
+
+
+@pytest.mark.db
+def test_dispatching_an_unknown_product_id_fails_through_the_registry(registry_with_everything):
+    """End to end: server raises, client reports isError, registry says ok=False."""
+    result = registry_with_everything.dispatch("get_product_details", {"product_id": 9999})
+
+    assert result.ok is False
+    assert "9999" in result.content
+    assert "search_products" in result.content
+
+
+@pytest.mark.db
+def test_a_local_tool_still_works_alongside_the_remote_ones(registry_with_everything):
+    """The widening must not have disturbed the tools that already worked."""
+    result = registry_with_everything.dispatch("calculator", {"expression": "(2 + 3) * 4"})
+
+    assert result.ok is True
+    assert result.content == "20"

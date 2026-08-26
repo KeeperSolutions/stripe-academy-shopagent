@@ -12,14 +12,28 @@ an `if`. It is non-streaming, because reassembling tool calls out of streamed
 deltas is bookkeeping that would obscure the chaining this file is meant to
 show. `LLMClient.stream_chat` is unchanged and still works; it is simply not
 what the CLI drives now.
+
+D5 added the catalog, and the shape of that change is the point. `run_tool_loop`
+below is byte-for-byte what D2 left: it takes a registry and a list of schemas
+and does not care where either came from. Everything D5 needed happens before
+the loop starts — assembling the registry and owning the subprocess — so the
+tools reached over a pipe and the two defined in `tools/basic.py` are the same
+kind of thing by the time the loop sees them. That was the bet D2 made when it
+made the registry a parameter instead of a global, and this file is where it
+either paid off or did not.
 """
 
 from __future__ import annotations
 
 import sys
+from contextlib import ExitStack
+from dataclasses import dataclass
 
+from shopagent.config import get_settings
 from shopagent.llm.client import LLMClient, Message, ToolCall
 from shopagent.llm.usage import UsageTracker
+from shopagent.mcp_client.client import MCPToolClient
+from shopagent.mcp_client.registration import register_mcp_tools
 from shopagent.tools.basic import REGISTRY
 from shopagent.tools.registry import ToolRegistry, ToolResult
 
@@ -31,6 +45,29 @@ SYSTEM_PROMPT = (
     "plainly — never guess. "
     "Use the tools for anything they cover: you have no clock, so never state "
     "a time from memory, and never do arithmetic in your head."
+)
+
+# What the catalog tools are for, not how they work. Each one already carries a
+# description written for a model to read, and repeating that here would give
+# the same contract two authors and let them drift. This says only when to
+# reach for them, and what is never allowed to come from memory.
+CATALOG_PROMPT = (
+    " The product catalogue is available through tools. Every product name, "
+    "price, size, colour and stock level you state must have come from a tool "
+    "result in this conversation — never from memory, and never inferred from "
+    "what a product sounds like. When the user asks about products, search "
+    "first and answer from what comes back. If a search returns a count of 0, "
+    "say plainly that nothing matched and suggest a broader search; do not "
+    "offer a product that was not in a result."
+)
+
+# Said when the catalog server could not be reached, so the model does not
+# apologise for its own memory when the real answer is that a tool is missing.
+NO_CATALOG_PROMPT = (
+    " The product catalogue is NOT available in this session: the tools that "
+    "search it could not be loaded. If the user asks about products, prices or "
+    "stock, say the catalogue is unavailable right now. Do not answer from "
+    "memory and do not invent products."
 )
 
 # One user input may legitimately need several rounds: a tool call, a look at
@@ -54,8 +91,9 @@ Commands:
   /exit    quit"""
 
 
-def _initial_messages() -> list[Message]:
-    return [{"role": "system", "content": SYSTEM_PROMPT}]
+def _initial_messages(catalog_available: bool = True) -> list[Message]:
+    extra = CATALOG_PROMPT if catalog_available else NO_CATALOG_PROMPT
+    return [{"role": "system", "content": SYSTEM_PROMPT + extra}]
 
 
 def _shorten(text: str, limit: int = MAX_SHOWN_RESULT) -> str:
@@ -133,6 +171,65 @@ def run_tool_loop(
     })
 
 
+@dataclass(frozen=True)
+class ToolSetup:
+    """The tools one session runs with, and whether the catalog is among them."""
+
+    registry: ToolRegistry
+    catalog_available: bool
+    note: str | None = None
+
+
+def build_tool_setup(
+    stack: ExitStack,
+    *,
+    catalog_enabled: bool | None = None,
+    client_factory: type[MCPToolClient] = MCPToolClient,
+) -> ToolSetup:
+    """Assemble the registry this session will use.
+
+    The local tools always go in. The catalog tools are added when the switch
+    is on and the server actually starts, and their absence is reported rather
+    than raised: a catalog that will not open is a smaller problem than a CLI
+    that will not start, and the model is told about it either way.
+
+    `stack` owns the client. Whatever ends the session — a clean `/exit`, a
+    Ctrl+C at the prompt, or an exception on the way out — unwinds it, and the
+    server subprocess goes with it.
+
+    `client_factory` exists so a test can inject a client that fails to start.
+    """
+    registry = ToolRegistry()
+    for spec in REGISTRY.specs():
+        registry.register(spec)
+
+    if catalog_enabled is None:
+        catalog_enabled = get_settings().mcp_catalog_enabled
+
+    if not catalog_enabled:
+        return ToolSetup(
+            registry=registry,
+            catalog_available=False,
+            note="catalog disabled (MCP_CATALOG_ENABLED=false)",
+        )
+
+    try:
+        client = stack.enter_context(client_factory())
+        register_mcp_tools(registry, client)
+    except Exception as exc:  # noqa: BLE001 - a missing catalog must not be fatal
+        # Broad on purpose, and the same reasoning as `dispatch`: the server is
+        # a separate process over a pipe, and everything from a bad interpreter
+        # path to a failed handshake to an unreachable database arrives here.
+        # None of them is worth refusing to start over.
+        return ToolSetup(
+            registry=registry,
+            catalog_available=False,
+            note=f"catalog unavailable ({type(exc).__name__}: {exc})",
+        )
+
+    return ToolSetup(registry=registry, catalog_available=True)
+
+
 def main() -> None:
     tracker = UsageTracker()
     try:
@@ -141,13 +238,27 @@ def main() -> None:
         print(f"[error] could not create the client: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
-    messages = _initial_messages()
-    tools = REGISTRY.openai_schemas()
+    with ExitStack() as stack:
+        setup = build_tool_setup(stack)
+        _run_session(client, tracker, setup)
+
+
+def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> None:
+    """The REPL itself, once the tools are decided.
+
+    Split out from `main` so the catalog's lifetime is visibly the session's
+    lifetime: everything below runs inside the `ExitStack` that owns the server.
+    """
+    registry = setup.registry
+    messages = _initial_messages(setup.catalog_available)
+    tools = registry.openai_schemas()
 
     print(
         f"ShopAgent · model {client.model} · "
-        f"{len(tools)} tools ({', '.join(REGISTRY.names())}) · /help for commands"
+        f"{len(tools)} tools ({', '.join(registry.names())}) · /help for commands"
     )
+    if setup.note:
+        print(f"[{setup.note}]")
 
     while True:
         try:
@@ -169,11 +280,11 @@ def main() -> None:
             print(tracker.summary())
             continue
         if user_input == "/reset":
-            messages = _initial_messages()
+            messages = _initial_messages(setup.catalog_available)
             print("[conversation history cleared; session cost is kept]")
             continue
         if user_input == "/tools":
-            for spec in REGISTRY.specs():
+            for spec in registry.specs():
                 print(f"  {spec.name}: {spec.description}")
             continue
 
@@ -186,7 +297,7 @@ def main() -> None:
         calls_before = len(tracker.calls)
 
         try:
-            run_tool_loop(client, REGISTRY, messages, tools)
+            run_tool_loop(client, registry, messages, tools)
         except KeyboardInterrupt:
             # Aborts this answer only — the application stays alive.
             print("\n[interrupted]")

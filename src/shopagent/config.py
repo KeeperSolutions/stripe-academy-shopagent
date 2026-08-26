@@ -56,6 +56,14 @@ class Settings(BaseSettings):
     # which is what a model that does not know it needs (e.g. gpt-4o-mini).
     openai_reasoning_effort: OptionalStr = "none"
 
+    # --- MCP (D4-D5) ---
+    # The off switch for the catalog. The agent loop registers the MCP tools
+    # alongside the local ones when this is true; set it false and the same
+    # binary runs with the two local tools only, which is what makes "the
+    # catalog answers are coming from MCP" a claim that can be tested rather
+    # than asserted.
+    mcp_catalog_enabled: bool = True
+
     # --- Infrastructure (D3, D6) ---
     database_url: str = (
         "postgresql+psycopg://shopagent:shopagent@localhost:5432/shopagent"
