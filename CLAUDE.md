@@ -91,6 +91,16 @@ output is not valid under strict mode without a transform: it omits
 `additionalProperties: false`, lists only non-defaulted fields in `required`,
 and emits `default` and `title`. Revisit on D5/D9.
 
+**A tool's name is written for the model; the function's name is written for
+whoever maintains it, and the two are allowed to differ.** The MCP tool
+`get_product_details` calls `catalog.search.get_product`. `get_product` is right
+in a module where every function is about products and the surrounding code
+supplies the context; `get_product_details` is right in a flat list of tool
+names where the model has only the name to go on and `get_product` reads as a
+near-duplicate of `search_products`. The rename happens in the wrapper, in one
+line, next to the docstring that explains the tool — never by renaming the
+catalog function to suit a caller.
+
 **Tools are plain Python functions that raise on bad input.** They stay
 callable and testable without the registry, which only wraps them.
 
