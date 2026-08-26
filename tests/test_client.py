@@ -310,3 +310,105 @@ def test_to_message_omits_the_key_entirely_when_there_are_no_tool_calls(client):
     )
 
     assert reply.to_message() == {"role": "assistant", "content": "Hello."}
+
+
+# --- embeddings --------------------------------------------------------
+
+EMBEDDING_MODEL = "fake-embedding-model"
+
+
+def _install_embeddings(client, vectors, *, prompt_tokens=42, shuffle=False):
+    """Fake the embeddings endpoint, recording the request it was given.
+
+    `shuffle` returns the items out of order with their `index` fields intact,
+    which is the case `embed` sorts for. The real API returns them in order;
+    that it is documented to be keyed by `index` is the reason not to rely on
+    it.
+    """
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        data = [
+            SimpleNamespace(index=position, embedding=vector)
+            for position, vector in enumerate(vectors)
+        ]
+        if shuffle:
+            data = list(reversed(data))
+        return SimpleNamespace(
+            data=data,
+            usage=SimpleNamespace(prompt_tokens=prompt_tokens),
+        )
+
+    client._client = SimpleNamespace(embeddings=SimpleNamespace(create=create))
+    return calls
+
+
+@pytest.fixture
+def embedding_client(client):
+    """The same fake client, priced as an embedding model."""
+    usage_mod.PRICING[EMBEDDING_MODEL] = (0.02, 0.00, 0.02)
+    client.embedding_model = EMBEDDING_MODEL
+    yield client
+    usage_mod.PRICING.pop(EMBEDDING_MODEL, None)
+
+
+def test_embed_sends_the_whole_batch_as_one_request(embedding_client):
+    calls = _install_embeddings(embedding_client, [[0.1], [0.2], [0.3]])
+
+    vectors, _ = embedding_client.embed(["a", "b", "c"])
+
+    assert len(calls) == 1
+    assert calls[0]["input"] == ["a", "b", "c"]
+    assert vectors == [[0.1], [0.2], [0.3]]
+
+
+def test_embed_uses_the_embedding_model_not_the_chat_model(embedding_client):
+    calls = _install_embeddings(embedding_client, [[0.1]])
+
+    embedding_client.embed(["a"])
+
+    assert calls[0]["model"] == EMBEDDING_MODEL
+    assert calls[0]["model"] != embedding_client.model
+
+
+def test_embed_returns_vectors_in_index_order_whatever_order_they_arrive_in(
+    embedding_client,
+):
+    _install_embeddings(embedding_client, [[0.1], [0.2], [0.3]], shuffle=True)
+
+    vectors, _ = embedding_client.embed(["a", "b", "c"])
+
+    assert vectors == [[0.1], [0.2], [0.3]]
+
+
+def test_embed_records_usage_against_the_embedding_model(embedding_client):
+    _install_embeddings(embedding_client, [[0.1], [0.2]], prompt_tokens=1_336)
+
+    _, call = embedding_client.embed(["a", "b"])
+
+    assert call.model == EMBEDDING_MODEL
+    assert call.prompt_tokens == 1_336
+    # An embedding call has nothing to complete, so nothing is billed as output.
+    assert call.completion_tokens == 0
+    assert embedding_client.tracker.total_tokens == 1_336
+    assert call.cost_usd == pytest.approx(1_336 * 0.02 / 1_000_000)
+
+
+def test_embed_does_not_land_in_unknown_models(embedding_client):
+    _install_embeddings(embedding_client, [[0.1]])
+
+    embedding_client.embed(["a"])
+
+    assert embedding_client.tracker.unknown_models == set()
+
+
+def test_embed_refuses_an_empty_batch_without_calling_the_api(embedding_client):
+    """A request with no input is a 400 from the API and a bug here."""
+    calls = _install_embeddings(embedding_client, [])
+
+    with pytest.raises(ValueError, match="empty batch"):
+        embedding_client.embed([])
+
+    assert calls == []
+    assert embedding_client.tracker.calls == []

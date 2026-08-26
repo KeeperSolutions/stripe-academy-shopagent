@@ -12,3 +12,18 @@ requires-python = ">=3.11"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# Three kinds of test now live side by side, and the difference is what each
+# one needs to run:
+#   (unmarked)  nothing outside the process — the D1/D2 rule, still the default
+#   db          the local Postgres from `docker compose up -d`
+#   network     the OpenAI API, which costs money on every run
+#
+# `network` is deselected by default so `pytest tests/` stays free and works
+# offline. Run those deliberately: `pytest tests/ -m network`.
+markers = [
+    "db: needs the local Postgres (docker compose up -d)",
+    "network: calls the OpenAI API and spends tokens",
+]
+addopts = "-m 'not network'"

@@ -242,7 +242,13 @@ def test_session_total_stays_correct_with_malformed_entry(fake_pricing):
 
 
 def test_real_prices_have_three_entries():
-    """Sanity: every PRICING entry must be (input, output, cached_input)."""
+    """Sanity: every PRICING entry must be (input, output, cached_input).
+
+    Cached input is `<=` full input, not `<`: the embedding models added on D3
+    have no prompt cache at all, so their cached price is deliberately equal to
+    their full one. What this still catches is the typo that matters — a cached
+    price *above* the full price, which would overstate every cached call.
+    """
     for model, pricing in usage_mod.PRICING.items():
         assert len(pricing) == 3, f"{model} has no cached input price"
-        assert pricing[2] < pricing[0], f"{model}: cached is not cheaper than full"
+        assert pricing[2] <= pricing[0], f"{model}: cached costs more than full"
