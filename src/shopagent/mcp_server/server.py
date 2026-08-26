@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import time
 from importlib.metadata import PackageNotFoundError, version
 from typing import Annotated, Any, TypedDict
@@ -449,13 +450,37 @@ def check_stock(
     return stock
 
 
+def configure_stderr_logging(level: int = logging.INFO) -> None:
+    """Send plain, untruncated log lines to stderr.
+
+    `force=True` is doing real work here. Constructing `MCPServer` calls the
+    SDK's own `configure_logging`, which installs a `RichHandler` if `rich` is
+    importable — and it is, as a transitive dependency. That handler formats for
+    a terminal: it wraps to the console width and, when stderr is a pipe rather
+    than a tty, truncates to a default width. The first casualty is the end of
+    every line, which is where this module puts the arguments and the duration.
+    A log that drops exactly the diagnostic payload is worse than no log,
+    because it still looks like logging.
+
+    Since `MCPServer` is constructed at import time, that handler is already in
+    place by the time this runs; `force=True` removes it and installs a plain
+    one. stderr, never stdout: stdout carries the protocol.
+    """
+    logging.basicConfig(
+        level=level,
+        force=True,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)-7s %(name)s %(message)s",
+    )
+
+
 def main() -> None:
     """Serve over stdio until the client disconnects.
 
     `run` is synchronous and opens the event loop itself, so there is no
-    `anyio.run` here. Logging goes to stderr; stdout carries the protocol.
+    `anyio.run` here.
     """
-    logging.basicConfig(level=logging.INFO)
+    configure_stderr_logging()
     server.run(transport="stdio")
 
 
