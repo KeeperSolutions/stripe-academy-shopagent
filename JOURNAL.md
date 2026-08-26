@@ -319,6 +319,146 @@ throughout and 0 after shutdown, and `engine.pool.status()` reported 0 checked
 out after 50 mixed operations. `_session_for` from D3 does the work — the tool
 passes no session, so `session_scope` opens one and closes it in a `finally`.
 
+## Day 5 — findings
+
+**The D2 abstraction held, and the evidence is that nothing moved.**
+`run_tool_loop` takes a registry and a list of schemas and does not ask where
+either came from. Adding four tools that live in another process therefore
+changed the assembly and the lifetime of the session, and not one line of the
+loop: `while`, `dispatch`, the `tool` messages and `MAX_TOOL_ITERATIONS` are
+what D2 left. That was checked by parsing both versions and comparing the
+function source, not by reading a diff — `run_tool_loop`, `_shorten`,
+`_show_tool_call`, `_show_tool_result` and `_print_cost` all come back
+identical. The eight lines `main()` did lose were all the same edit: the global
+`REGISTRY` becoming the registry that was assembled for this session. Making the
+registry a parameter instead of a global cost nothing on D2 and paid for itself
+three days later.
+
+**`ToolSpec` promised something its shape could not deliver.** `register()`
+carried the docstring "This is the entry point an MCP adapter (D5) will use",
+and `dispatch` already described taking "an already-parsed dict when the
+arguments came from somewhere else (MCP, on D5)". Both were written on D2 with
+this day in mind. Neither was reachable: `to_openai_schema` called
+`args_model.model_json_schema()` and `_parse` called `spec.args_model(**raw)`,
+so the type was hard — a Pydantic class or nothing, and MCP publishes JSON
+Schema. Constructing one anyway succeeds, because a dataclass does not check its
+annotations, and fails on first use with `AttributeError: 'dict' object has no
+attribute 'model_json_schema'`. The intention was recorded; the shape did not
+carry it. `args_model` is optional now and `parameters_schema` sits beside it,
+with exactly one required.
+
+**A remote tool validated twice is a schema with two owners.** The tempting fix
+was to rebuild a Pydantic model out of the published schema and keep validating
+locally. That would make this side a second source of truth for a contract the
+server owns, and the first symptom of a drift would be a call rejected here that
+the server would have accepted — with an error message the server never wrote.
+D4 had already measured the server's rejections reaching the model as usable,
+correctable text, so there was nothing to add. A tool with `parameters_schema`
+skips the Pydantic step entirely and the dict goes through as the model sent it.
+Everything before that step still runs: malformed JSON and a non-object payload
+are caught for remote tools exactly as for local ones, because neither is
+something a server should have to explain.
+
+**`dispatch` would have swallowed the failure, and running it is what showed
+that.** An MCP server reports a failed call in its reply rather than by raising,
+so the natural way to carry `isError` across is for the tool function to return a
+`ToolResult`. That did not work and did not look broken: `dispatch` passed the
+returned object to `_to_content()`, which has a `str()` fallback, and wrapped the
+result in `ToolResult(ok=True, ...)`. The model would have received
+`ToolResult(ok=False, content='...')` — the repr of a failure — as a successful
+answer. This is the client-side twin of the D4 finding that a returned string
+describing an error is indistinguishable from success, and it was found by
+constructing the case and printing the result before writing the test that now
+pins it. `dispatch` passes a returned `ToolResult` straight through.
+
+**The spawned server inherits almost no environment, and D1 is the only reason
+that does not matter.** `stdio_client` does not hand the child the parent's
+environment: `get_default_environment()` copies an allowlist, which on POSIX is
+`HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM` and `USER`. No `OPENAI_API_KEY`, no
+`DATABASE_URL`. It works because `config.py` sets `env_file` to an absolute path
+computed from the module's own location, so the server reads `.env` itself
+whatever it was started with and from wherever. A relative path there — the
+obvious way to write it — would have produced a catalog server that starts
+cleanly and fails every single call.
+
+**`content`, not `structuredContent`.** Convenience says read the structured
+payload; the protocol says otherwise. On a failed call `structuredContent` is
+`None` and the message exists only in `content`, and a tool without an output
+schema fills only `content` too. Preferring structured output would mean two code
+paths and a `None` check deciding what the model sees on the turn it most needs
+to understand — the failing one. Content is the field every result has.
+
+**A blocking portal, not `anyio.run` per call.** The SDK is async and the rest of
+the project is not. An MCP session is stateful: one subprocess, one handshake,
+and every later call down the same pipes. Wrapping each call in `anyio.run` would
+spawn a Python interpreter per tool call, and D4's measurement that the server
+holds exactly one pooled database connection would stop meaning anything.
+Instead one background thread runs one event loop for the client's lifetime and
+`anyio.from_thread.start_blocking_portal` lets synchronous callers submit work to
+it. `anyio` was already there as a dependency of `mcp`, and asyncio stays in one
+file rather than spreading through the project because one module needed it.
+
+**Prompt caching finally engaged — the gap left open on D2 and D3 is closed.**
+Both days measured `cached_tokens: 0` and diagnosed the same cause: OpenAI's
+cache has a 1,024-token minimum and the prompt peaked at 975. Six tool schemas
+changed that. The system prompt plus the catalog rules plus six schemas is
+**2,254 prompt tokens**, and the prefix is hit almost whole: 2,251 of 2,254 on
+one call, 3,549 of 3,552 on the next. `gpt-5.6-luna` bills cached input at
+$0.02/1M against $0.20/1M full, so a cached token costs a tenth.
+
+| Run | Without cache | Actually paid | Saved |
+|---|---|---|---|
+| Scenarios 1+2, cold cache | $0.003214 | $0.001436 | $0.001777 (55%) |
+| Scenarios 1+2, warm cache | $0.003095 | $0.000749 | $0.002345 (76%) |
+| Scenario 3, blue jacket | $0.001109 | $0.000301 | $0.000808 (73%) |
+| **All three** | **$0.007417** | **$0.002486** | **$0.004931 (66%)** |
+
+Cold and warm are worth separating, because a demo run twice flatters itself.
+On the first call of a genuinely cold session `cached_tokens` is 0 and the full
+2,254 tokens are billed at the input rate; every later call in that session hits,
+because the prefix has been sent once. Re-running the same conversation minutes
+later starts warm — the first call already reports 2,251 cached — which is why
+the second row saves more than the first. The 55% is the honest number for a
+session started from nothing; 76% is what a repeated demo looks like. Either way
+the accounting in `llm/usage.py` has been correct since D1 and was simply waiting
+for something to measure.
+
+### A2A, and why the catalog is not one
+
+A2A standardises the horizontal direction — agent to agent — where MCP
+standardises the vertical one, agent to tools and resources. The distinction its
+own documentation draws is between primitives and peers: tools are "well-defined,
+structured inputs and outputs" performing "specific, often stateless functions",
+while agents "reason, plan, use multiple tools, maintain state over longer
+interactions". What A2A adds on top of a tool call is what you need when the
+thing on the other end is not a function: an Agent Card at a well-known URL so
+capabilities can be discovered rather than configured, and a task with a
+lifecycle — `submitted`, `working`, `input-required`, `completed`, `failed` — so
+a peer can work for minutes, ask a clarifying question, and stream artifacts
+back. It also assumes opacity: an A2A peer need not reveal its tools, its model,
+or its reasoning, which is exactly the property you want when it belongs to
+somebody else.
+
+Could the D4 catalog server have been an A2A agent? Technically yes, and it
+would have been worse. `search_products` is a stateless function with a typed
+input and a JSON result; it finishes in 70ms, has nothing to clarify, and holds
+no state between calls. Wrapping it in a task lifecycle would add
+`submitted`/`working` bookkeeping to something that is over before the first poll,
+and an Agent Card would advertise discovery for a server whose address we
+already know because we spawn it ourselves. Opacity would be an active loss: D4
+spent its effort on making the tool schemas legible to the model, and A2A's
+selling point is that the peer does not have to show you that.
+
+Where A2A would have a case in this project is nowhere inside it, and that is the
+useful conclusion. It starts to earn its keep at a boundary this project does not
+have — a returns agent at a supplier who negotiates over several turns and takes
+a day to answer, a fraud-review agent that owns its own policy and must not
+expose it, a shipping partner whose capabilities change without our redeploying.
+All of them are somebody else's autonomous system. Everything ShopAgent talks to
+is our own function behind our own schema: the catalog on D4, the cart and orders
+API on D6, Stripe on D7. MCP is the right protocol for all of them, and reaching
+for A2A here would be adding a negotiation layer between a program and itself.
+
 ## Known gaps
 
 **The CLI does not stream while tools are in play.** `chat_with_tools` is a
@@ -408,3 +548,28 @@ real carts and real customers, and the same field becomes something a stranger
 wrote. Before this server sees production traffic, `query` needs redaction, a
 hash, or a config flag; the ids, prices and timings can stay. Raised by review
 on PR #4 and deferred on purpose rather than missed.
+
+**`DEFAULT_COMMAND` cannot be changed after import.** `MCPToolClient.__init__`
+takes `command: str = DEFAULT_COMMAND`, and a default argument is bound when the
+function is defined, not when it is called. Reassigning the module attribute
+afterwards does nothing — which cost a verification run on D5, where the CLI was
+supposed to be pointed at a broken interpreter and cheerfully started the real
+server instead. Harmless today, because nothing needs to change it. The day the
+server command comes from configuration, it has to be read inside the call.
+
+**The model miscounted its own summary.** Asked "do you have those in size 42?"
+it called `check_stock` on four variants, got four correct answers, and opened
+with "Yes, all three are available" above four rows — three products, four
+variants. No price, size or stock figure was invented; every number traced to a
+tool result. The failure is in summarising, not in retrieving, which makes it the
+kind of thing a guardrail can catch: D9 already owes a rule that an amount
+appearing in an answer must appear in the context, and a count is the same shape
+of claim.
+
+**`ping` is offered to the model.** It is a diagnostic tool with no business
+meaning, and it sits in the model's tool list alongside the four that matter.
+Filtering it out would mean matching on a tool name in the client, which is the
+one thing D5 exists to avoid — the adapter registers whatever the server lists.
+It was never called across any of the demo scenarios. If a future server exposes
+enough diagnostics to crowd the list, the fix belongs on the server (not
+advertising them) rather than in a name check here.
