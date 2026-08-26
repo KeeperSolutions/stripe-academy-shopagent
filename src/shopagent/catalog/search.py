@@ -164,6 +164,30 @@ def _priced_variants_of(*only_products: Any) -> Select[Any]:
     )
 
 
+def _has_a_qualifying_variant(
+    variant_filters: list[ColumnElement[bool]],
+) -> ColumnElement[bool]:
+    """EXISTS: at least one of this product's variants passes every filter.
+
+    Semantically identical to joining and grouping — a product qualifies when
+    one variant does — but it leaves the outer query as a plain scan of
+    `products`, which is what a vector index needs. See
+    `candidate_products_statement`.
+    """
+    currency = get_settings().currency
+    return (
+        select(Variant.id)
+        .join(
+            Price,
+            (Price.variant_id == Variant.id)
+            & Price.active.is_(True)
+            & (Price.currency == currency),
+        )
+        .where(Variant.product_id == Product.id, *variant_filters)
+        .exists()
+    )
+
+
 def candidate_products_statement(
     *,
     query: str | None = None,
@@ -187,52 +211,73 @@ def candidate_products_statement(
     semantic search on a literal match would defeat the entire point of it.
     Given none, a `query` filters with ILIKE, exactly as in step 3.
 
-    The vector changes only the ORDER BY. Every filter still sits in the WHERE
-    clause, and the LIMIT still runs after them, which is the trap the plan
-    warns about: rank first and filter afterwards, and a search for shoes under
-    $100 quietly returns the five nearest shoes minus the ones that were too
-    expensive — often nothing, while the shop is full of matches.
+    The two branches are shaped differently on purpose:
+
+    * Ranked by distance, the variant filters move into an `EXISTS` subquery so
+      the outer statement stays a scan of `products` ordered by a bare
+      `embedding <=> :vector`. That is the only form an HNSW index can serve;
+      wrapped in `min()` behind a `GROUP BY`, as this first did, the distance
+      is computed after aggregation and every qualifying product gets sorted no
+      matter how large the catalog grows.
+    * Ranked by price, the join and `GROUP BY` stay, because `min(amount_cents)`
+      is the ordering key and has to be aggregated to exist.
+
+    Either way the filters are WHERE predicates and `LIMIT` runs after them,
+    which is the trap the plan warns about: rank first and filter afterwards,
+    and a search for shoes under $100 quietly returns the five nearest shoes
+    minus the ones that were too expensive — often nothing, while the shop is
+    full of matches.
     """
-    cheapest = func.min(Price.amount_cents).label("cheapest_cents")
-    semantic = query_embedding is not None
-
-    selected: list[Any] = [Product.id, cheapest]
-    if semantic:
-        # min() over a per-product column is that column; the aggregate is
-        # there because the query groups by product id. `<=>` is pgvector's
-        # cosine distance: 0 is identical, 2 is opposite.
-        distance = func.min(Product.embedding.cosine_distance(query_embedding)).label(
-            "distance"
-        )
-        selected.append(distance)
-
-    statement = (
-        _priced_variants_of(*selected)
-        .where(
-            *_product_filters(query=None if semantic else query, category=category),
-            *_variant_filters(
-                max_price_cents=max_price_cents,
-                min_price_cents=min_price_cents,
-                size=size,
-                color=color,
-            ),
-        )
-        .group_by(Product.id)
+    variant_filters = _variant_filters(
+        max_price_cents=max_price_cents,
+        min_price_cents=min_price_cents,
+        size=size,
+        color=color,
     )
 
-    if semantic:
-        # NULLS LAST spelled out rather than left to the default: a product
-        # that has never been embedded cannot be ranked, and it belongs behind
-        # everything that can, not in front of it.
-        return statement.order_by(
-            distance.asc().nulls_last(), cheapest.asc(), Product.id.asc()
-        ).limit(limit)
+    if query_embedding is not None:
+        # `<=>` is pgvector's cosine distance: 0 is identical, 2 is opposite.
+        #
+        # Two details here are not stylistic. There is no `products.id`
+        # tie-break, because a second sort key stops the HNSW index being used
+        # at all — measured, not assumed: `ORDER BY embedding <=> $1` plans as
+        # an index scan, and `ORDER BY embedding <=> $1, id` plans as a sort of
+        # the whole table. Exact ties between real embeddings do not happen, so
+        # the tie-break bought reproducibility that nothing needed.
+        #
+        # And products without a vector are excluded rather than sorted last.
+        # They have to be: an index scan never returns them, since NULL vectors
+        # are not in the index, while a sequential scan does. Leaving it to the
+        # planner would mean the same query returning 29 or 30 rows depending
+        # on which plan it picked. Excluded is the honest reading anyway —
+        # nothing can rank by a similarity it has no vector for.
+        distance = Product.embedding.cosine_distance(query_embedding)
+        return (
+            select(Product.id)
+            .where(
+                *_product_filters(query=None, category=category),
+                Product.embedding.is_not(None),
+                _has_a_qualifying_variant(variant_filters),
+            )
+            .order_by(distance.asc())
+            .limit(limit)
+        )
 
-    # Cheapest match first, which is both a sensible default for a shopper and
-    # a total order — without it, LIMIT would return an arbitrary subset that
-    # changes between runs. Product.id breaks ties so the result is
-    # reproducible, which the tests depend on.
-    return statement.order_by(cheapest.asc(), Product.id.asc()).limit(limit)
+    cheapest = func.min(Price.amount_cents).label("cheapest_cents")
+    return (
+        _priced_variants_of(Product.id, cheapest)
+        .where(
+            *_product_filters(query=query, category=category),
+            *variant_filters,
+        )
+        .group_by(Product.id)
+        # Cheapest match first, which is both a sensible default for a shopper
+        # and a total order — without it, LIMIT would return an arbitrary
+        # subset that changes between runs. Product.id breaks ties so the
+        # result is reproducible, which the tests depend on.
+        .order_by(cheapest.asc(), Product.id.asc())
+        .limit(limit)
+    )
 
 
 def _rows_to_products(rows: Sequence[Any], order: Sequence[int]) -> list[dict]:

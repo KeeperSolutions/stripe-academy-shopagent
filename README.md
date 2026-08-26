@@ -190,8 +190,8 @@ because editing prose does not make a stored vector NULL. `text-embedding-3-smal
 had to be added to `PRICING` in `llm/usage.py`, with the output price at 0.0 —
 an embedding call has no completion to bill.
 
-**The HNSW index is decorative at this size.** It exists because the syntax is
-worth knowing:
+**The HNSW index is decorative at this size — but it had to be made usable
+anyway.** It exists because the syntax is worth knowing:
 
 ```sql
 CREATE INDEX ix_products_embedding_hnsw ON products USING hnsw (embedding vector_cosine_ops);
@@ -203,6 +203,40 @@ it should. The detail that does matter at any size is `vector_cosine_ops`: an
 index built for one operator class is silently unused by a query ranking with a
 different operator, and `search.py` ranks with `<=>`. It is also built after
 the vectors exist, since an index over an all-NULL column has nothing to build.
+
+**Decorative is not the same as unusable, and the first version of this query
+was unusable.** Code review caught it and `EXPLAIN` settled it. An HNSW index
+serves exactly one shape — `ORDER BY embedding <=> $1` with a `LIMIT`, over a
+plain scan of the table — and the query had neither half of it: the distance
+was wrapped in `min()` behind a `GROUP BY`, and a `products.id` tie-break
+followed it. Each alone is enough to lose the index:
+
+```
+ORDER BY embedding <=> $1                 -> Index Scan using ix_products_embedding_hnsw
+ORDER BY embedding <=> $1, products.id    -> Sort  (whole table)
+min(embedding <=> $1) after GROUP BY      -> Sort  (whole table)
+```
+
+So the variant filters moved into an `EXISTS` subquery, which leaves the outer
+statement a scan of `products`, and the tie-break came out. Losing it costs
+nothing real — exact ties between float distances do not happen — and it was
+the difference between an index scan and sorting every qualifying row.
+
+Thirty products cannot show this: the planner sequential-scans either shape,
+correctly. Loading 2,000 synthetic products into a transaction and rolling it
+back afterwards makes the choice real, and the two plans separate:
+
+```
+new:  Limit -> Nested Loop Semi Join -> Index Scan using ix_products_embedding_hnsw
+                                          Order By: (embedding <=> $1)
+old:  Limit -> Sort (2030 rows) -> HashAggregate
+```
+
+The same measurement turned up a subtler thing. An index scan never returns
+rows whose vector is NULL, because they are not in the index, while a
+sequential scan sorts them last. The same query would therefore return 29 or 30
+rows depending on the plan Postgres picked. Products without a vector are now
+excluded from a semantic search explicitly, so both plans agree.
 
 **Filtering stays in SQL, ranking only changes the ORDER BY.** The trap here is
 easy to fall into and quiet when you do: rank the five nearest products, then

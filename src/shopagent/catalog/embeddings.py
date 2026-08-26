@@ -14,7 +14,6 @@ call.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -90,6 +89,13 @@ def embed_products(
     `force=True` re-embeds everything, which is what an edited description or a
     changed embedding model needs.
     """
+    # Validated before anything else, because both bad values fail badly:
+    # `range(0, n, 0)` raises an incidental ValueError from deep inside the
+    # loop, and a negative step yields an empty range, so the pass reports a
+    # successful run of zero work while every product is still unembedded.
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be at least 1; got {batch_size}")
+
     client = client or default_client()
     summary = EmbedSummary()
 
