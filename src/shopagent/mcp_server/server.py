@@ -249,9 +249,15 @@ def search_products(
         str | None,
         Field(
             description=(
-                "Restrict to one catalogue section. Matched loosely, but the "
-                "sections are known and lowercase: shoes, jackets, bags, "
-                'accessories, equipment. Example: "shoes".'
+                "Restrict to one catalogue section. Matched exactly, not as a "
+                'prefix or a synonym: "shoe" does not match "shoes" and '
+                '"footwear" matches nothing at all. Capitalisation and '
+                "surrounding spaces do not matter. There are five sections and "
+                "these are all of them: shoes, jackets, bags, accessories, "
+                "equipment. If what the shopper wants is not one of those five, "
+                "leave category out entirely and describe it in query instead — "
+                "a section that does not exist returns nothing rather than "
+                'something close. Example: "shoes".'
             )
         ),
     ] = None,

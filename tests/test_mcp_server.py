@@ -545,3 +545,65 @@ def test_the_rewrite_leaves_a_handwritten_message_alone():
     message = message_of(call_over_transport("search_products", {"max_price_cents": -500}))
 
     assert message.endswith("out to search without that bound.")
+
+
+# --- category matches exactly, and the schema has to say so --------------
+#
+# `catalog/search.py` lowercases and trims, then compares for equality. That is
+# the right behaviour — category is a closed set of five values the model has
+# in front of it — but the schema described it as "matched loosely", which
+# invited a near miss like "shoe" and returned an unexplained empty list.
+# The description was the bug. These tests hold the two halves together.
+
+
+def test_the_category_description_promises_exact_matching():
+    """The schema must not advertise fuzziness the query does not have."""
+    description = schema_of("search_products")["properties"]["category"]["description"]
+
+    assert "Matched exactly" in description
+    assert "loosely" not in description.lower()
+
+
+def test_the_category_description_lists_every_section():
+    """A closed set is only useful to the model if the model has all of it."""
+    description = schema_of("search_products")["properties"]["category"]["description"]
+
+    for section in ("shoes", "jackets", "bags", "accessories", "equipment"):
+        assert section in description
+
+
+def test_the_category_description_says_what_to_do_when_it_is_not_a_section():
+    """Without this the model retries synonyms against a closed set forever."""
+    description = schema_of("search_products")["properties"]["category"]["description"]
+
+    assert "query" in description
+
+
+@pytest.mark.db
+def test_a_near_miss_category_returns_nothing_on_purpose(seeded):
+    """"shoe" is not "shoes", and that is deliberate rather than a bug.
+
+    Pinned so nobody later "fixes" it into a prefix or fuzzy match. The closed
+    set is what makes exactness safe: the model is given all five names, so a
+    value outside them is a mistake worth surfacing as an empty result rather
+    than papering over with a guess about what was meant.
+    """
+    result = call_over_transport("search_products", {"category": "shoe", "limit": 50})
+
+    assert result.is_error is False
+    assert count_of(result) == 0
+
+
+@pytest.mark.db
+def test_case_and_surrounding_space_do_not_change_a_category(seeded):
+    """The three spellings the description promises are interchangeable."""
+    counts = {
+        spelling: count_of(
+            call_over_transport("search_products", {"category": spelling, "limit": 50})
+        )
+        for spelling in ("shoes", "Shoes", "  SHOES  ")
+    }
+
+    assert counts["shoes"] > 0, "expected the seeded catalog to contain shoes"
+    assert len(set(counts.values())) == 1, counts
+
