@@ -49,8 +49,11 @@ turns into a rounding bug at checkout.
 **`amount_cents` and `price_cents` are two names on purpose — do not unify
 them.** `prices.amount_cents` is a database column: one row per currency per
 variant, with an `active` flag, so a price that was once charged stays
-readable. `price_cents` is a field in the flattened result the search functions
-return and the model reads — one number, already resolved to the active price
+readable — at most one of them active at a time, which a partial unique index
+on `(variant_id, currency) WHERE active` enforces, because a second active row
+in one currency reaches the model as the same sku twice at two prices.
+`price_cents` is a field in the flattened result the search functions return
+and the model reads — one number, already resolved to the active price
 in the session currency. The rename happens exactly where the layer changes.
 Making them the same word would hide that boundary, and the first symptom would
 be a tool handing the model a row that has three prices attached.

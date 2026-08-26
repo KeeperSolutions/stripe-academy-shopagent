@@ -134,6 +134,93 @@ def test_a_duplicate_sku_is_rejected(session):
     assert "sku" in str(excinfo.value).lower()
 
 
+def test_a_second_active_price_in_the_same_currency_is_rejected(session):
+    """One active price per variant per currency, enforced partially.
+
+    Without this the search join returns the variant once per active row, and
+    the model is handed the same sku twice with two different `price_cents`.
+    Superseded rows are unaffected — that is what makes the index partial.
+    """
+    product = make_product(session)
+    variant = product.variants[0]
+    variant.prices.append(Price(currency="usd", amount_cents=7999, active=True))
+
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_a_second_inactive_price_is_allowed(session):
+    """The other half: price history is the reason `active` exists."""
+    product = make_product(session)
+    variant = product.variants[0]
+    variant.prices.append(Price(currency="usd", amount_cents=7999, active=False))
+    session.commit()
+
+    assert len(variant.prices) == 2
+
+
+def test_an_active_price_in_another_currency_is_allowed(session):
+    product = make_product(session)
+    variant = product.variants[0]
+    variant.prices.append(Price(currency="eur", amount_cents=8499, active=True))
+    session.commit()
+
+    assert {price.currency for price in variant.prices} == {"usd", "eur"}
+
+
+def test_reserving_more_than_is_in_stock_is_rejected(session):
+    """`quantity - reserved` is what is left to sell, so it cannot go negative.
+
+    A negative `available` would travel straight through `check_stock` into the
+    D9 guardrail that decides whether a checkout may proceed.
+    """
+    product = make_product(session)
+    product.variants[0].inventory.reserved = 99
+
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_reserving_exactly_the_whole_stock_is_allowed(session):
+    product = make_product(session)
+    inventory = product.variants[0].inventory
+    inventory.reserved = inventory.quantity
+    session.commit()
+
+    assert inventory.quantity - inventory.reserved == 0
+
+
+def test_two_products_cannot_share_a_name_and_brand(session):
+    """The identity `seed.py` looks products up by, enforced by the database."""
+    make_product(session)
+    duplicate = Product(
+        name="Trail Runner 3",
+        description="A different entry for the same shoe.",
+        category="shoes",
+        brand="Fleetfoot",
+        variants=[Variant(size="44", color="black", sku="SKU-OTHER-44")],
+    )
+    session.add(duplicate)
+
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_the_same_name_under_another_brand_is_fine(session):
+    make_product(session)
+    other_brand = Product(
+        name="Trail Runner 3",
+        description="Another maker's shoe that happens to share a name.",
+        category="shoes",
+        brand="Northridge",
+        variants=[Variant(size="44", color="black", sku="SKU-NR-44")],
+    )
+    session.add(other_brand)
+    session.commit()
+
+    assert other_brand.id is not None
+
+
 def test_a_negative_price_is_rejected(session):
     product = make_product(session)
     product.variants[0].prices.append(Price(currency="usd", amount_cents=-1))

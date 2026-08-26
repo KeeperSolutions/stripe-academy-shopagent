@@ -27,7 +27,7 @@ the long way round to avoid a word, that is why.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -488,17 +488,18 @@ class SeedSummary:
 
 
 def _product_for(session: Session, spec: ProductSpec) -> Product | None:
-    """Find the stored product for a spec, through any variant it already has.
+    """Find the stored product for a spec, by name and brand.
 
-    Products have no natural key of their own — two shops can sell a shoe with
-    the same name. The sku is unique, so it is the identity used here, and a
-    product is "already seeded" when one of its variants is present.
+    Those two together are a product's identity here, and `products` carries a
+    unique constraint on them so the database agrees. Looking the product up
+    through a surviving sku instead — which is what this did first — works only
+    while a sku survives: delete every variant of a single-variant product and
+    the row is still there, unreachable, and the next seed run inserts a second
+    copy of it. That is the "restores a missing variant" behaviour failing at
+    exactly the case it exists for.
     """
     return session.scalars(
-        select(Product)
-        .join(Variant)
-        .where(Variant.sku.in_([variant.sku for variant in spec.variants]))
-        .limit(1)
+        select(Product).where(Product.name == spec.name, Product.brand == spec.brand)
     ).first()
 
 

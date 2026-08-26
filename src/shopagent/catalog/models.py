@@ -22,9 +22,13 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
+    UniqueConstraint,
+    func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -48,13 +52,24 @@ class Product(Base):
     """A sellable item, independent of size or colour."""
 
     __tablename__ = "products"
+    __table_args__ = (
+        # Products have no natural key of their own, which let the seeder
+        # create a second "Runner's Cap" when the first one's only variant had
+        # been deleted: identity was inferred from a surviving sku, and there
+        # was none. Name and brand together are the identity the seed data
+        # already assumes, so the database now enforces it and `seed.py` can
+        # look a product up by it.
+        UniqueConstraint("name", "brand", name="uq_products_name_brand"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(200))
     description: Mapped[str] = mapped_column(Text)
-    # Indexed because search filters on it before ranking by similarity: the
-    # cheap SQL predicate should cut the candidate set, not the vector scan.
-    category: Mapped[str] = mapped_column(String(60), index=True)
+    # The index on this column is declared below as a functional index over
+    # `lower(category)`, because that is the expression the search compares
+    # against. A plain index would sit unused: `WHERE lower(category) = 'shoes'`
+    # cannot read one built on the raw column.
+    category: Mapped[str] = mapped_column(String(60))
     brand: Mapped[str] = mapped_column(String(80))
     # Nullable on purpose. Rows arrive from the seed (step 2) with no vector
     # and are filled in by the embedding pass (step 4); NOT NULL would make
@@ -120,6 +135,18 @@ class Price(Base):
         # A negative price is not a discount, it is a bug. Cheap to forbid in
         # the schema; expensive to notice at checkout.
         CheckConstraint("amount_cents >= 0", name="ck_prices_amount_cents_positive"),
+        # At most one *active* price per variant per currency. Superseded rows
+        # stay, which is the point of the `active` flag, so the uniqueness is
+        # partial. Without it the search join returns a variant once per active
+        # row: the same sku reaching the model twice, with two different
+        # `price_cents`, and nothing to say which one it would be charged.
+        Index(
+            "uq_prices_one_active_per_variant_currency",
+            "variant_id",
+            "currency",
+            unique=True,
+            postgresql_where=text("active"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -150,6 +177,14 @@ class Inventory(Base):
     __table_args__ = (
         CheckConstraint("quantity >= 0", name="ck_inventory_quantity_positive"),
         CheckConstraint("reserved >= 0", name="ck_inventory_reserved_positive"),
+        # Reserved units are a subset of the units on hand, so `quantity -
+        # reserved` is what is left to sell. Allowing reserved past quantity
+        # made that difference negative, and a negative `available` travels
+        # straight through `check_stock` into the guardrail D9 builds on top
+        # of it.
+        CheckConstraint(
+            "reserved <= quantity", name="ck_inventory_reserved_within_quantity"
+        ),
     )
 
     variant_id: Mapped[int] = mapped_column(
@@ -159,3 +194,11 @@ class Inventory(Base):
     reserved: Mapped[int] = mapped_column(Integer, default=0)
 
     variant: Mapped[Variant] = relationship(back_populates="inventory")
+
+
+# Declared out here rather than in `__table_args__` because it indexes an
+# expression rather than a column, and the expression needs the mapped
+# attribute to build. `search.py` compares `lower(products.category)`; an index
+# on the raw column cannot serve that, which EXPLAIN confirms by falling back
+# to a sequential scan.
+Index("ix_products_category_lower", func.lower(Product.category))

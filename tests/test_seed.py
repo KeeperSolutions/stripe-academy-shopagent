@@ -105,6 +105,34 @@ def test_a_removed_variant_is_restored_without_duplicating_its_product(empty_ses
     assert count(empty_session, Variant) == EXPECTED_VARIANTS
 
 
+def test_a_product_whose_every_variant_is_gone_is_repaired_not_duplicated(
+    empty_session,
+):
+    """The case the sku-based lookup could not see.
+
+    `Runner's Cap` has one variant. Delete it and the product row is still
+    there, but there is no sku left to find it by, so the seeder used to insert
+    a second `Runner's Cap` and hang the restored variant on that. Identity now
+    comes from name and brand, which survive.
+    """
+    seed_catalog(empty_session)
+    product_id = empty_session.scalars(
+        select(Product.id).where(Product.name == "Runner's Cap")
+    ).one()
+    empty_session.execute(delete(Variant).where(Variant.product_id == product_id))
+    empty_session.commit()
+
+    summary = seed_catalog(empty_session)
+
+    assert summary.products_created == 0
+    assert count(empty_session, Product) == EXPECTED_PRODUCTS
+    assert count(empty_session, Variant) == EXPECTED_VARIANTS
+    restored = empty_session.scalars(
+        select(Variant).where(Variant.product_id == product_id)
+    ).all()
+    assert len(restored) == 1
+
+
 def test_reset_clears_the_catalog_and_everything_hanging_off_it(empty_session):
     seed_catalog(empty_session)
 
