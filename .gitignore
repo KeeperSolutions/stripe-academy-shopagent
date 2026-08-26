@@ -12,3 +12,6 @@ notes/
 *.egg-info/
 build/
 dist/
+
+# MCP Inspector / Playwright scratch output
+.playwright-mcp/

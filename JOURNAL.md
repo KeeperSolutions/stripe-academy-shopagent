@@ -213,6 +213,112 @@ both a first and an immediately repeated call, against OpenAI's 1,024-token
 minimum. The accounting works and is tested; the prompt is simply too small.
 D5 is where it should finally engage, when MCP supplies the catalog schemas.
 
+## Day 4 — findings
+
+**`FastMCP` does not exist in `mcp` 2.0.** The plan, and every tutorial written
+before the 2.0 release, opens with `from mcp.server.fastmcp import FastMCP`.
+That module was renamed: it is `mcp.server.mcpserver` now, the class is
+`MCPServer`, and the import that works is `from mcp.server import MCPServer`.
+Grepping the installed package for `FastMCP` returns nothing at all, so the
+failure is an immediate `ModuleNotFoundError` rather than a deprecation warning.
+Decorators and handler signatures came through the rename unchanged, which is
+why this cost an import line and not a redesign — but a v1 tutorial does not run
+against a v2 pin, and `mcp>=1.2` in `requirements.txt` would happily have
+installed either. It is `mcp>=2,<3` now.
+
+**The `Args:` section of a docstring never reaches the parameter schema.** The
+plan says "docstrings and types are the contract — MCP generates the schemas the
+model sees from them". Half true, and the half that is false is the expensive
+one. A tool's *docstring* becomes its `description`; the *argument* schema is
+built from the type hints alone. An `Args:` block describing each parameter is
+read by nobody: the properties come out carrying a type and a title and no
+`description` at all. Per-parameter text requires
+`Annotated[..., Field(description=...)]`, which is a Pydantic annotation and not
+a docstring convention. Checked by generating both forms side by side before
+writing anything, which is the only reason `search_products` does not ship with
+seven undocumented properties. Both channels are used now — the docstring says
+when to call a tool, the `Field` says what one argument means.
+
+**A returned string describing a failure is indistinguishable from success.**
+The obvious way to report "no such product" is to return a sentence saying so.
+It arrives at the client as `isError: false` with that sentence as the content —
+byte-identical in shape to a successful answer, and the model has only prose to
+tell them apart. The only way a client sees an error is an exception: the SDK
+catches whatever a tool raises, wraps it as `ToolError`, and the protocol
+handler turns that into `CallToolResult(is_error=True)`. So `get_product_details`
+and `check_stock` raise on an unknown id rather than returning `None` or a
+message. Worth pinning precisely, because the two layers disagree on purpose:
+`server.call_tool(...)` — the bare Python API — *raises*, while the same call
+over the transport *returns* `is_error`. A test asserts both, since step 3's
+error handling is built on the distinction.
+
+**An empty list serialises to zero content blocks.** `search_products` returning
+`[]` produced `content: []` — not an empty string, not an empty array rendered
+as text, but no blocks at all. `structuredContent` still carried `{"result": []}`,
+so a client reading structured output was fine; a client reading `content`, which
+is the shape the D5 adapter will hand the model, received literally nothing. "No
+matches" and "the call did nothing" then look the same, and the difference is
+operational: the first means widen a filter, the second means retry. The fix is
+an envelope — `search_products` returns `{count, results}` — so one object always
+renders as one block and `count: 0` states the outcome in words. No filtering and
+no reshaping of an individual product: the envelope exists purely to make
+emptiness legible.
+
+**The SDK's logging handler quietly truncated the logs.** `MCPServer.__init__`
+calls the SDK's own `configure_logging`, which installs a `RichHandler` whenever
+`rich` is importable — and it is, as a transitive dependency. That handler
+formats for a terminal: it wraps to the console width, and with stderr a pipe
+rather than a tty it falls back to a default width and cuts. What sits at the end
+of a log line here is the arguments and the duration, so exactly the diagnostic
+payload was being dropped while the line still looked like a log entry. A
+`logging.basicConfig` in `main()` did nothing about it, because the handler was
+already installed at import time and `basicConfig` is a no-op once handlers
+exist. `force=True` with an explicit stderr handler fixes it. A log that drops
+its payload is worse than no log, because nothing about it looks broken.
+
+**A bare `dict` return annotation produces no output schema.** `-> dict` yields
+`outputSchema: None` and no `structuredContent`; `-> dict[str, Any]` yields a
+free-form object schema, and a `TypedDict` yields a real one with named
+properties. Two of the four tools were shipping without an output contract on the
+strength of an annotation that looked complete. The return types are
+`dict[str, Any]` now, and `search_products` returns a `SearchResults` TypedDict so
+that `count` and `results` appear in the schema rather than only in prose.
+
+**Edge cases: which are errors, and which are simply empty.** The line drawn is
+that an error is what the model *must* change to get any answer at all, and an
+empty result is what valid arguments return when the shop holds nothing like
+that. The distinction matters because the two demand opposite next moves —
+correct the argument, or relax a filter.
+
+| Case | Outcome | Why |
+|---|---|---|
+| `max_price_cents` < 0 | error | No catalogue holds a product priced below zero. Returning nothing would read as "nothing that cheap" and invite the model to search lower — the one direction that cannot help |
+| `min_price_cents` < 0 | error | Same |
+| `min` > `max` | error | The range is empty by construction and stays empty however much the shop grows, so "widen the filter" leads nowhere |
+| `limit` outside 1-50 | clamped, succeeds | The model still gets a usable answer, just a different size. Refusing would cost a turn to teach it something the schema already states |
+| `query` empty or whitespace | succeeds, browses | An empty query means "no query". `catalog.search_products` skips embedding for it, so it costs nothing — worth a test, because that guard is invisible from outside and easy to delete |
+| `size`/`color` with no match | empty result | Arguments valid, shop has none. Exactly what the envelope was built for |
+| unknown `product_id`/`variant_id` | error | The id is wrong; repeating it cannot start working |
+
+**Pydantic's validation message is written for a developer, and is left mostly
+alone.** A wrong argument type never reaches a tool body — the SDK validates
+against the generated model first — so the text the model reads is Pydantic's
+own, ending in a link to `errors.pydantic.dev` and tagged with an internal type
+code. Rewriting it properly would mean loosening the schema types so the error
+never fires, which makes the mistake *more* likely in order to make the message
+prettier. Instead a small middleware trims the trailing noise and the generated
+model name while keeping the field name and the expected type. It fires only on
+text carrying Pydantic's own header, so the hand-written messages pass through
+untouched, and a test asserts that.
+
+**The catalog tools open their own database sessions, and they close.** A
+long-lived server leaking a connection per call is a real failure mode, so it was
+measured rather than assumed: 40 consecutive `check_stock` calls through a real
+stdio subprocess held the backend count in `pg_stat_activity` at exactly 1
+throughout and 0 after shutdown, and `engine.pool.status()` reported 0 checked
+out after 50 mixed operations. `_session_for` from D3 does the work — the tool
+passes no session, so `session_scope` opens one and closes it in a `finally`.
+
 ## Known gaps
 
 **The CLI does not stream while tools are in play.** `chat_with_tools` is a
@@ -266,3 +372,39 @@ output with `strict` unset. Under strict every tool argument would become
 required, so a Pydantic default would stop meaning "the model may omit this" —
 a change to the tool contract rather than a formatting fix. Revisit on D5/D9,
 when MCP supplies the schemas anyway.
+
+**Price validation lives in the MCP wrapper, not in `catalog/search.py`.** A
+negative bound or a minimum above a maximum is rejected in
+`mcp_server/server.py`, because D4 is where the plan puts edge cases and because
+changing `search_products` would change the contract D3 tests. The cost is that
+the rule is not where the function is: a caller reaching
+`catalog.search_products` directly — which is what D9 does behind its own
+tools — still gets a silent empty list for `max_price_cents=-500`. Either the
+validation moves down into `catalog/`, or D9 repeats it in its own wrapper. The
+first is tidier and is a change to D3's tested surface, so it is a decision
+rather than a chore.
+
+**The `limit` clamp is silent.** `search.py` clamps to 1-50, so a model asking
+for 100 gets at most 50 and is told nothing about it. The parameter description
+now says the clamp exists and points at `count` as the authority on how many came
+back, which is a docstring rather than a signal in the response — a model that
+ignores the description learns nothing from the result either. Making it explicit
+needs a third field in the envelope, which was deliberately not added while the
+shape is this new.
+
+**The upper half of that clamp has never actually fired.** The catalog holds 30
+products, so `limit=100` returns everything that matched and never reaches the
+cap of 50 — the clamp is verified by reading `max(1, min(int(limit), MAX_LIMIT))`
+and by the lower bound, where `limit=0` and `limit=-5` both return one result.
+The 50 ceiling is asserted in a test as a range rather than observed, and will
+stay that way until the catalog outgrows it.
+
+**The MCP middleware logs `query`, which stops being safe on D6.** Every tool
+call is logged with its arguments, and that is deliberate: `query` is the one
+argument that shows what the model understood the shopper to want, so redacting
+it would gut the log precisely where D5 needs it. It is safe today only because
+the text is a developer's own — typed into the Inspector or a test. D6 brings
+real carts and real customers, and the same field becomes something a stranger
+wrote. Before this server sees production traffic, `query` needs redaction, a
+hash, or a config flag; the ids, prices and timings can stay. Raised by review
+on PR #4 and deferred on purpose rather than missed.

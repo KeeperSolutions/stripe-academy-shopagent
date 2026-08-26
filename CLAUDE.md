@@ -91,6 +91,41 @@ output is not valid under strict mode without a transform: it omits
 `additionalProperties: false`, lists only non-defaulted fields in `required`,
 and emits `default` and `title`. Revisit on D5/D9.
 
+**MCP tools are thin wrappers; the business logic stays in `catalog/`.** The
+server may do three things and no more: adapt the shape to the protocol, turn a
+missing row into an exception, and validate arguments the schema cannot express.
+Adapting the shape is why `search_products` returns `{count, results}` — an empty
+list serialises to zero content blocks, and a client reading `content` cannot
+tell "nothing matched" from "nothing happened". Turning `None` into a raise is
+how a client sees `is_error` at all; a returned string describing the failure
+arrives looking exactly like success. Validating is for rules JSON Schema has no
+way to state — a negative price, or a minimum above a maximum — not for anything
+that depends on what the catalog holds. Everything past those three belongs one
+layer down. The test is whether the wrapper would still be correct against a
+different database: if it would not, the logic is in the wrong file.
+
+**The MCP middleware logs tool arguments, and `query` becomes user input on
+D6.** Every call is logged with its arguments, which is what makes the server
+debuggable once D5 drives it from an agent loop — and `query` is the one
+argument worth reading, because it shows what the model understood the shopper
+to want. Redacting it would blind the log exactly where it earns its keep.
+Today that text is a developer's own, typed into the Inspector or a test. From
+D6 there are real carts and real customers, and `query` becomes something a
+stranger typed: it has to be redacted, hashed, or gated behind a config flag
+before this server sees production traffic. This is an obligation D6 owes, in
+the same way `scripts/seed_catalog.py --reset` owes it a guard — not a bug in
+what is here now.
+
+**A tool's name is written for the model; the function's name is written for
+whoever maintains it, and the two are allowed to differ.** The MCP tool
+`get_product_details` calls `catalog.search.get_product`. `get_product` is right
+in a module where every function is about products and the surrounding code
+supplies the context; `get_product_details` is right in a flat list of tool
+names where the model has only the name to go on and `get_product` reads as a
+near-duplicate of `search_products`. The rename happens in the wrapper, in one
+line, next to the docstring that explains the tool — never by renaming the
+catalog function to suit a caller.
+
 **Tools are plain Python functions that raise on bad input.** They stay
 callable and testable without the registry, which only wraps them.
 
