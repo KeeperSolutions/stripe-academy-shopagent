@@ -39,7 +39,7 @@ from shopagent.config import get_settings
 from shopagent.db import session_scope
 
 # How a `query` is matched. "semantic" embeds it and ranks by cosine distance;
-# "keyword" keeps the ILIKE of step 3, which is what the README comparison
+# "keyword" keeps the ILIKE of step 3, which is what the journal comparison
 # needs and what still answers an exact-name search ("Trail Runner GTX") more
 # sharply than a vector does.
 SearchMode = Literal["semantic", "keyword"]
@@ -329,7 +329,7 @@ def search_products(
     With a `query`, results come back nearest first: the query is embedded and
     ranked against `products.embedding` by cosine distance. Without one, they
     come back cheapest first. `mode="keyword"` swaps the ranking for the ILIKE
-    matching of step 3 — kept because the README comparison needs both halves,
+    matching of step 3 — kept because the journal comparison needs both halves,
     and because an exact name is still something a substring finds better than
     a vector.
 

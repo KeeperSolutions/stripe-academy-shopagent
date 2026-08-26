@@ -10,7 +10,7 @@ neither of those makes an existing vector NULL.
 
 The HNSW index is created at the end, after the vectors exist — an index over
 an empty column has nothing to build. On thirty products it is decorative; see
-the note in the README.
+the note in JOURNAL.md.
 """
 
 from __future__ import annotations

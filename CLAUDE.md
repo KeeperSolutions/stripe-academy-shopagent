@@ -7,8 +7,9 @@ project, built without an agent framework so the agent loop stays visible.
 ## Language
 
 Everything committed to this repo is in English: code, comments, docstrings,
-test names, CLI strings, system prompts, README and commit messages. The
-planning notes under `notes/` are the one exception, and they are not tracked.
+test names, CLI strings, system prompts, README, JOURNAL and commit messages.
+The planning notes under `notes/` are the one exception, and they are not
+tracked.
 
 ## Layout
 
