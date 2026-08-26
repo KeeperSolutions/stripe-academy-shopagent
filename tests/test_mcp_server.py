@@ -26,14 +26,25 @@ into a failure rather than a bill.
 
 from __future__ import annotations
 
+import io
+import logging
+import sys
+
 import anyio
 import pytest
 from mcp.client.client import Client
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from rich.console import Console
+from rich.logging import RichHandler
 from sqlalchemy import text
 
-from shopagent.mcp_server.server import SERVER_NAME, ping, server
+from shopagent.mcp_server.server import (
+    SERVER_NAME,
+    configure_stderr_logging,
+    ping,
+    server,
+)
 
 # The tool names the model sees. They are pinned as a list because the set of
 # tools *is* the interface: D5 loads them dynamically, so a rename here is a
@@ -607,3 +618,77 @@ def test_case_and_surrounding_space_do_not_change_a_category(seeded):
     assert counts["shoes"] > 0, "expected the seeded catalog to contain shoes"
     assert len(set(counts.values())) == 1, counts
 
+
+# --- the logging configuration, which is easy to silently undo -----------
+#
+# `MCPServer.__init__` installs a `RichHandler` whenever `rich` is importable.
+# It wraps to console width and, with stderr a pipe, truncates — cutting off
+# the end of every line, which is where the arguments and the duration are.
+# `configure_stderr_logging` exists only to remove it, and removing `force=True`
+# would silently restore the truncation, because `basicConfig` is a no-op once
+# any handler is installed. These tests reproduce that exact setup.
+
+
+@pytest.fixture
+def restored_root_logging():
+    """Put the root logger back afterwards.
+
+    `configure_stderr_logging` calls `basicConfig(force=True)`, which removes
+    every existing handler — pytest's own capture handlers included. Without
+    this fixture the first test to run would quietly disable logging capture
+    for the rest of the session.
+    """
+    root = logging.getLogger()
+    saved_handlers, saved_level = list(root.handlers), root.level
+    try:
+        yield root
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
+def test_configuring_removes_a_handler_the_sdk_already_installed(restored_root_logging):
+    """The whole point of `force=True`: an existing handler must not survive."""
+    rich_handler = RichHandler(console=Console(stderr=True))
+    restored_root_logging.handlers[:] = [rich_handler]
+
+    configure_stderr_logging()
+
+    assert rich_handler not in restored_root_logging.handlers
+    assert not any(isinstance(h, RichHandler) for h in restored_root_logging.handlers)
+
+
+def test_the_installed_handler_writes_to_stderr(restored_root_logging, monkeypatch):
+    """stdout carries JSON-RPC. A log line on it corrupts the protocol."""
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    configure_stderr_logging()
+
+    (handler,) = restored_root_logging.handlers
+    assert isinstance(handler, logging.StreamHandler)
+    assert handler.stream is stderr
+
+
+def test_a_long_line_reaches_the_log_intact(restored_root_logging, monkeypatch):
+    """The regression this guards is silent: the line still looks like a log.
+
+    A `RichHandler` is installed first, exactly as the SDK leaves things, and
+    the console is given a narrow width so that wrapping would be unmistakable.
+    Drop `force=True` and that handler survives, the message comes out wrapped
+    and decorated, and this fails.
+    """
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+    restored_root_logging.handlers[:] = [RichHandler(console=Console(stderr=True, width=80))]
+
+    configure_stderr_logging()
+    payload = (
+        "tool search_products args={'query': 'a deliberately long query written to "
+        "run past any console width a handler might wrap at'} -> ok in 12.3ms"
+    )
+    logging.getLogger("test").info(payload)
+
+    written = stderr.getvalue()
+    assert payload in written
+    assert written.count("\n") == 1, f"the line was wrapped: {written!r}"
