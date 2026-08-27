@@ -38,7 +38,12 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from shopagent.api.lifecycle import OrderStatus, TransitionEffects, transition
+from shopagent.api.lifecycle import (
+    OrderStatus,
+    TransitionEffects,
+    check_transition,
+    transition,
+)
 from shopagent.api.models import Cart, CartItem, CartStatus, Order, OrderItem
 from shopagent.api.services.cart import CartNotFound, variant_label
 from shopagent.catalog.models import Inventory, Price, Product, Variant
@@ -437,10 +442,24 @@ def apply_transition(
     Raises `IllegalTransition` untouched: the router maps it to 409, and the
     lifecycle's own message already names both statuses.
     """
-    effects = transition(order, new_status)
+    # Lock the row before reading the status that decides whether stock moves.
+    # Without it two concurrent callers — a refund arriving twice from D8, say —
+    # both read `paid`, both pass the transition table, and both release the
+    # same reservation. Re-locking a row this transaction already holds is free
+    # in Postgres, so `cancel_order` taking the lock first costs nothing here.
+    #
+    # This is the sanctioned boundary for changing a status, so the protection
+    # belongs here rather than in each caller: a caller that forgot the lock
+    # would be exactly as invisible as the caller that forgot the release, and
+    # that is what concentrating this function was meant to prevent.
+    locked = session.scalar(select(Order).where(Order.id == order.id).with_for_update())
+    if locked is None:
+        raise OrderNotFound(f"no order with id {order.id}")
+
+    effects = transition(locked, new_status)
 
     if effects.releases_reservation:
-        _release_reservation(session, order)
+        _release_reservation(session, locked)
 
     session.commit()
     return effects
@@ -464,18 +483,38 @@ def cancel_order(session: Session, order_id: uuid.UUID) -> Order:
     """
     order = _lock_cart_free_order(session, order_id)
 
-    apply_transition(session, order, OrderStatus.CANCELLED)
+    # Refuse an illegal cancellation *before* touching Stripe. Expiring the
+    # session of an order that is then refused would be a side effect with no
+    # transaction to undo it.
+    check_transition(OrderStatus(order.status), OrderStatus.CANCELLED)
 
+    # Close the payment page before committing the cancellation, not after.
+    # The other order looks tidier and fails badly: the cancellation commits,
+    # the expiry call then times out, and the order is terminally `cancelled`
+    # while its Checkout URL is still payable — with no way back, because a
+    # retry is refused by the transition table. Expiring first means a failure
+    # here leaves the order untouched and the request retryable, and the only
+    # cost of the reverse failure is a session that expired for an order that
+    # stayed open, which the shopper resolves by starting checkout again.
     session_id = order.stripe_checkout_session_id
     if session_id:
         try:
             existing = stripe_svc.retrieve_checkout_session(session_id)
             if existing.status == "open":
                 stripe_svc.expire_checkout_session(session_id)
-        except MissingStripeKey:
-            # Nothing to close if Stripe was never configured; the session id
-            # could not have been written without it.
-            pass
+        except MissingStripeKey as exc:
+            # A stored session id proves Stripe *was* configured when the order
+            # was placed, so a missing key now is a server misconfiguration
+            # rather than "there was never anything to close". Swallowing it
+            # would cancel the order and leave a payable URL behind in silence.
+            raise SessionExpiryFailed(
+                f"order {order_id} has Checkout Session {session_id}, which "
+                "cannot be closed because STRIPE_SECRET_KEY is not configured. "
+                "The order was not cancelled: cancelling it now would leave a "
+                "payable link for an order that no longer exists."
+            ) from exc
+
+    apply_transition(session, order, OrderStatus.CANCELLED)
 
     return order
 

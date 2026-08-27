@@ -134,6 +134,29 @@ class HasStatus(Protocol):
     status: OrderStatus
 
 
+def check_transition(
+    current: OrderStatus, requested: OrderStatus
+) -> TransitionEffects:
+    """Say what a transition would do, or refuse it, without changing anything.
+
+    Split out of `transition()` so a caller can find out whether a move is
+    legal *before* doing irreversible work. `cancel_order` needs exactly that:
+    it expires the Stripe session before committing the cancellation, and
+    expiring the session of an order it was going to refuse anyway would be a
+    side effect with no transaction to roll it back.
+    """
+    current = OrderStatus(current)
+    requested = OrderStatus(requested)
+
+    if requested not in ALLOWED_TRANSITIONS[current]:
+        raise IllegalTransition(current, requested)
+
+    return TransitionEffects(
+        status=requested,
+        releases_reservation=requested in RELEASES_RESERVATION,
+    )
+
+
 def transition(order: HasStatus, new_status: OrderStatus) -> TransitionEffects:
     """Move `order` to `new_status`, or refuse, and say what else must happen.
 
@@ -153,14 +176,6 @@ def transition(order: HasStatus, new_status: OrderStatus) -> TransitionEffects:
     arriving as `paid -> paid` should be visibly rejected, not absorbed as a
     no-op that reads like success in the log.
     """
-    current = OrderStatus(order.status)
-    requested = OrderStatus(new_status)
-
-    if requested not in ALLOWED_TRANSITIONS[current]:
-        raise IllegalTransition(current, requested)
-
-    order.status = requested
-    return TransitionEffects(
-        status=requested,
-        releases_reservation=requested in RELEASES_RESERVATION,
-    )
+    effects = check_transition(OrderStatus(order.status), OrderStatus(new_status))
+    order.status = effects.status
+    return effects

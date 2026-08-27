@@ -290,19 +290,28 @@ def expire_checkout_session(session_id: str) -> Any:
 # --- customers (D7 step 4) -----------------------------------------------
 
 
-def create_customer(*, email: str, name: str | None = None) -> Any:
-    """Create a Stripe Customer. The SDK call and nothing else.
+def create_customer(
+    *, email: str, name: str | None = None, idempotency_key: str | None = None
+) -> Any:
+    """Create a Stripe Customer.
 
-    No idempotency key. Stripe happily stores several Customers with the same
-    email — it treats the field as data, not as an identity — so a key would
-    only deduplicate within its 24-hour window and would do nothing about the
-    same email arriving next week. Deduplication is `payments/customers.py`'s
-    job and is done by looking first.
+    Stripe stores as many Customers with the same email as it is asked to — it
+    treats the field as data, not identity — so deduplication is
+    `payments/customers.py`'s job and is done by looking first.
+
+    The key closes the window that looking cannot. Two first orders for the
+    same address arriving together both find nothing and both create, because
+    look-then-create is check-then-act; a key derived from the address makes
+    Stripe answer the second with the first one's Customer. It covers 24 hours,
+    which is the concurrent case rather than the returning-shopper case — that
+    one is answered by the local lookup, which is durable.
     """
     params: dict[str, Any] = {"email": email}
     if name:
         params["name"] = name
-    return get_client().v1.customers.create(params=params)
+
+    options = {"idempotency_key": idempotency_key} if idempotency_key else None
+    return get_client().v1.customers.create(params=params, options=options)
 
 
 def find_customers_by_email(email: str, limit: int = 1) -> list[Any]:

@@ -97,7 +97,22 @@ class CheckoutTotalMismatch(CheckoutError):
 
 
 def _load_order(session: Session, order_id: uuid.UUID) -> Order:
-    order = session.get(Order, order_id)
+    """Load the order with a row lock, because what follows decides a write.
+
+    Two things race without it. Two concurrent checkout requests both see no
+    stored session, both create one, and the order ends up with two payable
+    URLs while remembering only the second — the first stays open and
+    chargeable with nothing pointing at it. And a concurrent cancellation can
+    commit `cancelled` between this read and the write below, leaving a fresh
+    payable session attached to an order that no longer exists.
+
+    The stored `stripe_checkout_session_id` only makes a *later* call
+    idempotent; it cannot order two calls that overlap. `cancel_order` takes
+    the same lock, so the two serialise against each other.
+    """
+    order = session.scalar(
+        select(Order).where(Order.id == order_id).with_for_update()
+    )
     if order is None:
         raise OrderNotFound(f"no order with id {order_id}")
     return order

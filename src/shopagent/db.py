@@ -99,24 +99,32 @@ class ForeignKeyGap:
 
     table: str
     columns: tuple[str, ...]
+    expected_target: str
     expected_ondelete: str
-    actual_ondelete: str | None  # None means the constraint is absent entirely
+    # None on both means the constraint is absent entirely.
+    actual_target: str | None
+    actual_ondelete: str | None
 
     @property
     def is_missing(self) -> bool:
-        return self.actual_ondelete is None
+        return self.actual_ondelete is None and self.actual_target is None
 
     def describe(self) -> str:
         columns = ", ".join(self.columns)
+        expected = f"-> {self.expected_target} ON DELETE {self.expected_ondelete}"
+
         if self.is_missing:
             return (
                 f"{self.table}({columns}) has no foreign key at all; "
-                f"the models declare ON DELETE {self.expected_ondelete}"
+                f"the models declare {expected}"
             )
-        return (
-            f"{self.table}({columns}) is ON DELETE {self.actual_ondelete}, "
-            f"but the models declare ON DELETE {self.expected_ondelete}"
-        )
+        actual = f"-> {self.actual_target} ON DELETE {self.actual_ondelete}"
+        return f"{self.table}({columns}) is {actual}, but the models declare {expected}"
+
+
+def _target(table: str, columns: list[str]) -> str:
+    """`variants(id)` — what a foreign key points at, as one comparable string."""
+    return f"{table}({', '.join(columns)})"
 
 
 def _declared_ondelete(constraint) -> str:
@@ -159,25 +167,113 @@ def find_foreign_key_gaps(engine: Engine | None = None) -> list[ForeignKeyGap]:
             # `create_all` reports it. Not this function's business.
             continue
 
+        # Keyed by the constrained columns, carrying both what the constraint
+        # points at and how it deletes. Comparing the delete action alone would
+        # call a foreign key correct while it referenced the wrong table
+        # entirely — which is a worse fault than a wrong ON DELETE and would
+        # have been reported as a match.
         actual = {
-            tuple(fk["constrained_columns"]): (fk.get("options") or {}).get(
-                "ondelete", "NO ACTION"
-            ).upper()
+            tuple(fk["constrained_columns"]): (
+                _target(fk["referred_table"], fk["referred_columns"]),
+                ((fk.get("options") or {}).get("ondelete") or "NO ACTION").upper(),
+            )
             for fk in inspector.get_foreign_keys(table.name)
         }
 
         for constraint in table.foreign_key_constraints:
             columns = tuple(c.name for c in constraint.columns)
-            expected = _declared_ondelete(constraint)
+            expected_ondelete = _declared_ondelete(constraint)
+            expected_target = _target(
+                constraint.referred_table.name,
+                [element.column.name for element in constraint.elements],
+            )
             found = actual.get(columns)
 
-            if found is None or found != expected:
+            if found is None:
                 gaps.append(
                     ForeignKeyGap(
                         table=table.name,
                         columns=columns,
-                        expected_ondelete=expected,
-                        actual_ondelete=found,
+                        expected_target=expected_target,
+                        expected_ondelete=expected_ondelete,
+                        actual_target=None,
+                        actual_ondelete=None,
+                    )
+                )
+                continue
+
+            found_target, found_ondelete = found
+            if found_target != expected_target or found_ondelete != expected_ondelete:
+                gaps.append(
+                    ForeignKeyGap(
+                        table=table.name,
+                        columns=columns,
+                        expected_target=expected_target,
+                        expected_ondelete=expected_ondelete,
+                        actual_target=found_target,
+                        actual_ondelete=found_ondelete,
+                    )
+                )
+
+    return gaps
+
+
+@dataclass(frozen=True)
+class ColumnGap:
+    """A column the models declare that the live database does not have."""
+
+    table: str
+    column: str
+    declared_type: str
+
+    def describe(self) -> str:
+        return (
+            f"{self.table}.{self.column} is declared in the models "
+            f"({self.declared_type}) but does not exist in the database"
+        )
+
+
+def find_column_gaps(engine: Engine | None = None) -> list[ColumnGap]:
+    """Columns the models declare and the database lacks.
+
+    The commerce tables are not disposable, so a schema change to them is an
+    `ALTER`, applied by hand from `migrations/`. Nothing enforces that it was
+    applied: `create_all` builds missing *tables* and never alters an existing
+    one, so it reports a table as "already present" while it is missing the
+    column added last week. The first symptom is `UndefinedColumn` from an
+    ordinary read, at whatever moment the ORM first selects that column — which
+    is a long way from the change that caused it.
+
+    Reported rather than repaired, for the same reason `find_foreign_key_gaps`
+    is: a script that issues its own `ALTER` statements against a table holding
+    real orders is a migration tool, and this project has deliberately not
+    built one. Naming the gap and pointing at `migrations/` is the whole job.
+
+    Extra columns in the database are not reported. They are what a rolled-back
+    deployment looks like, they break nothing, and flagging them would make the
+    check noisy in exactly the situation where it needs to be trusted.
+    """
+    engine = engine or get_engine()
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+
+    from shopagent.catalog.models import Base
+
+    gaps: list[ColumnGap] = []
+
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue
+
+        actual = {column["name"] for column in inspector.get_columns(table.name)}
+
+        for column in table.columns:
+            if column.name not in actual:
+                gaps.append(
+                    ColumnGap(
+                        table=table.name,
+                        column=column.name,
+                        declared_type=str(column.type),
                     )
                 )
 

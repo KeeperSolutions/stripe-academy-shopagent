@@ -751,6 +751,36 @@ argument: D8 exists to flip one order to `paid` on one event, and a Payment
 Link leaves it guessing. Payment Links are right for selling one product from a
 link in a post; they are wrong for a cart.
 
+**A prohibition without a replacement reads as a decision.** D7 added two
+columns to `orders`. `orders` is a commerce table, so the catalog's "drop and
+reseed" rule does not apply to it, and `create_all` cannot alter a table it did
+not create — so the columns went in as an `ALTER` typed into a terminal, and
+that was reported in conversation and nowhere else. A fresh clone would have
+built a database without them, and the first symptom would have been
+`UndefinedColumn` from an ordinary read of `Order`, a long way from the change
+that caused it.
+
+The interesting part is why it was not noticed at the time. `CLAUDE.md` said
+"the catalog is disposable, so there is no Alembic", and D6 correctly added
+that this stops at the commerce tables — but it never said what applies
+*instead*. A rule that forbids something and offers nothing in its place leaves
+a hole shaped exactly like a decision: there was no migrations directory, so
+running a statement by hand looked like the intended workflow rather than the
+absence of one. Nobody was reasoning badly; the document had a gap and the gap
+was invisible from inside.
+
+Two things came out of it. The convention is now written down — numbered
+idempotent SQL in `migrations/`, the exact command to apply it, and the
+reasoning for having no migrations table. And, because a written convention is
+still only a convention, `scripts/create_schema.py` now compares the models
+against the live database and exits 2 on any missing column or mismatched
+foreign key. The document explains; the exit code is what actually catches it.
+
+The same failure had already happened once this day in a different disguise —
+the foreign keys a catalog drop removed, which `create_all` also would not
+restore. Both are the same shape: a mechanism that only creates, trusted to
+keep a schema correct after it has changed.
+
 **The balance transaction is not the charge amount.** The $284.97 charge
 settled as `amount=24469, fee=1285, net=23184` — a different number because the
 account settles in a currency other than the one charged. Nothing in this

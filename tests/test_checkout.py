@@ -11,9 +11,12 @@ afterwards. Stripe keeps Checkout Sessions permanently and offers no delete, so
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 
 import pytest
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
 
 from shopagent.api.lifecycle import OrderStatus
 from shopagent.api.models import Order, OrderItem
@@ -30,6 +33,26 @@ from shopagent.payments.checkout import (
 pytestmark = pytest.mark.db
 
 MISSING_UUID = uuid.UUID("00000000-0000-0000-0000-000000000000")
+
+
+@contextlib.contextmanager
+def recorded_sql():
+    """Every SQL statement executed inside the block.
+
+    Row locks are invisible in single-threaded behaviour, so the statements are
+    read directly — the same technique `test_api_orders.py` uses on
+    `place_order`, and for the same reason.
+    """
+    statements: list[str] = []
+
+    def listener(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(Engine, "before_cursor_execute", listener)
+    try:
+        yield statements
+    finally:
+        event.remove(Engine, "before_cursor_execute", listener)
 
 
 def make_variant(session, *, sku: str, amount_cents: int = 2500) -> Variant:
@@ -623,7 +646,10 @@ def test_the_success_page_says_the_order_is_not_paid_yet(api_client, monkeypatch
     assert "Payment received" in response.text
     assert "has not been marked paid yet" in response.text
     assert "abc-123" in response.text
-    assert "4200" in response.text
+    # Formatted for a person, not echoed in minor units: `4200 USD` reads as
+    # four thousand dollars to the shopper who just paid forty-two.
+    assert "42.00 USD" in response.text
+    assert "4200 USD" not in response.text
 
 
 def test_the_success_page_does_not_change_the_order(authed_client, session, monkeypatch):
@@ -703,3 +729,196 @@ def test_stripe_accepts_payment_intent_data_on_a_real_session(authed_client, ses
     finally:
         if session_id:
             stripe_svc.expire_checkout_session(session_id)
+
+
+# --- what review on PR #7 turned up --------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("minor_units", "currency", "expected"),
+    [
+        (28497, "usd", "284.97 USD"),
+        (4200, "usd", "42.00 USD"),
+        (100, "usd", "1.00 USD"),
+        (0, "usd", "0.00 USD"),
+        # Zero-decimal: the smallest unit *is* the unit, so dividing invents a
+        # decimal part the currency does not have.
+        (5000, "jpy", "5,000 JPY"),
+        (None, "usd", "—"),
+    ],
+)
+def test_amounts_are_rendered_for_a_person(minor_units, currency, expected):
+    from shopagent.api.routers.checkout_pages import format_amount
+
+    assert format_amount(minor_units, currency) == expected
+
+
+def test_an_unreadable_session_does_not_claim_nothing_was_charged(
+    api_client, monkeypatch
+):
+    """A server that cannot check is not a server that knows.
+
+    A key can be rotated or removed after a session was created and paid.
+    Telling a shopper who was charged that they were not is the worst of the
+    three possible answers, so neither failure branch says it.
+    """
+    def no_key(session_id):
+        raise stripe_svc.MissingStripeKey("STRIPE_SECRET_KEY is not set")
+
+    monkeypatch.setattr(stripe_svc, "retrieve_checkout_session", no_key)
+
+    response = api_client.get("/checkout/success?session_id=cs_test_x")
+
+    assert response.status_code == 200
+    assert "Nothing was charged" not in response.text
+    assert "does not mean the payment did not go through" in response.text
+
+
+def test_creating_a_checkout_locks_the_order_row(authed_client, session, monkeypatch):
+    """Two concurrent checkouts would otherwise leave two payable sessions.
+
+    Both read "no stored session", both create one, and the order remembers
+    only the second — the first stays open and chargeable with nothing pointing
+    at it. Invisible single-threaded, so the SQL is read instead.
+    """
+    order_id = make_order(authed_client, session, [("CHK-LOCK-SQL", 700, 1)])
+
+    class FakeSession:
+        id = "cs_test_lock"
+        url = "https://example.test/pay"
+
+    monkeypatch.setattr(stripe_svc, "create_checkout_session", lambda **kw: FakeSession())
+
+    with recorded_sql() as statements:
+        create_checkout_session(session, uuid.UUID(order_id))
+
+    normalised = [" ".join(s.lower().split()) for s in statements]
+    locked = [s for s in normalised if "from orders" in s and "for update" in s]
+    assert locked, "the order row was read without FOR UPDATE"
+
+
+def test_applying_a_transition_locks_the_order_row(authed_client, session):
+    """The sanctioned boundary carries the lock, so no caller has to remember.
+
+    Two concurrent refunds would otherwise both read `paid`, both pass the
+    transition table, and both release the same reservation.
+    """
+    from shopagent.api.services import orders as order_service
+
+    order_id = make_order(authed_client, session, [("CHK-TRANS-SQL", 600, 1)])
+    order = session.get(Order, uuid.UUID(order_id))
+
+    with recorded_sql() as statements:
+        order_service.apply_transition(session, order, OrderStatus.PAID)
+
+    normalised = [" ".join(s.lower().split()) for s in statements]
+    assert [s for s in normalised if "from orders" in s and "for update" in s]
+
+
+def test_cancelling_expires_the_session_before_committing(
+    authed_client, session, monkeypatch
+):
+    """Ordering, asserted rather than described.
+
+    Committing first and expiring after fails badly: the cancellation stands,
+    the expiry times out, and a terminally cancelled order keeps a payable URL
+    with no way back — a retry is refused by the transition table.
+    """
+    order_id = make_order(authed_client, session, [("CHK-ORDER-SQL", 800, 1)])
+    session.execute(
+        Order.__table__.update()
+        .where(Order.id == uuid.UUID(order_id))
+        .values(stripe_checkout_session_id="cs_test_order_check")
+    )
+    session.commit()
+
+    seen: list[str] = []
+
+    class Open:
+        id = "cs_test_order_check"
+        status = "open"
+
+    monkeypatch.setattr(
+        stripe_svc, "retrieve_checkout_session", lambda sid: seen.append("retrieve") or Open()
+    )
+
+    def expire(sid):
+        # The status must still be pending at this point: if the cancellation
+        # had already been committed, this would read `cancelled`.
+        session.refresh(order)
+        seen.append(f"expire:{order.status.value}")
+
+    monkeypatch.setattr(stripe_svc, "expire_checkout_session", expire)
+
+    from shopagent.api.services import orders as order_service
+
+    order = session.get(Order, uuid.UUID(order_id))
+    order_service.cancel_order(session, uuid.UUID(order_id))
+
+    assert seen == ["retrieve", "expire:pending"]
+    session.refresh(order)
+    assert order.status is OrderStatus.CANCELLED
+
+
+def test_cancelling_refuses_when_the_session_cannot_be_closed(
+    authed_client, session, monkeypatch
+):
+    """A stored session id proves Stripe was configured when the order was placed.
+
+    Swallowing a missing key now would cancel the order and leave a payable
+    link behind in silence.
+    """
+    from shopagent.api.services import orders as order_service
+
+    order_id = make_order(authed_client, session, [("CHK-NOKEY", 800, 1)])
+    session.execute(
+        Order.__table__.update()
+        .where(Order.id == uuid.UUID(order_id))
+        .values(stripe_checkout_session_id="cs_test_orphan")
+    )
+    session.commit()
+
+    def no_key(session_id):
+        raise stripe_svc.MissingStripeKey("STRIPE_SECRET_KEY is not set")
+
+    monkeypatch.setattr(stripe_svc, "retrieve_checkout_session", no_key)
+
+    with pytest.raises(order_service.SessionExpiryFailed):
+        order_service.cancel_order(session, uuid.UUID(order_id))
+
+    order = session.get(Order, uuid.UUID(order_id))
+    session.refresh(order)
+    assert order.status is OrderStatus.PENDING, "the order was cancelled anyway"
+
+
+def test_an_order_survives_stripe_being_down_when_attaching_a_customer(
+    authed_client, session, monkeypatch
+):
+    """`place_order` has already committed by the time the buyer is attached.
+
+    An exception here would surface as a 500 for an order that exists, and the
+    retry would be refused with 409 because the cart is already ordered —
+    leaving the caller without the order id at all.
+    """
+    from shopagent.payments import customers as customer_service
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("Stripe is unreachable")
+
+    monkeypatch.setattr(customer_service, "get_or_create_customer", boom)
+
+    variant = make_variant(session, sku="CHK-CUST-DOWN", amount_cents=900)
+    cart_id = authed_client.post("/cart").json()["cart_id"]
+    authed_client.post(f"/cart/{cart_id}/items", json={"variant_id": variant.id, "quantity": 1})
+
+    response = authed_client.post(
+        "/orders", json={"cart_id": cart_id, "customer_email": "down@example.com"}
+    )
+
+    assert response.status_code == 201
+    order_id = response.json()["order_id"]
+    order = session.get(Order, uuid.UUID(order_id))
+    session.refresh(order)
+    # The email is ours and is kept; the Stripe Customer is the part that failed.
+    assert order.customer_email == "down@example.com"
+    assert order.stripe_customer_id is None

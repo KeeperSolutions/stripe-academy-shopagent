@@ -91,6 +91,56 @@ this half of the schema needs a migration path — `create_all` is still the
 mechanism only because these tables are young, not because dropping them is
 ever acceptable.
 
+**Schema changes to those tables go in `migrations/`, as numbered idempotent
+SQL.** "No Alembic" was a rule about the catalog, and for a long time it was
+the only rule there was — which left changing a commerce table with a
+prohibition and no replacement. The gap looked like a decision, so D7's two
+`orders` columns were added with an `ALTER` typed into a terminal and reported
+in conversation, and nothing in the repository recorded that a database built
+before them needed anything at all.
+
+The convention, which D8's `processed_events` is the next to need:
+
+- **One numbered file per change**, `migrations/NNNN_short_description.sql`.
+  The number is the order they were written, not a version anything reads.
+- **Every statement is idempotent**: `ADD COLUMN IF NOT EXISTS`,
+  `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`. Re-running a
+  migration must be a no-op, not an error.
+- **Applies to `carts`, `cart_items`, `orders`, `order_items` and every table
+  added later that holds real data.** The catalog's four keep their own rule —
+  drop, `create_all`, reseed — because `catalog/seed.py` can rebuild them and
+  nothing of a customer's is in there.
+
+Applied with, from the repository root:
+
+```bash
+docker compose exec -T db psql -U shopagent -d shopagent \
+  -f /dev/stdin < migrations/0001_d7_order_customer_columns.sql
+```
+
+**The repository does not track which migrations have run, on purpose.** A
+migrations table is a second record of the schema, and the failure it produces
+is the one this whole area exists to prevent: the ledger says a migration was
+applied while the column is not there, and every check that trusts the ledger
+agrees. Idempotent SQL plus drift detection covers the same ground with no such
+state — `scripts/create_schema.py` asks the *database* what it has, compares it
+against the models, exits **2** on any missing column or mismatched foreign
+key, and can be run at any time by anyone. Re-running every migration in order
+is always safe, which is what makes the ledger unnecessary rather than merely
+absent.
+
+That trade has an edge, and it is worth knowing where: it holds only while
+migrations are additive. The day one has to backfill or transform existing rows,
+`IF NOT EXISTS` stops being able to express "already done", and a record of what
+ran becomes the only way to know. That is the moment to introduce Alembic — not
+before, and not by hand.
+
+`create_all` remains the mechanism for creating tables that do not exist yet.
+It never alters one that does, which is why it reports a table as "already
+present" while that table is missing the column added last week, and why the
+first symptom without the check above is `UndefinedColumn` from an ordinary
+read.
+
 That is enforced mechanically rather than remembered. `order_items.variant_id`
 is `ON DELETE RESTRICT`, so Postgres refuses `DELETE FROM products` while any
 order line points into the catalog — against any client, psql included.
@@ -243,14 +293,25 @@ and a different amount is a different object. A stored id — `stripe_product_id
 makes a second run free and lets a shopper return the next day to the session
 they left. Neither substitutes for the other.
 
-**`metadata.order_id` is mandatory on every Checkout Session, and it does not
-propagate.** Verified against a real payment: the session carries it, and the
-PaymentIntent and Charge it produces both have empty metadata. D8 must
-therefore listen to `checkout.session.completed`; `payment_intent.succeeded`
-arrives with no way to say which order it belongs to. This is also why the
-project uses a Checkout Session rather than a Payment Link — a Payment Link is
-a durable URL bound to a Price, reusable by anyone holding it and carrying no
-per-order metadata at all.
+**`metadata.order_id` is mandatory on every Checkout Session, and it is sent
+twice because Stripe does not propagate it.** A session's `metadata` stays on
+the session: verified against a real payment, the PaymentIntent and Charge it
+produced both came back with `metadata: {}`. So the checkout also passes
+`payment_intent_data={"metadata": {"order_id": ...}}`, and a second payment
+confirmed the identifier then reaches the PaymentIntent *and* its Charge.
+
+The distinction matters when reading this code: **nothing propagates
+automatically, and the explicit copy is why all three objects carry it.** D8 may
+therefore subscribe to `checkout.session.completed`,
+`payment_intent.succeeded` or `charge.succeeded` and attribute any of them —
+but only for as long as that parameter keeps being sent, which is what the
+offline test on the outgoing payload exists to guard. No PaymentIntent exists
+until a shopper starts paying, so nothing on an unpaid session can prove the
+copy arrived.
+
+This is also why the project uses a Checkout Session rather than a Payment
+Link — a Payment Link is a durable URL bound to a Price, reusable by anyone
+holding it and carrying no per-order metadata at all.
 
 **`lifecycle.transition()` returns `TransitionEffects` and is called only
 through `api/services/orders.py::apply_transition`.** The function stays pure

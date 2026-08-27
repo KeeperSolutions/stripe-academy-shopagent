@@ -192,3 +192,118 @@ def test_the_models_and_the_database_agree_about_every_foreign_key(engine):
     gaps = find_foreign_key_gaps(engine)
 
     assert not gaps, "\n".join(gap.describe() for gap in gaps)
+
+
+# --- what review on PR #7 turned up --------------------------------------
+
+
+def test_the_gap_check_notices_a_foreign_key_pointing_somewhere_else(engine):
+    """Comparing the delete action alone called a wrong target a match.
+
+    A constraint on the right columns with the right ON DELETE but referencing
+    the wrong table is a worse fault than a wrong ON DELETE, and the derived
+    check reported it as fine. It now compares what the key points at too.
+    """
+    import shopagent.api.models  # noqa: F401
+
+    from shopagent.db import ForeignKeyGap, find_foreign_key_gaps
+
+    # The healthy state, so the assertion below means something.
+    assert find_foreign_key_gaps(engine) == []
+
+    gap = ForeignKeyGap(
+        table="cart_items",
+        columns=("variant_id",),
+        expected_target="variants(id)",
+        expected_ondelete="CASCADE",
+        actual_target="products(id)",
+        actual_ondelete="CASCADE",
+    )
+    assert not gap.is_missing
+    described = gap.describe()
+    assert "products(id)" in described
+    assert "variants(id)" in described
+
+
+def test_a_missing_column_is_reported_rather_than_discovered_at_runtime(engine):
+    """`create_all` never alters an existing table.
+
+    A commerce table that gained a column since it was built stays "already
+    present", and the first symptom is `UndefinedColumn` from an ordinary read.
+    `migrations/` holds the ALTER; this is what says whether it was applied.
+    """
+    import shopagent.api.models  # noqa: F401
+
+    from shopagent.db import find_column_gaps
+
+    assert find_column_gaps(engine) == [], (
+        "this database is missing a column the models declare — apply the "
+        "matching file from migrations/"
+    )
+
+
+def test_the_recorded_migration_covers_the_columns_day_7_added():
+    """The ALTER has to exist in the repo, not only in somebody's shell history.
+
+    These two columns were added to `orders` by hand during D7. Without a file
+    recording that, a database built from Day 6 would lack them and nothing
+    would say so until a query failed.
+    """
+    import pathlib
+
+    migrations = pathlib.Path(__file__).resolve().parents[1] / "migrations"
+    sql = "\n".join(path.read_text() for path in migrations.glob("*.sql"))
+
+    for column in ("customer_email", "stripe_customer_id"):
+        assert column in sql, f"no migration records adding orders.{column}"
+    # Re-runnable, because nothing in this project tracks which have been run.
+    assert "IF NOT EXISTS" in sql
+
+
+def test_every_migration_can_be_applied_twice(session):
+    """Idempotency is the whole reason this project needs no migrations table.
+
+    A ledger of what has run is a second record of the schema, and its failure
+    mode is the one this area exists to prevent: the ledger says applied while
+    the column is not there. The alternative only works if re-running every
+    migration is always safe — so that is asserted rather than assumed, by
+    running each file twice inside a transaction that is rolled back.
+
+    DDL is transactional in Postgres, so nothing here survives the test.
+    """
+    import pathlib
+
+    migrations = sorted(
+        (pathlib.Path(__file__).resolve().parents[1] / "migrations").glob("*.sql")
+    )
+    assert migrations, "no migrations found — this test would pass vacuously"
+
+    for path in migrations:
+        sql = text(path.read_text())
+        session.execute(sql)
+        # The second pass is the claim. A non-idempotent statement raises here.
+        session.execute(sql)
+
+    session.rollback()
+
+
+def test_migrations_are_numbered_so_their_order_is_readable():
+    """The number is the order they were written, not a version anything reads.
+
+    Without it the directory is a set rather than a sequence, and the next
+    person cannot tell which change came first.
+    """
+    import pathlib
+    import re
+
+    migrations = sorted(
+        (pathlib.Path(__file__).resolve().parents[1] / "migrations").glob("*.sql")
+    )
+
+    for path in migrations:
+        assert re.match(r"^\d{4}_[a-z0-9_]+\.sql$", path.name), (
+            f"{path.name} does not match NNNN_short_description.sql"
+        )
+
+    numbers = [path.name[:4] for path in migrations]
+    assert len(numbers) == len(set(numbers)), f"duplicate migration numbers: {numbers}"

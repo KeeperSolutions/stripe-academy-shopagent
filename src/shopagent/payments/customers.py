@@ -19,6 +19,9 @@ first locally, which is free and immediately consistent, then at Stripe.
 
 from __future__ import annotations
 
+import hashlib
+import logging
+
 from typing import Any
 
 from sqlalchemy import select
@@ -26,6 +29,8 @@ from sqlalchemy.orm import Session
 
 from shopagent.api.models import Order
 from shopagent.payments import stripe_svc
+
+logger = logging.getLogger(__name__)
 
 
 def normalise_email(email: str) -> str:
@@ -78,7 +83,12 @@ def get_or_create_customer(session: Session, email: str, name: str | None = None
     if existing:
         return existing[0].id
 
-    created = stripe_svc.create_customer(email=email, name=name)
+    # Derived from the address, never random: two concurrent creations for the
+    # same shopper must collide rather than both succeed.
+    digest = hashlib.sha256(email.encode("utf-8")).hexdigest()[:32]
+    created = stripe_svc.create_customer(
+        email=email, name=name, idempotency_key=f"shopagent-customer-v1-{digest}"
+    )
     return created.id
 
 
@@ -94,7 +104,28 @@ def attach_customer(session: Session, order: Order, email: str | None) -> Order:
     if not email:
         return order
 
+    # The email is ours and is written first, on its own. `place_order` has
+    # already committed the order, the reservation and the terminal cart
+    # status, so an exception from here would surface as a 500 for an order
+    # that exists — and the retry would be refused with 409 because the cart is
+    # already ordered, leaving the caller without the order id at all.
     order.customer_email = normalise_email(email)
-    order.stripe_customer_id = get_or_create_customer(session, email)
     session.commit()
+
+    # The Stripe Customer is a convenience on top of that: it puts the payment
+    # on a timeline in the dashboard. It is not required to place an order, to
+    # read one, or to pay for one — a session falls back to `customer_email`.
+    # So a Stripe outage degrades the result rather than failing the request.
+    try:
+        order.stripe_customer_id = get_or_create_customer(session, email)
+        session.commit()
+    except Exception:
+        session.rollback()
+        logger.warning(
+            "could not attach a Stripe Customer to order %s; the order stands "
+            "and checkout will fall back to customer_email",
+            order.id,
+            exc_info=True,
+        )
+
     return order
