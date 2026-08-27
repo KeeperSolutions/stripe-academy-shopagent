@@ -25,7 +25,7 @@ tracked.
 | `tools/commerce.py` | D9 | cart and checkout, over HTTP |
 | `catalog/` | D3 | models, seed data, embeddings, search |
 | `mcp_server/` | D4 | exposes `catalog/search.py` as MCP tools |
-| `mcp_client/` | D5 | loads tools from MCP dynamically |
+| `mcp_client/` | D5 | client, schema adapter, registration into the registry |
 | `api/` | D6, D8 | FastAPI cart and orders; Stripe webhooks |
 | `payments/` | D7 | Stripe SDK |
 | `agent/` | D9 | memory, guardrails |
@@ -38,7 +38,10 @@ a thin wrapper, which is what lets D5 swap transports without touching logic.
 
 **Configuration goes through `shopagent.config.get_settings()`.** `os.getenv`
 and `os.environ` appear nowhere else. A new variable is added there as a typed
-field, then to `.env.example`, and only then used.
+field, then to `.env.example`, and only then used. `MCP_CATALOG_ENABLED`
+(D5, default true) is the catalog's off switch: false runs the same CLI with the
+two local tools and no server, which is what makes "the product answers come
+from MCP" a claim that can be demonstrated rather than asserted.
 
 **`openai` is imported only in `llm/client.py`.** Changing provider then means
 editing one file rather than hunting through the tree.
@@ -89,7 +92,9 @@ on the server, which hides the very loop this project exists to learn.
 **Function calling is non-strict for now.** Pydantic's `model_json_schema()`
 output is not valid under strict mode without a transform: it omits
 `additionalProperties: false`, lists only non-defaulted fields in `required`,
-and emits `default` and `title`. Revisit on D5/D9.
+and emits `default` and `title`. D5 came and went without it — MCP
+publishes its own schemas, so strict there would mean rewriting a contract the
+server owns. Revisit on D9.
 
 **MCP tools are thin wrappers; the business logic stays in `catalog/`.** The
 server may do three things and no more: adapt the shape to the protocol, turn a
@@ -115,6 +120,19 @@ stranger typed: it has to be redacted, hashed, or gated behind a config flag
 before this server sees production traffic. This is an obligation D6 owes, in
 the same way `scripts/seed_catalog.py --reset` owes it a guard — not a bug in
 what is here now.
+
+**A tool describes its arguments in exactly one of two ways.** `ToolSpec` takes
+either `args_model`, a Pydantic model, or `parameters_schema`, a JSON Schema —
+never both, never neither, and the constructor refuses anything else the way a
+duplicate name is refused. A local tool uses `args_model`: the schema is
+generated from it and `dispatch` validates every call here, so the schema and
+the validation cannot drift. A tool that lives behind MCP uses
+`parameters_schema`, the schema its own server published, and is validated
+there. Rebuilding a model from that schema in order to check the same thing twice
+would make this side a second owner of a contract it does not own, and the first
+symptom would be a call rejected here that the server would have accepted. The
+steps before validation — decoding JSON, refusing a payload that is not an
+object — apply to both.
 
 **A tool's name is written for the model; the function's name is written for
 whoever maintains it, and the two are allowed to differ.** The MCP tool
@@ -182,5 +200,14 @@ python scripts/seed_catalog.py    # 30 products; --reset to rebuild
 python scripts/embed_catalog.py   # vectors + HNSW index; --force to redo
 pytest tests/ -v                  # offline and database tests
 pytest tests/ -m network          # the four that call the API and cost money
-python -m shopagent.llm.loop      # the CLI agent
+python -m shopagent.llm.loop      # the CLI agent (local tools + MCP catalog)
+python scripts/run_mcp_server.py  # the catalog MCP server alone, on stdio
+```
+
+`MCP_CATALOG_ENABLED=false` runs the same CLI without the catalog server. The
+Inspector takes the script path, never `-m shopagent.mcp_server.server`, because
+it parses `-m` as one of its own flags:
+
+```bash
+npx @modelcontextprotocol/inspector .venv/bin/python scripts/run_mcp_server.py
 ```

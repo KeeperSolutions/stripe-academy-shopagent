@@ -15,7 +15,7 @@ import json
 import pytest
 from pydantic import BaseModel, Field
 
-from shopagent.tools.registry import ToolRegistry, ToolSpec
+from shopagent.tools.registry import ToolRegistry, ToolResult, ToolSpec
 
 
 class EchoArgs(BaseModel):
@@ -408,3 +408,154 @@ def test_a_failed_result_always_carries_content_for_the_tool_message(registry):
 
     assert result.content
     assert result.error in result.content
+
+
+# --- a tool that brings its own schema (D5, step 2) ----------------------
+#
+# A remote tool publishes JSON Schema, not a Pydantic model, and validates its
+# own arguments. `ToolSpec` therefore takes either `args_model` or
+# `parameters_schema` — never both, never neither. Everything above this line
+# is the `args_model` half and is unchanged, which is the point: widening the
+# spec must not have moved anything a local tool relies on.
+
+
+REMOTE_SCHEMA = {
+    "type": "object",
+    "properties": {"product_id": {"type": "integer", "title": "Product Id"}},
+    "required": ["product_id"],
+    "title": "remoteArguments",
+}
+
+
+def remote_fn(**arguments):
+    """Stand-in for the call that would cross a pipe."""
+    return {"received": arguments}
+
+
+def test_a_schema_backed_spec_publishes_the_schema_it_was_given():
+    """Passed through as published, not regenerated — see ToolSpec."""
+    spec = ToolSpec(
+        name="remote", description="A remote tool.", fn=remote_fn,
+        parameters_schema=REMOTE_SCHEMA,
+    )
+
+    schema = spec.to_openai_schema()
+
+    assert schema == {
+        "type": "function",
+        "function": {
+            "name": "remote",
+            "description": "A remote tool.",
+            "parameters": REMOTE_SCHEMA,
+        },
+    }
+    assert schema["function"]["parameters"] is REMOTE_SCHEMA
+
+
+def test_a_model_backed_spec_is_unchanged_by_the_widening():
+    """The D2 shape, asserted again now that a second shape exists."""
+    schema = ECHO_SPEC.to_openai_schema()
+
+    assert schema["type"] == "function"
+    assert schema["function"]["name"] == "echo"
+    assert schema["function"]["parameters"] == EchoArgs.model_json_schema()
+
+
+def test_validates_locally_distinguishes_the_two_kinds():
+    remote = ToolSpec(
+        name="r", description="d", fn=remote_fn, parameters_schema=REMOTE_SCHEMA
+    )
+
+    assert ECHO_SPEC.validates_locally is True
+    assert remote.validates_locally is False
+
+
+def test_a_spec_describing_its_arguments_in_neither_way_is_refused():
+    """Our bug, not the model's — so it fails at construction, loudly."""
+    with pytest.raises(ValueError, match="neither args_model nor parameters_schema"):
+        ToolSpec(name="broken", description="d", fn=remote_fn)
+
+
+def test_a_spec_describing_its_arguments_in_both_ways_is_refused():
+    """Two descriptions of one contract are two things free to disagree."""
+    with pytest.raises(ValueError, match="both args_model and parameters_schema"):
+        ToolSpec(
+            name="broken", description="d", fn=remote_fn,
+            args_model=EchoArgs, parameters_schema=REMOTE_SCHEMA,
+        )
+
+
+def test_a_schema_backed_tool_receives_the_arguments_unvalidated():
+    """No Pydantic step: the dict reaches the tool as the model sent it."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(name="remote", description="d", fn=remote_fn, parameters_schema=REMOTE_SCHEMA)
+    )
+
+    result = registry.dispatch("remote", {"product_id": 7})
+
+    assert result.ok is True
+    assert json.loads(result.content) == {"received": {"product_id": 7}}
+
+
+@pytest.mark.parametrize(
+    "raw_args",
+    [
+        {},                                   # required field missing
+        {"product_id": "not an integer"},     # wrong type
+        {"product_id": 1, "extra": True},     # a field the schema does not have
+        '{"product_id": 3}',                  # a JSON string, decoded before the call
+    ],
+)
+def test_dispatch_never_raises_on_a_schema_backed_tool(raw_args):
+    """The D2 invariant holds for the new shape too.
+
+    None of these is rejected here — the server owns that judgement — so they
+    reach the tool. What matters is that `dispatch` comes back with a
+    `ToolResult` in every case instead of letting anything escape.
+    """
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(name="remote", description="d", fn=remote_fn, parameters_schema=REMOTE_SCHEMA)
+    )
+
+    result = registry.dispatch("remote", raw_args)
+
+    assert isinstance(result, ToolResult)
+    assert result.content
+
+
+def test_malformed_json_is_still_caught_before_a_schema_backed_tool_runs():
+    """The steps before validation are shared, and still apply."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(name="remote", description="d", fn=remote_fn, parameters_schema=REMOTE_SCHEMA)
+    )
+
+    result = registry.dispatch("remote", "{not json")
+
+    assert result.ok is False
+    assert "not valid JSON" in result.content
+
+
+def test_a_tool_returning_a_tool_result_has_it_passed_through():
+    """How a remote tool reports a failure the registry cannot detect.
+
+    Without this the `ok=False` would be flattened into a success and the
+    model would read the failure text as an answer.
+    """
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="remote",
+            description="d",
+            fn=lambda **kw: ToolResult(ok=False, content="the server said no", error="nope"),
+            parameters_schema=REMOTE_SCHEMA,
+        )
+    )
+
+    result = registry.dispatch("remote", {"product_id": 1})
+
+    assert result.ok is False
+    assert result.content == "the server said no"
+    assert result.error == "nope"

@@ -59,27 +59,73 @@ class ToolResult:
 
 @dataclass(frozen=True)
 class ToolSpec:
-    """One tool: what the model sees, and what actually runs."""
+    """One tool: what the model sees, and what actually runs.
+
+    A tool describes its arguments in one of two ways, and exactly one of them.
+    A local tool gives `args_model`, a Pydantic model: the schema is generated
+    from it and every call is validated against it here, so the schema and the
+    validation cannot drift. A remote tool gives `parameters_schema`, the JSON
+    Schema its own server published, and is validated *there*.
+
+    That second form exists because of what MCP is. The server owns the schema
+    and already rejects bad arguments — D4 measured those rejections reaching
+    the model as usable, correctable text. Rebuilding a Pydantic model from the
+    published schema in order to check the same thing again would make this
+    module a second source of truth for a contract it does not own, and the
+    first symptom of a drift would be a call this side rejects that the server
+    would have accepted.
+    """
 
     name: str
     description: str
-    args_model: type[BaseModel]
     fn: Callable[..., Any]
+    args_model: type[BaseModel] | None = None
+    parameters_schema: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse a spec that describes its arguments in neither or both ways.
+
+        This is a bug in our code, not input from the model, so it fails at
+        registration the way a duplicate name does — loudly, and long before a
+        conversation is riding on it.
+        """
+        if self.args_model is None and self.parameters_schema is None:
+            raise ValueError(
+                f"tool {self.name!r} has neither args_model nor parameters_schema; "
+                "a tool must describe its arguments in one of the two ways"
+            )
+        if self.args_model is not None and self.parameters_schema is not None:
+            raise ValueError(
+                f"tool {self.name!r} has both args_model and parameters_schema; "
+                "the two describe the same thing and would be free to disagree"
+            )
+
+    @property
+    def validates_locally(self) -> bool:
+        """Whether arguments are checked here before the tool runs."""
+        return self.args_model is not None
 
     def to_openai_schema(self) -> dict[str, Any]:
         """The tool definition as the `tools` parameter expects it.
 
-        `parameters` is Pydantic's own output, passed through untouched. The
-        `title` and `default` keys it adds are ignored by the API in
-        non-strict mode; see the note at the top of this module before
-        enabling strict.
+        For a local tool `parameters` is Pydantic's own output; for a remote one
+        it is the server's schema, passed through exactly as published. The
+        `title` and `default` keys either may carry are ignored by the API in
+        non-strict mode; see the note at the top of this module before enabling
+        strict.
         """
+        if self.parameters_schema is not None:
+            parameters = self.parameters_schema
+        else:
+            assert self.args_model is not None  # guaranteed by __post_init__
+            parameters = self.args_model.model_json_schema()
+
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.args_model.model_json_schema(),
+                "parameters": parameters,
             },
         }
 
@@ -199,6 +245,10 @@ class ToolRegistry:
         validation, an exception inside the tool — comes back as a ToolResult
         whose `content` explains the problem to the model, so it gets a chance
         to fix the call on the next turn instead of taking the app down.
+
+        A tool may also return a `ToolResult` itself, which is passed through as
+        it is. That is how a tool reports a failure the registry has no way to
+        detect — an MCP server answering with `isError` rather than raising.
         """
         spec = self.get(name)
         if spec is None:
@@ -210,7 +260,7 @@ class ToolRegistry:
             return bad.result
 
         try:
-            value = spec.fn(**arguments.model_dump())
+            value = spec.fn(**arguments)
         except Exception as exc:  # noqa: BLE001 - a tool may raise anything
             # Broad on purpose: a buggy tool must not end the conversation.
             # The exception type is included because it is often the only clue
@@ -221,6 +271,16 @@ class ToolRegistry:
                 "Do not repeat the identical call. Either correct the arguments "
                 "or tell the user this is currently unavailable.",
             )
+
+        if isinstance(value, ToolResult):
+            # A tool that already knows the call failed says so by returning a
+            # ToolResult, and it is passed through untouched. Remote tools need
+            # this: an MCP server reports failure in the reply rather than by
+            # raising, so without this branch `isError` would be flattened into
+            # a success and the model would read an error message as an answer.
+            # Rendering it instead would also replace the server's text — written
+            # for the model — with this module's repr of it.
+            return value
 
         try:
             content = _to_content(value)
@@ -240,8 +300,14 @@ class ToolRegistry:
 
     def _parse(
         self, spec: ToolSpec, raw_args: str | dict[str, Any] | None
-    ) -> BaseModel:
-        """Decode and validate arguments, or raise _BadArguments carrying the reply."""
+    ) -> dict[str, Any]:
+        """Decode and validate arguments, or raise _BadArguments carrying the reply.
+
+        Everything up to the Pydantic step applies to every tool: the model can
+        send malformed JSON or a bare list to a remote tool exactly as easily as
+        to a local one, and neither is something a server should have to explain.
+        The validation step is what differs — see the branch at the end.
+        """
         if raw_args is None:
             raw_args = {}
         if isinstance(raw_args, str):
@@ -276,8 +342,15 @@ class ToolRegistry:
                 )
             )
 
+        if spec.args_model is None:
+            # A remote tool owns its own schema and validates against it. Doing
+            # it again here would need a second model built from that schema,
+            # and the day the two disagree this side would reject a call the
+            # server would have accepted — with an error the server never wrote.
+            return raw_args
+
         try:
-            return spec.args_model(**raw_args)
+            return spec.args_model(**raw_args).model_dump()
         except ValidationError as exc:
             raise _BadArguments(
                 ToolResult(
