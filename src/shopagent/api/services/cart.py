@@ -174,8 +174,33 @@ def _check_stock_advisory(session: Session, variant: Variant, wanted: int) -> No
         )
 
 
-def _load_cart(session: Session, cart_id: uuid.UUID) -> Cart:
-    cart = session.get(Cart, cart_id)
+def _load_cart(session: Session, cart_id: uuid.UUID, *, lock: bool = False) -> Cart:
+    """Fetch a cart, optionally taking a row lock on it first.
+
+    Every path that goes on to *write* passes `lock=True`, and the reason is a
+    race this module cannot otherwise win. `place_order` locks the same row,
+    snapshots the items it finds and flips the status to `ordered`. An unlocked
+    add reads `open`, is descheduled, and commits its line after that snapshot
+    has already been taken — leaving an ordered cart holding an item that is on
+    no order, which is goods a shopper believes they bought and nobody was
+    charged for. The status check has to happen *under* the lock that
+    `place_order` respects, or it is a decision made on a value another
+    transaction is free to change before the write lands.
+
+    Locking here also serialises two concurrent adds of the same variant.
+    Without it both read "no existing line", both insert, and the UNIQUE on
+    `(cart_id, variant_id)` turns the loser into an `IntegrityError` — a 500
+    where the shopper should simply have got a merged line.
+
+    `render_cart` passes `lock=False` on purpose. A read has no business taking
+    a write lock: it would make every `GET /cart` queue behind an in-flight
+    checkout for no benefit, since nothing it returns is used to decide a write.
+    """
+    statement = select(Cart).where(Cart.id == cart_id)
+    if lock:
+        statement = statement.with_for_update()
+
+    cart = session.scalar(statement)
     if cart is None:
         raise CartNotFound(f"no cart with id {cart_id}")
     return cart
@@ -222,7 +247,7 @@ def add_item(
         # callers is a service with one validation layer that can be skipped.
         raise ValueError("quantity must be greater than zero")
 
-    cart = _load_cart(session, cart_id)
+    cart = _load_cart(session, cart_id, lock=True)
     _require_open(cart)
 
     variant = session.get(Variant, variant_id)
@@ -267,7 +292,7 @@ def remove_item(
     else is indistinguishable from one that does not exist — which is the
     answer the router is going to give anyway.
     """
-    cart = _load_cart(session, cart_id)
+    cart = _load_cart(session, cart_id, lock=True)
     _require_open(cart)
 
     line = session.scalar(

@@ -79,12 +79,16 @@ class Settings(BaseSettings):
 
     # --- Commerce (D6-D7) ---
     currency: str = "usd"
-    # min_length=1 for the same reason as `openai_api_key` above: a blank
-    # `SHOPAGENT_API_KEY=` in .env would otherwise validate as the empty
-    # string, and D6's auth dependency would be comparing every request
-    # against nothing. The failure has to happen when configuration is read,
-    # not at the first request that should have been refused.
-    shopagent_api_key: str = Field(default="dev-local-key", min_length=1)
+    # Required, with no default, for the same reason `openai_api_key` is: it is
+    # the API's only authentication secret. A default here would be a published
+    # one — every deployment that forgot the variable would be protected by a
+    # string anybody can read in this file, and would look correctly configured
+    # while doing it. `min_length=1` additionally rejects a blank
+    # `SHOPAGENT_API_KEY=` in .env, which would otherwise validate as the empty
+    # string and have `require_api_key` compare every request against nothing.
+    # Both failures happen when configuration is read, not at the first request
+    # that should have been refused.
+    shopagent_api_key: str = Field(min_length=1)
 
     # --- Stripe (D7-D8) --- no values yet, so these must be allowed to be None
     stripe_secret_key: OptionalStr = None

@@ -38,7 +38,7 @@ python scripts/embed_catalog.py
 # 6. verify
 docker compose exec db psql -U shopagent -d shopagent \
   -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
-pytest tests/ -v          # 500 tests; add -m network for the 4 that call the API
+pytest tests/ -v          # 505 tests; add -m network for the 4 that call the API
 ```
 
 Postgres listens on `localhost:5432` (user / password / db: `shopagent`), with data
@@ -71,7 +71,7 @@ python scripts/seed_catalog.py          # 30 products; --reset to rebuild
 python scripts/embed_catalog.py         # vectors + HNSW index; --force to redo
 
 # tests
-pytest tests/ -v                        # 500, offline and database
+pytest tests/ -v                        # 505, offline and database
 pytest tests/ -m network                # the 4 that call the API and cost money
 ```
 

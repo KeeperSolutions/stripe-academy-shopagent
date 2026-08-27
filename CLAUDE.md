@@ -173,10 +173,19 @@ decremented.** Units leave `quantity` when they physically ship, and this
 project has no fulfilment flow — `fulfilled` is a status nothing transitions
 into automatically, so there is no moment at which decrementing would be
 correct. Available stock is `quantity - reserved` everywhere, so a reservation
-already makes the units unsellable. The check in `services/cart.py` is
+already makes the units unsellable. The *stock* check in `services/cart.py` is
 advisory and says so in its docstring: no lock, no write, and two requests can
 both be told there is room. The authoritative check is `place_order`'s, under
 `SELECT ... FOR UPDATE` in the transaction that writes `reserved`.
+
+The cart *row*, by contrast, is locked on every write. `add_item` and
+`remove_item` take `FOR UPDATE` on `carts` before reading the status, because
+`place_order` locks the same row, snapshots the items it finds and flips the
+status to `ordered` — and an unlocked add can read `open`, be descheduled, and
+commit its line after that snapshot, leaving an ordered cart holding an item on
+no order. `render_cart` deliberately does not lock: a read that took a write
+lock would queue every `GET /cart` behind an in-flight checkout for nothing.
+Raised by review on PR #6.
 
 **A table joins `Base.metadata` when its class is imported, so both model
 modules have to be.** `api/models.py` registers on the same `Base` as

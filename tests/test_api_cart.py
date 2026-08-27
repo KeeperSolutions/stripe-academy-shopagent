@@ -12,10 +12,12 @@ file leaves nothing behind. See `tests/conftest.py`.
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
+from sqlalchemy.engine import Engine
 
 from shopagent.api.models import Cart, CartItem, CartStatus
 from shopagent.catalog.models import Inventory, Price, Product, Variant
@@ -421,4 +423,85 @@ def test_every_cart_route_needs_the_key(api_client, session):
     assert (
         api_client.delete(f"/cart/{MISSING_UUID}/items/{MISSING_UUID}").status_code
         == 401
+    )
+
+
+# --- the cart row is locked on every write (review on PR #6) -------------
+#
+# `place_order` locks the cart, snapshots what it finds and flips the status to
+# `ordered`. An unlocked add can read `open`, be descheduled, and commit its
+# line after that snapshot was taken — an ordered cart holding an item that is
+# on no order, which is goods a shopper believes they bought and nobody was
+# charged for. The check has to happen under the same lock `place_order` takes.
+#
+# Like the locks in `test_api_orders.py`, this is invisible in single-threaded
+# behaviour: an implementation without it passes every other test in this file.
+# So the statements are read instead.
+
+
+@contextlib.contextmanager
+def recorded_sql():
+    statements: list[str] = []
+
+    def listener(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(Engine, "before_cursor_execute", listener)
+    try:
+        yield statements
+    finally:
+        event.remove(Engine, "before_cursor_execute", listener)
+
+
+def _cart_selects(statements) -> list[str]:
+    return [
+        " ".join(s.lower().split())
+        for s in statements
+        if "from carts" in " ".join(s.lower().split())
+    ]
+
+
+def test_adding_an_item_locks_the_cart_row(authed_client, session):
+    variant = make_variant(session, sku="CART-LOCK-ADD-SQL")
+    cart_id = new_cart(authed_client)
+
+    with recorded_sql() as statements:
+        assert add(authed_client, cart_id, variant.id, 1).status_code == 201
+
+    locked = [s for s in _cart_selects(statements) if "for update" in s]
+    assert locked, (
+        "the cart row was read without FOR UPDATE, so an add can commit onto a "
+        "cart that place_order has already snapshotted and closed"
+    )
+
+
+def test_removing_an_item_locks_the_cart_row(authed_client, session):
+    variant = make_variant(session, sku="CART-LOCK-DEL-SQL")
+    cart_id = new_cart(authed_client)
+    item_id = add(authed_client, cart_id, variant.id, 1).json()["items"][0]["item_id"]
+
+    with recorded_sql() as statements:
+        assert authed_client.delete(f"/cart/{cart_id}/items/{item_id}").status_code == 204
+
+    locked = [s for s in _cart_selects(statements) if "for update" in s]
+    assert locked, "the cart row was read without FOR UPDATE on the delete path"
+
+
+def test_reading_a_cart_takes_no_write_lock(authed_client, session):
+    """The other half, and it matters as much.
+
+    A read that took `FOR UPDATE` would make every `GET /cart` queue behind an
+    in-flight checkout for no benefit, since nothing it returns decides a write.
+    """
+    variant = make_variant(session, sku="CART-LOCK-GET-SQL")
+    cart_id = new_cart(authed_client)
+    add(authed_client, cart_id, variant.id, 1)
+
+    with recorded_sql() as statements:
+        assert authed_client.get(f"/cart/{cart_id}").status_code == 200
+
+    selects = _cart_selects(statements)
+    assert selects, "the recorder captured no read of the cart to inspect"
+    assert not [s for s in selects if "for update" in s], (
+        "GET /cart took a write lock on the cart row"
     )

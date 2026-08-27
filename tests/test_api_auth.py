@@ -29,7 +29,9 @@ from shopagent.api.deps import (
     require_api_key,
 )
 from shopagent.api.main import app
-from shopagent.config import Settings, get_settings
+from pydantic import ValidationError
+
+from shopagent.config import REPO_ROOT, Settings, get_settings
 
 pytestmark = pytest.mark.db
 
@@ -159,7 +161,6 @@ def test_the_401_names_the_header_a_client_has_to_send():
     [
         pytest.param("", id="empty-string"),
         pytest.param("wrong", id="wrong-key"),
-        pytest.param("dev-local-ke", id="prefix-of-the-real-key"),
         pytest.param("  ", id="whitespace"),
     ],
 )
@@ -168,6 +169,19 @@ def test_a_key_that_is_not_the_key_is_refused(presented):
         response = client.get("/guarded", headers={API_KEY_HEADER: presented})
 
     assert response.status_code == 401
+
+
+def test_a_prefix_of_the_real_key_is_refused():
+    """The case `==` would still get right, and `compare_digest` is here for.
+
+    Built from the configured key rather than hard-coded, so it stays a real
+    prefix whatever the key happens to be.
+    """
+    almost = valid_key()[:-1]
+    assert almost and almost != valid_key()
+
+    with guarded_client() as client:
+        assert client.get("/guarded", headers={API_KEY_HEADER: almost}).status_code == 401
 
 
 # --- the sweep -----------------------------------------------------------
@@ -255,6 +269,40 @@ def test_settings_reject_a_blank_api_key():
     """First layer: `.env` holding `SHOPAGENT_API_KEY=` is a config error."""
     with pytest.raises(ValueError):
         Settings(shopagent_api_key="")
+
+
+def test_the_api_key_has_no_default(monkeypatch):
+    """Raised in review on PR #6, and it was right.
+
+    The field used to default to `"dev-local-key"`, so a deployment that simply
+    forgot `SHOPAGENT_API_KEY` started successfully and authenticated every
+    request against a string published in `.env.example`. It would have looked
+    correctly configured while being open. There is no safe default for the
+    only secret the API has, so there is now no default at all — the same
+    treatment `openai_api_key` already had.
+    """
+    monkeypatch.delenv("SHOPAGENT_API_KEY", raising=False)
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None, openai_api_key="sk-test")
+
+    missing = {error["loc"][0] for error in excinfo.value.errors()}
+    assert "shopagent_api_key" in missing
+
+
+def test_the_example_env_ships_no_usable_key():
+    """`.env.example` is copied verbatim by whoever sets this up next.
+
+    A plausible-looking value there becomes a real credential on somebody's
+    machine, so the placeholder has to be one that cannot be mistaken for a key.
+    """
+    example = (REPO_ROOT / ".env.example").read_text()
+
+    line = next(
+        raw for raw in example.splitlines() if raw.startswith("SHOPAGENT_API_KEY=")
+    )
+    value = line.split("=", 1)[1]
+    assert value == "CHANGE-ME", f"the example ships a usable-looking key: {value!r}"
 
 
 def test_configured_api_key_rejects_a_whitespace_key(monkeypatch):
