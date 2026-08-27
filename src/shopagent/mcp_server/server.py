@@ -42,7 +42,10 @@ logger writes to stderr, which the client leaves alone.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
+import os
 import re
 import sys
 import time
@@ -53,8 +56,70 @@ from mcp.server import MCPServer
 from pydantic import Field
 
 from shopagent.catalog import search as catalog
+from shopagent.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# The one argument that is free text somebody typed. Everything else the tools
+# accept is an id, a category from a closed set, a price bound or a limit —
+# values already visible in the tool schema, and the reason the log is worth
+# keeping at all.
+SENSITIVE_ARGUMENT = "query"
+
+# A per-process salt, generated once at import and never logged. It is what
+# makes the digests below correlatable without being readable.
+#
+# A bare SHA-256 of a shopping query is not a redaction: the space of things a
+# shopper types is small enough that a wordlist recovers most of it, so a
+# leaked log would still say what people searched for. Keying the digest with a
+# secret nobody has removes that entirely.
+#
+# Per-process rather than configured, because the question the log has to
+# answer is "did the model send the same query twice in this conversation",
+# and a conversation lives inside one process. Correlating across restarts is
+# not a use this server has, and a stable salt would be a long-lived secret to
+# store, rotate and eventually leak.
+_LOG_SALT = os.urandom(32)
+
+
+def _digest(text: str) -> str:
+    """Eight hex characters of a keyed digest — enough to tell calls apart.
+
+    Truncated because the log needs an equality token, not a cryptographic
+    commitment; sixty-four characters would push the interesting part of every
+    line off the screen.
+    """
+    return hmac.new(_LOG_SALT, text.encode("utf-8"), hashlib.sha256).hexdigest()[:8]
+
+
+def redact_arguments(arguments: Any) -> Any:
+    """Return the arguments as they should appear in a log line.
+
+    Replaces `query` with a salted digest and leaves every other argument
+    alone. The digest is deliberately not accompanied by the text's length:
+    with the salt in place, length is the only thing left that could narrow a
+    guess, and knowing a query was thirty characters long has never helped
+    anyone debug this server.
+
+    What survives is the two things the log is read for. Whether a query was
+    sent at all is visible from the key being present, and whether the model
+    sent the same one twice is visible from two identical digests. What was
+    searched for is gone.
+
+    Returns the input untouched when redaction is off, when the payload is not
+    a mapping, or when `query` is absent or not a string — a log line is not
+    worth an exception, and a client is free to send nonsense.
+    """
+    if not get_settings().mcp_log_redact_query:
+        return arguments
+    if not isinstance(arguments, dict):
+        return arguments
+
+    value = arguments.get(SENSITIVE_ARGUMENT)
+    if not isinstance(value, str):
+        return arguments
+
+    return {**arguments, SENSITIVE_ARGUMENT: f"<redacted:{_digest(value)}>"}
 
 # What the client sees in the server list. It names the surface rather than the
 # project, because D5 adds a second source of tools (local HTTP commerce) and
@@ -108,10 +173,11 @@ async def log_tool_calls(ctx, call_next):
     this layer sees both ends of the call, and outcome lives here because only
     this layer sees the result after the tool has returned or raised.
 
-    Everything logged is a catalog identifier, a filter or a price — the same
-    things already visible in the tool schema. D6 introduces carts and orders,
-    and the moment a request carries a customer this has to be revisited, since
-    logging an argument is logging whatever the argument happens to contain.
+    Arguments go through `redact_arguments` first. Everything except `query`
+    is a catalog identifier, a filter or a price — already visible in the tool
+    schema, and the reason this log is worth keeping. `query` is free text a
+    shopper typed, and from D6 there are real carts behind it, so it is
+    replaced with a salted digest by default. See `redact_arguments`.
     """
     if ctx.method != "tools/call":
         return await call_next(ctx)
@@ -128,7 +194,13 @@ async def log_tool_calls(ctx, call_next):
         # A raise here is a protocol-level failure, not a tool returning an
         # error result — worth a distinct log line, because the client sees
         # something very different in each case.
-        logger.error("tool %s args=%r raised after %.1fms: %s", name, arguments, elapsed_ms, exc)
+        logger.error(
+            "tool %s args=%r raised after %.1fms: %s",
+            name,
+            redact_arguments(arguments),
+            elapsed_ms,
+            exc,
+        )
         raise
 
     elapsed_ms = (time.perf_counter() - started) * 1000
@@ -137,7 +209,7 @@ async def log_tool_calls(ctx, call_next):
         logging.WARNING if failed else logging.INFO,
         "tool %s args=%r -> %s in %.1fms",
         name,
-        arguments,
+        redact_arguments(arguments),
         "error" if failed else "ok",
         elapsed_ms,
     )

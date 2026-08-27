@@ -26,7 +26,14 @@ tracked.
 | `catalog/` | D3 | models, seed data, embeddings, search |
 | `mcp_server/` | D4 | exposes `catalog/search.py` as MCP tools |
 | `mcp_client/` | D5 | client, schema adapter, registration into the registry |
-| `api/` | D6, D8 | FastAPI cart and orders; Stripe webhooks |
+| `api/main.py` | D6 | the FastAPI app, CORS, `/health`, router mounts |
+| `api/db.py` | D6 | the request-scoped session dependency |
+| `api/deps.py` | D6 | `X-API-Key` authentication |
+| `api/models.py` | D6 | carts and orders, on the catalog's `Base` |
+| `api/lifecycle.py` | D6 | `OrderStatus` and the transitions between them |
+| `api/schemas.py` | D6, D8 | request and response bodies; where names change |
+| `api/routers/` | D6, D8 | HTTP only — parse, call a service, map an error |
+| `api/services/` | D6, D8 | cart and order logic; imports no FastAPI |
 | `payments/` | D7 | Stripe SDK |
 | `agent/` | D9 | memory, guardrails |
 | `obs/` | D10 | Langfuse tracing |
@@ -72,9 +79,128 @@ users did, which no script can regenerate; the moment they exist, altering them
 needs a migration path and this rule stops applying to them. Concretely:
 `scripts/seed_catalog.py --reset` issues `DELETE FROM products` and lets the
 cascade clear the rest, which is safe only while nothing outside the catalog
-points at a variant. D6 owes that script a guard — it must refuse to run while
-any order exists, rather than taking a customer's order lines down with the
-catalog.
+points at a variant. D6 paid that debt — see the next rule.
+
+**`carts`, `cart_items`, `orders` and `order_items` are not seed data.** They
+hold what a shopper actually did, and no script regenerates them, so the rule
+above stops at the catalog's four tables. From the first real order, changing
+this half of the schema needs a migration path — `create_all` is still the
+mechanism only because these tables are young, not because dropping them is
+ever acceptable.
+
+That is enforced mechanically rather than remembered. `order_items.variant_id`
+is `ON DELETE RESTRICT`, so Postgres refuses `DELETE FROM products` while any
+order line points into the catalog — against any client, psql included.
+`assert_no_orders()` in `api/models.py` is the courtesy in front of it:
+`scripts/seed_catalog.py --reset` calls it and stops with a sentence naming how
+many orders are in the way, instead of an `IntegrityError` naming a constraint.
+`cart_items.variant_id` is `ON DELETE CASCADE` on purpose — the opposite answer
+to the same question, because a product that no longer exists cannot be bought
+and has no business sitting in a basket.
+
+**`routers/` speaks HTTP, `services/` speaks the domain, and `services/`
+imports no FastAPI.** A router parses, calls one service function and maps a
+domain exception to a status code; it holds no rule about what a cart may
+contain. The reason is not tidiness: D8's Stripe webhook and D9's agent tools
+call `place_order` and `add_item` outside any request, where an
+`HTTPException` would have nobody to catch it and a 500 would appear where the
+log should have said what was refused. `api/lifecycle.py` follows the same rule
+and goes further, taking anything with a `status` attribute rather than an ORM
+row — which is what lets the whole transition table be swept offline.
+
+**`lifecycle.transition()` is the only way an order's status changes.**
+Assigning `order.status` directly bypasses the table of allowed transitions,
+and the two absences in that table are the ones that matter: `paid → pending`
+and `paid → cancelled`. Once a charge settles the only way back is `refunded`,
+which is a movement of money and a status of its own, and refusing `paid →
+paid` is what makes D8 idempotent when Stripe delivers the same event twice.
+
+Status columns are `Enum(..., native_enum=False, create_constraint=True)` —
+VARCHAR plus a CHECK, never a Postgres enum type. A native enum changes with
+`ALTER TYPE`, which `create_all` never issues, and D8 adding a status is a
+realistic week rather than a hypothetical one. `create_constraint=True` is
+spelled out because SQLAlchemy 2.0 defaults it to `False`, and a bare VARCHAR
+that accepts any string at all is the failure that looks like it works.
+
+**Authentication is attached to the router mount, never to a route.** Routers
+are included with `dependencies=[Depends(require_api_key)]`, so a route added
+later is protected by where it lives rather than by whoever wrote it
+remembering a decorator. A missing key is **401, not 403**: 403 is the answer
+to a known caller who may not do this, and it tells a client that retrying with
+a credential is pointless. That is why `deps.py` declares
+`APIKeyHeader(auto_error=False)` and raises by hand — `auto_error=True` answers
+403 to a missing header — and declaring the scheme is also what puts the
+Authorize button in `/docs`. The comparison is `secrets.compare_digest`, never
+`==`, because string equality returns at the first differing byte and how long
+that takes measures how much of the key was right.
+
+An unusable key kills the process at import: `min_length=1` on the setting
+rejects a blank `.env` value, `configured_api_key()` rejects a whitespace-only
+one that passes a length check and authenticates nobody, and `api/main.py`
+calls it at module scope so uvicorn dies while loading rather than starting and
+refusing every request afterwards. `/health` is unauthenticated and touches no
+database — a liveness probe that queries reports the database's latency as the
+process's liveness, so a slow Postgres reads as a dead API and the wrong thing
+gets restarted.
+
+**The rename from `amount_cents` to `price_cents` happens in
+`api/schemas.py`.** `prices.amount_cents` and `order_items.unit_amount_cents`
+are database columns; `unit_price_cents` and `total_cents` are what a reader
+gets — one number, already resolved to the active price in the session
+currency. Never copy a column name through to a response because it was
+convenient; that is the boundary the two names exist to mark.
+
+A cart total is computed from the database on every read, never from a request
+and never cached on the cart, because a stored total is a number that is right
+until a price changes. An order's total is the opposite: written once from the
+snapshot and never recomputed.
+
+**`order_items` snapshots enough to render an order with no join to the
+catalog.** `sku`, `product_name`, `variant_label`, `unit_amount_cents`,
+`currency` and `quantity` are copied at order time, because prices change and
+products get renamed while an order is a record of an event rather than a view
+over current data. This is asserted by recording the SQL `render_order`
+actually issues and failing if any of the four catalog tables appears — not by
+checking that the response fields came back populated, which an implementation
+that joins the catalog would satisfy perfectly right up to the day a row
+changes. The row locks in `place_order` are tested the same way and for the
+same reason: `FOR UPDATE` and its `ORDER BY variant_id` are invisible in
+single-threaded behaviour, so an implementation that dropped them would pass
+every behavioural test and fail only in production.
+
+**`inventory.reserved` rises when an order is placed; `quantity` is never
+decremented.** Units leave `quantity` when they physically ship, and this
+project has no fulfilment flow — `fulfilled` is a status nothing transitions
+into automatically, so there is no moment at which decrementing would be
+correct. Available stock is `quantity - reserved` everywhere, so a reservation
+already makes the units unsellable. The *stock* check in `services/cart.py` is
+advisory and says so in its docstring: no lock, no write, and two requests can
+both be told there is room. The authoritative check is `place_order`'s, under
+`SELECT ... FOR UPDATE` in the transaction that writes `reserved`.
+
+The cart *row*, by contrast, is locked on every write. `add_item` and
+`remove_item` take `FOR UPDATE` on `carts` before reading the status, because
+`place_order` locks the same row, snapshots the items it finds and flips the
+status to `ordered` — and an unlocked add can read `open`, be descheduled, and
+commit its line after that snapshot, leaving an ordered cart holding an item on
+no order. `render_cart` deliberately does not lock: a read that took a write
+lock would queue every `GET /cart` behind an in-flight checkout for nothing.
+Raised by review on PR #6.
+
+**A table joins `Base.metadata` when its class is imported, so both model
+modules have to be.** `api/models.py` registers on the same `Base` as
+`catalog/models.py` — one base, one `create_all`, one schema. The consequence
+is that `scripts/create_schema.py` and `tests/conftest.py` both import
+`shopagent.api.models` for the side effect alone: importing `Base` by itself
+builds the catalog's four tables and none of the commerce ones, which is a
+schema that looks complete until the first missing relation.
+
+**Ids that leave the process are UUIDs.** `carts`, `cart_items`, `orders` and
+`order_items` have `UUID` primary keys, while the catalog keeps its integers.
+The difference is exposure: an order id reaches the model in conversation and
+travels to Stripe as `metadata.order_id` on D7, and a serial integer in that
+position invites a shopper to try the neighbouring number. A UUID also exists
+before the row is flushed, which is what makes it safe to put in a response.
 
 **A stored vector does not record which model made it.** `products.embedding`
 is 1536 floats and nothing else — no model name, no timestamp. Changing
@@ -109,17 +235,26 @@ that depends on what the catalog holds. Everything past those three belongs one
 layer down. The test is whether the wrapper would still be correct against a
 different database: if it would not, the logic is in the wrong file.
 
-**The MCP middleware logs tool arguments, and `query` becomes user input on
-D6.** Every call is logged with its arguments, which is what makes the server
-debuggable once D5 drives it from an agent loop — and `query` is the one
-argument worth reading, because it shows what the model understood the shopper
-to want. Redacting it would blind the log exactly where it earns its keep.
-Today that text is a developer's own, typed into the Inspector or a test. From
-D6 there are real carts and real customers, and `query` becomes something a
-stranger typed: it has to be redacted, hashed, or gated behind a config flag
-before this server sees production traffic. This is an obligation D6 owes, in
-the same way `scripts/seed_catalog.py --reset` owes it a guard — not a bug in
-what is here now.
+**The MCP middleware logs tool arguments, and `query` is redacted by
+default.** Every call is logged with its arguments, which is what makes the
+server debuggable once an agent loop drives it. Everything except `query` is an
+id, a category from a closed set, a price bound or a limit — values already
+visible in the tool schema, and the reason the log is worth keeping; redacting
+them would gut it. `query` is the one argument that is free text somebody
+typed, and from D6 there are real carts behind it, so `redact_arguments()`
+replaces it with `<redacted:xxxxxxxx>`, eight hex characters of an HMAC keyed
+with a salt generated once per process and never logged.
+
+A digest rather than a blanket `<redacted>` because the log has to keep
+answering "did the model send the same query twice", which is a question about
+one conversation and therefore about one process. A *keyed* digest rather than
+a plain SHA-256 because the space of things a shopper types is small enough
+that a wordlist recovers most of it, so a bare hash would still say what people
+searched for. No length alongside it: with the salt in place, length is the
+only thing left that could narrow a guess, and it has never helped anyone debug
+this server. `MCP_LOG_REDACT_QUERY` turns it off for reading back what the
+model actually searched for on a developer's own machine; the default is on,
+because the safe setting must not be one somebody has to remember to type.
 
 **A tool describes its arguments in exactly one of two ways.** `ToolSpec` takes
 either `args_model`, a Pydantic model, or `parameters_schema`, a JSON Schema —
@@ -184,6 +319,24 @@ the API fail rather than spend. `search_products` embeds its query by default,
 so forgetting `mode="keyword"` in a test is a real and quiet way to bill
 tokens on every run — it happened once, which is why the guard exists.
 
+**D6 tests reach the API through `api_client` / `authed_client`, and nothing
+else writes to the database through a handler.** FastAPI's `get_session` builds
+a session of its own from the shared factory, so a handler commits straight to
+the database — outside whatever transaction a test opened. Nothing raises: the
+rows simply stay behind, the test's own session reads an older snapshot and
+never sees them, and the suite starts depending on the order it ran in. The
+fixture closes the gap by overriding that dependency with the *same* session
+the test holds, bound with `join_transaction_mode="create_savepoint"` so a
+handler's `commit()` lands on a SAVEPOINT and the outer transaction still rolls
+back. The override is a plain function, not a generator — FastAPI closes
+generator dependencies, and closing that session would leave the test holding a
+dead one after its first request.
+
+Those tests also assume `orders` is empty. A real order left behind by a manual
+run fails them, and `--reset`'s RESTRICT then blocks `tests/test_seed.py` as
+well — correct behaviour from the guard, and a reminder to clean up after
+driving the API by hand.
+
 **Tests reach no network and call no SDK method.** Importing `openai` is fine —
 `tests/test_client.py` imports `LLMClient`, which pulls it in — but the client
 object is replaced by a fake before any call. The fakes mirror the shape of real
@@ -202,7 +355,14 @@ pytest tests/ -v                  # offline and database tests
 pytest tests/ -m network          # the four that call the API and cost money
 python -m shopagent.llm.loop      # the CLI agent (local tools + MCP catalog)
 python scripts/run_mcp_server.py  # the catalog MCP server alone, on stdio
+uvicorn shopagent.api.main:app --reload --port 8000   # the commerce API
 ```
+
+The API's interactive docs are at `http://127.0.0.1:8000/docs`. Paste the
+`SHOPAGENT_API_KEY` into **Authorize** once and every cart and order call
+carries it; `/health` needs no key. `MCP_LOG_REDACT_QUERY=false` puts the raw
+search query back in the catalog server's log, which is worth doing only on
+your own machine.
 
 `MCP_CATALOG_ENABLED=false` runs the same CLI without the catalog server. The
 Inspector takes the script path, never `-m shopagent.mcp_server.server`, because

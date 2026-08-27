@@ -38,7 +38,7 @@ python scripts/embed_catalog.py
 # 6. verify
 docker compose exec db psql -U shopagent -d shopagent \
   -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
-pytest tests/ -v          # 363 tests; add -m network for the 4 that call the API
+pytest tests/ -v          # 505 tests; add -m network for the 4 that call the API
 ```
 
 Postgres listens on `localhost:5432` (user / password / db: `shopagent`), with data
@@ -62,15 +62,24 @@ npx @modelcontextprotocol/inspector \
 npx @modelcontextprotocol/inspector --cli \
   .venv/bin/python scripts/run_mcp_server.py --method tools/list   # non-interactive
 
+# the commerce API (carts and orders)
+uvicorn shopagent.api.main:app --reload --port 8000      # docs on :8000/docs
+
 # catalog data
 python scripts/create_schema.py         # pgvector + create_all, idempotent
 python scripts/seed_catalog.py          # 30 products; --reset to rebuild
 python scripts/embed_catalog.py         # vectors + HNSW index; --force to redo
 
 # tests
-pytest tests/ -v                        # 363, offline and database
+pytest tests/ -v                        # 505, offline and database
 pytest tests/ -m network                # the 4 that call the API and cost money
 ```
+
+The API and the catalog reach the model over different protocols on purpose:
+products come through MCP, carts and orders over HTTP. `/docs` is the fastest way
+to drive the second — paste `SHOPAGENT_API_KEY` into **Authorize** once and every
+cart and order call carries it, while `/health` needs no key. Screenshots of that
+walkthrough are in `docs/screenshots/`.
 
 The agent spawns the catalog server itself, so `run_mcp_server.py` is only needed
 to drive the server by hand — from the Inspector, or to tell a catalog fault
