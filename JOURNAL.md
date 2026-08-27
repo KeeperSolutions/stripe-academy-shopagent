@@ -489,6 +489,111 @@ is our own function behind our own schema: the catalog on D4, the cart and order
 API on D6, Stripe on D7. MCP is the right protocol for all of them, and reaching
 for A2A here would be adding a negotiation layer between a program and itself.
 
+## Day 6 — findings
+
+**A table joins `Base.metadata` only when its class is imported, and a schema
+missing half its tables looks finished.** `scripts/create_schema.py` imported
+`Base` from `catalog/models.py` and called `create_all`, which was correct on
+D3 and stayed correct. Adding `api/models.py` on the same base changed nothing
+about that call — and it went on creating the catalog's four tables and none of
+the commerce ones, reporting success each time, because the module defining
+them had never been imported in that process. There is no error at that point:
+the failure surfaces later as `relation "carts" does not exist`, in whatever
+happens to touch a cart first. Both `create_schema.py` and `tests/conftest.py`
+now import `shopagent.api.models` for the side effect alone, with a comment
+saying why, because an import whose only purpose is registration is exactly the
+line a tidy-up deletes.
+
+**`Enum(native_enum=False)` without `create_constraint=True` is a bare VARCHAR
+that accepts anything.** SQLAlchemy 2.0 defaults `create_constraint` to
+`False`, so the obvious spelling produces a column with no CHECK behind it: the
+Python side still validates, the database does not, and a status written by
+anything other than the ORM goes in unchallenged. It is the shape of bug that
+never announces itself — every test passes and the table looks plausible, the
+constraint is simply absent. Worth knowing that the safe-looking half of that
+argument pair is the one that is off by default.
+
+**A route sweep that passes is not the same as a route sweep that looks.** Step
+2 added a parametrised test asserting every non-public route answers 401
+without a key, built on filtering `app.routes` for `APIRoute`. FastAPI 0.141
+stopped flattening `include_router` into `app.routes` and wraps each mount in an
+`_IncludedRouter` instead. The consequence was silent and total: once the cart
+router was mounted, the sweep found `/health`, saw no protected routes, and
+passed green while four unauthenticated write endpoints sat on the app. It now
+recurses through `original_router` — an undocumented attribute — so a second
+test compares its result against `app.openapi()["paths"]`, which is built by an
+entirely different code path, and a future rename fails that test loudly
+instead of quietly emptying the sweep. The general lesson is the one this cost
+an hour to learn: a test whose subject is "everything of kind X" needs a
+separate assertion that it can still find X, or it decays into a test that
+asserts nothing.
+
+**Two of the most important properties of this day cannot be tested through
+behaviour, so they are tested by reading the SQL.** `render_order` must not
+join the catalog, and `place_order` must take `FOR UPDATE` on `carts` and on
+`inventory`. A single-threaded test cannot see either: an implementation that
+joins the catalog returns a perfectly correct response, and an implementation
+with no locks behaves identically until two requests overlap. Both are asserted
+by registering a `before_cursor_execute` listener, capturing the statements the
+request actually issues, and inspecting them — no catalog table may appear in
+the first, `for update` and `order by inventory.variant_id` must appear in the
+second. Both were then falsified on purpose: adding a `join(Variant, ...)` to
+`render_order` made the first fail with the offending SQL quoted back in the
+assertion. A test asserting an invisible property is worth nothing until it has
+been seen to fail.
+
+**A FastAPI dependency opens its own session, so a test that does not override
+it writes to a different database than it reads.** `get_session` builds a
+session from the shared factory, and a handler's `commit()` therefore goes
+straight to Postgres — outside the transaction the fixture opened and will roll
+back. Nothing raises. The rows survive the test, the test's own session reads
+an older snapshot and never sees them, and the suite starts passing or failing
+on collection order. Two details make the fix work: the override hands back the
+*same* session the test holds, bound with
+`join_transaction_mode="create_savepoint"` so an inner `commit()` lands on a
+savepoint; and it is a plain function rather than a generator, because FastAPI
+closes generator dependencies and closing that session leaves the test holding
+a dead one after its first request. Containment is checked from a second
+connection, which must *not* see the row — the half that actually catches a
+missing override.
+
+**`ORDER BY variant_id` inside a `FOR UPDATE` looks cosmetic and is not.** Two
+orders covering the same two variants in opposite order each end up holding the
+row the other waits for, and Postgres resolves that by killing one with a
+deadlock error. Locking in a globally consistent order turns it into the second
+transaction waiting for the first. The same argument rules out a loop: a loop
+acquires locks in whatever order Python iterates, which is a different order
+per request unless the caller sorted first — so it is one statement with an
+`ORDER BY`, not five `session.get`s.
+
+**Driving the real Swagger UI found a wording bug no test would have.** `POST
+/orders` on an already-ordered cart answered *"cart … is ordered and has already
+been ordered"* — the status value interpolated into a sentence that then
+repeated it. Every test asserted `409` and the presence of `"ordered"`, and both
+passed. CLAUDE.md says error messages are written for the model, and the model
+is the reader who would have had to make sense of that. Small, but the specific
+kind of small that only appears when somebody reads the output instead of
+asserting on it.
+
+**The `--reset` guard fired against a real order for the first time.** The debt
+D3 recorded and D6 owed — `scripts/seed_catalog.py --reset` issuing `DELETE FROM
+products` while order lines point into the catalog — stopped being theoretical
+during step 4's manual run. Both layers behaved: the guard refused with a
+sentence naming how many orders were in the way, and with the guard bypassed
+entirely through psql, the `ON DELETE RESTRICT` on `order_items.variant_id`
+refused the delete with a constraint error. A debt is only closed once the
+closing mechanism has been seen to fire.
+
+**The `db` test suite is not hermetic with respect to orders left behind.** The
+Swagger walkthrough committed one real cart and one real order, and the next
+full run produced 6 failures and 17 errors. Nothing was broken: tests asserting
+`count(orders) == 0` are right to fail when an order exists, and
+`tests/test_seed.py` errors because `reset_catalog` hits the very RESTRICT D6
+added to protect order history. Both are the system working as designed. But it
+means "clean up after driving the API by hand" is now a real obligation rather
+than tidiness, and a suite that built its own database — or that skipped those
+tests when orders exist — would be the honest fix. Deferred, and recorded below.
+
 ## Known gaps
 
 **The CLI does not stream while tools are in play.** `chat_with_tools` is a
@@ -579,6 +684,14 @@ wrote. Before this server sees production traffic, `query` needs redaction, a
 hash, or a config flag; the ids, prices and timings can stay. Raised by review
 on PR #4 and deferred on purpose rather than missed.
 
+**Closed on D6.** `redact_arguments()` replaces `query` with an HMAC digest
+keyed by a per-process salt, and leaves every other argument alone.
+`MCP_LOG_REDACT_QUERY` turns it off, and defaults to on. Why a digest rather
+than a blanket `<redacted>` is in CLAUDE.md; what remains open is that the salt
+is per-process, so two runs of the server cannot be correlated with each other.
+That is deliberate — the question the log answers is about one conversation —
+but worth knowing before anyone tries to trace a shopper across a restart.
+
 **`DEFAULT_COMMAND` cannot be changed after import.** `MCPToolClient.__init__`
 takes `command: str = DEFAULT_COMMAND`, and a default argument is bound when the
 function is defined, not when it is called. Reassigning the module attribute
@@ -603,3 +716,56 @@ one thing D5 exists to avoid — the adapter registers whatever the server lists
 It was never called across any of the demo scenarios. If a future server exposes
 enough diagnostics to crowd the list, the fix belongs on the server (not
 advertising them) rather than in a name check here.
+
+**There is no fulfilment flow, so `reserved` only ever goes up.** `place_order`
+adds to `inventory.reserved` and nothing subtracts from it except a rolled-back
+transaction. `fulfilled` is a status nothing transitions into automatically,
+and `cancelled` and `refunded` do not release stock either — so a catalog run
+long enough will reserve itself down to zero available with no orders shipping.
+Correct for a training project with no warehouse behind it, and wrong the
+moment anything real depends on the number. Releasing on `cancelled`/`refunded`
+is the small half of the fix; the large half is deciding when units leave
+`quantity`, which is a fulfilment design this project does not have.
+
+**A cart line with no active price passes in the cart and fails at the order.**
+Deliberate on both sides — a cart that silently drops an item is worse than one
+showing an item it cannot price, and a line missing from an order is goods that
+ship and are never charged for — but the consequence is a shopper who can hold
+a cart that cannot be bought, and only finds out at checkout. Nothing warns
+them earlier. A flag on the cart response would be the obvious improvement and
+was not added, because inventing a field the plan does not describe is how a
+response shape stops being reviewable.
+
+**The advisory stock check can tell two shoppers the same units are free.**
+`services/cart.py` reads `quantity - reserved` with no lock and writes nothing,
+by design: a cart is a statement of intent. The authoritative check under
+`FOR UPDATE` is in `place_order`. The gap is a user-experience one rather than
+a correctness one — two people can both fill a cart and only one can buy —
+which is the right trade for a basket and would be the wrong trade anywhere
+money moves.
+
+**`orders.cart_id` is UNIQUE, so a cancelled order's cart cannot be reordered.**
+The constraint closes a real race — two concurrent `POST /orders` on one cart —
+and costs nothing while `ordered` is terminal for a cart. But `cancelled` and
+`refunded` are real order statuses, and after either, the cart that produced
+the order is permanently unusable: the only path is a new cart with the same
+lines re-added. Acceptable now, and a decision to revisit on D8 when a
+cancellation actually happens.
+
+**There is no readiness endpoint.** `/health` deliberately does not touch the
+database, because a liveness probe that queries reports the database's latency
+as the process's liveness. That leaves "can this process actually serve a cart"
+unanswered by any endpoint — a separate `/ready` that does hit Postgres is the
+missing half, and it was left out rather than guessed at.
+
+**CORS is `allow_origins=["*"]`.** Nothing here is reached by a browser today —
+the client is the agent process, and the credential is a header that
+same-origin rules were never protecting. The setting is a placeholder that has
+to become a list of origins before any front end exists, and the combination
+with `allow_credentials=True` is one browsers refuse anyway, which is the
+reminder built into it.
+
+**The commerce API has no rate limiting and no request logging.** Both are
+outside D6's scope and both are load-bearing once the key is anything other
+than a developer's own. Worth naming here so that "the API is done" does not
+read as "the API is deployable".

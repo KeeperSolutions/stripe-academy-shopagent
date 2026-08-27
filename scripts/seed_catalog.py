@@ -9,6 +9,11 @@ absent, so a second run reports thirty products skipped and touches nothing.
 `--reset` deletes every product first, and the cascade takes the variants,
 prices and stock with them. That is the supported way to pick up an edit to
 `catalog/seed.py`, because the seeder never updates a row it already stored.
+
+It refuses to run once any order exists (D6). The cascade reaches `cart_items`,
+which is fine — carts are as disposable as the catalog — but `order_items` is
+history, and `ON DELETE RESTRICT` on its `variant_id` would stop the delete
+anyway. The guard turns that IntegrityError into a sentence.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ import sys
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
+from shopagent.api.models import OrdersExist, assert_no_orders
 from shopagent.catalog.models import Inventory, Price, Product, Variant
 from shopagent.catalog.seed import reset_catalog, seed_catalog
 from shopagent.db import get_engine, session_scope
@@ -48,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with session_scope() as session:
             if args.reset:
+                assert_no_orders(session, operation="reset the catalog")
                 deleted = reset_catalog(session)
                 print(f"Reset: {deleted} product(s) deleted, cascade took the rest.\n")
 
@@ -58,6 +65,9 @@ def main(argv: list[str] | None = None) -> int:
 
             print("\nIn the database now")
             print_totals(session)
+    except OrdersExist as exc:
+        print(exc, file=sys.stderr)
+        return 1
     except OperationalError as exc:
         print(f"Cannot reach the database at {get_engine().url}.", file=sys.stderr)
         print("Is Postgres up? Try: docker compose up -d", file=sys.stderr)

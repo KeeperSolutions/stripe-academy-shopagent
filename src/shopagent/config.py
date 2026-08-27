@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     # catalog answers are coming from MCP" a claim that can be tested rather
     # than asserted.
     mcp_catalog_enabled: bool = True
+    # The catalog server logs every tool call with its arguments, and `query`
+    # is the one argument that is free text a shopper wrote. Default true, so
+    # the safe setting is the one nobody has to remember to type: a log that
+    # over-redacts costs a debugging session, a log that under-redacts cannot
+    # be un-leaked. Set false deliberately, on a developer's own machine, when
+    # reading back what the model actually searched for.
+    mcp_log_redact_query: bool = True
 
     # --- Infrastructure (D3, D6) ---
     database_url: str = (
@@ -72,7 +79,12 @@ class Settings(BaseSettings):
 
     # --- Commerce (D6-D7) ---
     currency: str = "usd"
-    shopagent_api_key: str = "dev-local-key"
+    # min_length=1 for the same reason as `openai_api_key` above: a blank
+    # `SHOPAGENT_API_KEY=` in .env would otherwise validate as the empty
+    # string, and D6's auth dependency would be comparing every request
+    # against nothing. The failure has to happen when configuration is read,
+    # not at the first request that should have been refused.
+    shopagent_api_key: str = Field(default="dev-local-key", min_length=1)
 
     # --- Stripe (D7-D8) --- no values yet, so these must be allowed to be None
     stripe_secret_key: OptionalStr = None

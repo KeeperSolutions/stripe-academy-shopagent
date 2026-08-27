@@ -1,9 +1,9 @@
-"""Create the catalog schema in Postgres (D3, step 1).
+"""Create the whole schema in Postgres (D3, step 1; extended on D6).
 
-`create_all`, not Alembic. D6 adds new tables to the same metadata rather than
-altering these ones, so a migration tool would carry cost without yet carrying
-its weight. The day a column has to change shape on a database holding real
-rows is the day to introduce it.
+`create_all`, not Alembic. D6 added its four commerce tables to the same
+metadata rather than altering the catalog's four, so a migration tool would
+carry cost without yet carrying its weight. That stops being true for `carts`
+and `orders` the moment they hold a real order — see CLAUDE.md.
 
 Safe to run repeatedly: the extension is created IF NOT EXISTS and `create_all`
 checks for each table before creating it, so a second run reports everything as
@@ -19,6 +19,12 @@ import sys
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import OperationalError
 
+# Both model modules are imported for their side effect: a table joins
+# `Base.metadata` when its class is defined, so `create_all` builds only what
+# has been imported. Importing `Base` alone would silently create the four
+# catalog tables and none of the commerce ones.
+from shopagent.api import models as commerce_models  # noqa: F401
+from shopagent.catalog import models as catalog_models  # noqa: F401
 from shopagent.catalog.models import Base
 from shopagent.db import ensure_vector_extension, get_engine
 

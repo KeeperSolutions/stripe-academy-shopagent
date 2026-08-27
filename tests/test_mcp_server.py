@@ -39,6 +39,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from sqlalchemy import text
 
+import shopagent.mcp_server.server as server_module
 from shopagent.mcp_server.server import (
     SERVER_NAME,
     configure_stderr_logging,
@@ -692,3 +693,212 @@ def test_a_long_line_reaches_the_log_intact(restored_root_logging, monkeypatch):
     written = stderr.getvalue()
     assert payload in written
     assert written.count("\n") == 1, f"the line was wrapped: {written!r}"
+
+
+# --- redacting the one argument a shopper wrote (D6) ---------------------
+#
+# The middleware logs every call with its arguments, which is what makes the
+# server debuggable once an agent loop drives it. `query` is the argument worth
+# reading — it shows what the model understood the shopper to want — and from
+# D6 it is also the only one a stranger wrote. These tests hold both halves:
+# the text does not reach the log, and everything else still does.
+
+
+def _force_redaction(monkeypatch, enabled: bool) -> None:
+    """Point the server's `get_settings` at a copy with the flag flipped.
+
+    `get_settings` is `lru_cache`d and the real `.env` decides the default, so
+    a test that wants the other branch has to replace the lookup rather than
+    the environment.
+    """
+    from shopagent.config import get_settings
+
+    patched = get_settings().model_copy(update={"mcp_log_redact_query": enabled})
+    monkeypatch.setattr(server_module, "get_settings", lambda: patched)
+
+
+def _search_args() -> dict:
+    return {
+        "query": "waterproof trail shoes for wide feet",
+        "category": "shoes",
+        "max_price_cents": 12000,
+        "min_price_cents": 3000,
+        "size": "42",
+        "limit": 5,
+    }
+
+
+def test_redaction_keeps_the_query_text_out_of_the_log(monkeypatch):
+    _force_redaction(monkeypatch, True)
+
+    logged = server_module.redact_arguments(_search_args())
+
+    assert "waterproof trail shoes" not in repr(logged)
+    assert logged["query"].startswith("<redacted:")
+
+
+def test_redaction_leaves_every_other_argument_untouched(monkeypatch):
+    """The journal's point: a log that redacts everything is a log nobody reads.
+
+    Ids, categories, price bounds and limits are already visible in the tool
+    schema and are what a call is actually debugged from.
+    """
+    _force_redaction(monkeypatch, True)
+    original = _search_args()
+
+    logged = server_module.redact_arguments(original)
+
+    for field in ("category", "max_price_cents", "min_price_cents", "size", "limit"):
+        assert logged[field] == original[field]
+
+
+def test_redaction_off_lets_the_query_through(monkeypatch):
+    """The developer-machine setting, and the other half of the claim."""
+    _force_redaction(monkeypatch, False)
+
+    logged = server_module.redact_arguments(_search_args())
+
+    assert logged["query"] == "waterproof trail shoes for wide feet"
+
+
+def test_the_same_query_redacts_to_the_same_token(monkeypatch):
+    """"Did the model ask the same thing twice" has to stay answerable."""
+    _force_redaction(monkeypatch, True)
+
+    first = server_module.redact_arguments({"query": "running shoes"})
+    second = server_module.redact_arguments({"query": "running shoes"})
+
+    assert first["query"] == second["query"]
+
+
+def test_different_queries_redact_to_different_tokens(monkeypatch):
+    _force_redaction(monkeypatch, True)
+
+    first = server_module.redact_arguments({"query": "running shoes"})
+    second = server_module.redact_arguments({"query": "running shoe"})
+
+    assert first["query"] != second["query"]
+
+
+def test_the_token_is_not_a_plain_digest_of_the_text(monkeypatch):
+    """A bare SHA-256 of a shopping query is recoverable from a wordlist.
+
+    The salt is what makes the log unreadable rather than merely encoded, so
+    this asserts the obvious attack does not work.
+    """
+    import hashlib
+
+    _force_redaction(monkeypatch, True)
+    text = "running shoes"
+
+    token = server_module.redact_arguments({"query": text})["query"]
+
+    assert hashlib.sha256(text.encode()).hexdigest()[:8] not in token
+
+
+def test_redaction_survives_a_payload_that_is_not_a_mapping(monkeypatch):
+    """A log line is not worth an exception, and a client may send anything."""
+    _force_redaction(monkeypatch, True)
+
+    assert server_module.redact_arguments(None) is None
+    assert server_module.redact_arguments("not a dict") == "not a dict"
+    assert server_module.redact_arguments([1, 2]) == [1, 2]
+
+
+def test_redaction_survives_a_query_that_is_absent_or_not_a_string(monkeypatch):
+    _force_redaction(monkeypatch, True)
+
+    assert server_module.redact_arguments({"product_id": 7}) == {"product_id": 7}
+    assert server_module.redact_arguments({"query": 42}) == {"query": 42}
+    assert server_module.redact_arguments({"query": None}) == {"query": None}
+
+
+def test_an_empty_query_still_redacts_rather_than_leaking_its_emptiness(monkeypatch):
+    _force_redaction(monkeypatch, True)
+
+    assert server_module.redact_arguments({"query": ""})["query"].startswith("<redacted:")
+
+
+def test_the_middleware_logs_the_redacted_arguments(caplog, monkeypatch):
+    """End to end through the middleware itself, with no catalog behind it.
+
+    Driven directly rather than over the transport because `search_products`
+    embeds its query, and a test that spends tokens to check a log line is the
+    exact mistake `tests/conftest.py` installs a guard against.
+    """
+    _force_redaction(monkeypatch, True)
+
+    class Ctx:
+        method = "tools/call"
+        params = {
+            "name": "search_products",
+            "arguments": {"query": "secret shopper phrase", "category": "shoes"},
+        }
+
+    async def call_next(ctx):
+        return {"content": [], "isError": False}
+
+    async def scenario():
+        return await server_module.log_tool_calls(Ctx(), call_next)
+
+    with caplog.at_level(logging.INFO):
+        call(scenario)
+
+    emitted = "\n".join(record.getMessage() for record in caplog.records)
+    assert emitted, "the middleware logged nothing to inspect"
+    assert "secret shopper phrase" not in emitted
+    assert "<redacted:" in emitted
+    # The argument that is safe, and that the log is actually read for.
+    assert "shoes" in emitted
+
+
+def test_the_middleware_logs_the_raw_query_when_redaction_is_off(
+    caplog, monkeypatch
+):
+    """The other branch, so the test above cannot pass by logging nothing."""
+    _force_redaction(monkeypatch, False)
+
+    class Ctx:
+        method = "tools/call"
+        params = {
+            "name": "search_products",
+            "arguments": {"query": "secret shopper phrase"},
+        }
+
+    async def call_next(ctx):
+        return {"content": [], "isError": False}
+
+    async def scenario():
+        return await server_module.log_tool_calls(Ctx(), call_next)
+
+    with caplog.at_level(logging.INFO):
+        call(scenario)
+
+    emitted = "\n".join(record.getMessage() for record in caplog.records)
+    assert "secret shopper phrase" in emitted
+
+
+def test_a_raising_tool_also_logs_the_redacted_arguments(caplog, monkeypatch):
+    """The error path logs separately, and was the easier one to forget."""
+    _force_redaction(monkeypatch, True)
+
+    class Ctx:
+        method = "tools/call"
+        params = {
+            "name": "search_products",
+            "arguments": {"query": "secret shopper phrase"},
+        }
+
+    async def call_next(ctx):
+        raise RuntimeError("boom")
+
+    async def scenario():
+        return await server_module.log_tool_calls(Ctx(), call_next)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError):
+            call(scenario)
+
+    emitted = "\n".join(record.getMessage() for record in caplog.records)
+    assert "secret shopper phrase" not in emitted
+    assert "<redacted:" in emitted
