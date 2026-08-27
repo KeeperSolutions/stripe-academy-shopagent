@@ -42,6 +42,29 @@ class SupportsToolCalls(Protocol):
     def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any: ...
 
 
+def _summarise(content: str) -> str:
+    """The first sentence of a failure, for `ToolResult.error`.
+
+    `ToolResult` promises `error` is a short cause *and* a substring of
+    `content`, which rules out phrasing one here: a sentence written on this
+    side would not appear in a message written on the server. Taking the
+    opening sentence satisfies both — it is by construction a substring, and
+    for this server it is the part that names the tool and the cause
+    ("Error executing tool get_product_details: No product has product_id 9999.").
+
+    Falls back to the whole first line when there is no sentence break, and to
+    the content itself if that leaves nothing; an empty `error` alongside
+    `ok=False` would say less than no field at all.
+    """
+    first_line = content.splitlines()[0] if content else content
+    sentence = first_line.split(". ")[0]
+    if sentence and not sentence.endswith("."):
+        # `split` drops the separator, so put the full stop back — without it
+        # the result is still a substring, but reads as a truncation.
+        sentence = f"{sentence}." if f"{sentence}." in content else sentence
+    return sentence or first_line or content
+
+
 def _make_caller(client: SupportsToolCalls, tool_name: str):
     """Build the function the registry will run for one remote tool.
 
@@ -56,11 +79,7 @@ def _make_caller(client: SupportsToolCalls, tool_name: str):
         content = result_to_content(result)
 
         if is_error(result):
-            return ToolResult(
-                ok=False,
-                content=content,
-                error=f"the tool {tool_name!r} reported an error",
-            )
+            return ToolResult(ok=False, content=content, error=_summarise(content))
 
         return ToolResult(ok=True, content=content)
 

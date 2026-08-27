@@ -427,7 +427,25 @@ def test_a_server_error_becomes_a_failed_tool_result():
 
     assert result.ok is False
     assert result.error is not None
-    assert "alpha" in result.error
+    assert result.error in result.content
+
+
+def test_the_error_summary_stays_a_substring_of_the_content():
+    """`ToolResult` promises `error` is a substring of `content`.
+
+    Every failure path in the registry upholds it, and a remote tool is the one
+    place where an invented summary would be easy and wrong: the content comes
+    from the server, so anything phrased here would not appear in it.
+    """
+    message = "Error executing tool alpha: no such product_id 9999.\nCall search_products."
+    registry = ToolRegistry()
+    client = _fake_client(alpha=FakeResult(content=[FakeTextBlock(message)], is_error=True))
+    register_mcp_tools(registry, client)
+
+    result = registry.dispatch("alpha", {})
+
+    assert result.error is not None
+    assert result.error in result.content
 
 
 def test_the_servers_error_text_is_not_rewritten():

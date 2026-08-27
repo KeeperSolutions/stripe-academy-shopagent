@@ -504,7 +504,7 @@ def test_a_schema_backed_tool_receives_the_arguments_unvalidated():
         {},                                   # required field missing
         {"product_id": "not an integer"},     # wrong type
         {"product_id": 1, "extra": True},     # a field the schema does not have
-        '{"product_id": 3}',                  # still arrives as a JSON string
+        '{"product_id": 3}',                  # a JSON string, decoded before the call
     ],
 )
 def test_dispatch_never_raises_on_a_schema_backed_tool(raw_args):
