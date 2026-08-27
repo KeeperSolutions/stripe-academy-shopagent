@@ -423,6 +423,36 @@ session started from nothing; 76% is what a repeated demo looks like. Either way
 the accounting in `llm/usage.py` has been correct since D1 and was simply waiting
 for something to measure.
 
+**The validation error cannot be provoked from the Inspector.** Driving the
+finished server through the UI covered the catalog tools, the error path and the
+empty envelope, but one case turned out to be unreachable: sending a string where
+`max_price_cents` wants an integer. The Inspector renders that argument as a
+Mantine `NumberInput`, which discards non-numeric input before anything is sent —
+setting the value programmatically through the native setter leaves the field
+empty too. So the exact path the D4 middleware exists to clean up, stripping
+`errors.pydantic.dev` and the generated model name out of Pydantic's message, is
+reproducible only from an API client or from a model. That is a boundary of the
+tool rather than a defect: the Inspector protects a human from sending what the
+schema forbids, and a model has no such protection. It is why that message is
+pinned by a test rather than by a screenshot.
+
+**A failed tool call is green in the protocol log.** In the Inspector's message
+list, a `tools/call` that came back with `isError: true` still shows **OK**, and
+it is right to: the JSON-RPC request succeeded and carried a flag saying the tool
+did not. The failure is red only in the Results panel. Anyone reading the log
+alone would score that call as fine.
+
+That is the third appearance of one idea, at three different layers, and worth
+naming as a single class. On D4 the server side: a tool that *returns* a string
+describing a failure produces `isError: false`, indistinguishable from an answer.
+On D5 the registry: a tool returning a `ToolResult` was flattened by `dispatch`
+into `ToolResult(ok=True)` with the failure as its repr. And here the UI: the
+transport-level outcome is displayed where a reader looks for the tool-level one.
+Every time, a failure travelled inside a successful envelope and something
+upstream read only the envelope. The lesson is the same at each layer — the
+success of the delivery is never evidence about the content — and D9 gets it in
+its most expensive form, where the content is a price.
+
 ### A2A, and why the catalog is not one
 
 A2A standardises the horizontal direction — agent to agent — where MCP

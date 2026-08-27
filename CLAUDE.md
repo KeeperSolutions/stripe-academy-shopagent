@@ -92,7 +92,9 @@ on the server, which hides the very loop this project exists to learn.
 **Function calling is non-strict for now.** Pydantic's `model_json_schema()`
 output is not valid under strict mode without a transform: it omits
 `additionalProperties: false`, lists only non-defaulted fields in `required`,
-and emits `default` and `title`. Revisit on D5/D9.
+and emits `default` and `title`. D5 came and went without it — MCP
+publishes its own schemas, so strict there would mean rewriting a contract the
+server owns. Revisit on D9.
 
 **MCP tools are thin wrappers; the business logic stays in `catalog/`.** The
 server may do three things and no more: adapt the shape to the protocol, turn a
@@ -198,5 +200,14 @@ python scripts/seed_catalog.py    # 30 products; --reset to rebuild
 python scripts/embed_catalog.py   # vectors + HNSW index; --force to redo
 pytest tests/ -v                  # offline and database tests
 pytest tests/ -m network          # the four that call the API and cost money
-python -m shopagent.llm.loop      # the CLI agent
+python -m shopagent.llm.loop      # the CLI agent (local tools + MCP catalog)
+python scripts/run_mcp_server.py  # the catalog MCP server alone, on stdio
+```
+
+`MCP_CATALOG_ENABLED=false` runs the same CLI without the catalog server. The
+Inspector takes the script path, never `-m shopagent.mcp_server.server`, because
+it parses `-m` as one of its own flags:
+
+```bash
+npx @modelcontextprotocol/inspector .venv/bin/python scripts/run_mcp_server.py
 ```

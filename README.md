@@ -38,12 +38,48 @@ python scripts/embed_catalog.py
 # 6. verify
 docker compose exec db psql -U shopagent -d shopagent \
   -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
-pytest tests/ -v          # 254 tests; add -m network for the 4 that call the API
+pytest tests/ -v          # 362 tests; add -m network for the 4 that call the API
 ```
 
 Postgres listens on `localhost:5432` (user / password / db: `shopagent`), with data
 stored in the named volume `pgdata`. Stop it with `docker compose down` — the volume
 is preserved.
+
+## Commands
+
+```bash
+# the agent
+python -m shopagent.llm.loop            # CLI agent: local tools + the MCP catalog
+MCP_CATALOG_ENABLED=false \
+  python -m shopagent.llm.loop          # same CLI, local tools only, no server
+
+# the catalog MCP server on its own
+python scripts/run_mcp_server.py        # serves on stdio; the agent starts this itself
+
+# the MCP Inspector, against that server
+npx @modelcontextprotocol/inspector \
+  .venv/bin/python scripts/run_mcp_server.py               # web UI on :6274
+npx @modelcontextprotocol/inspector --cli \
+  .venv/bin/python scripts/run_mcp_server.py --method tools/list   # non-interactive
+
+# catalog data
+python scripts/create_schema.py         # pgvector + create_all, idempotent
+python scripts/seed_catalog.py          # 30 products; --reset to rebuild
+python scripts/embed_catalog.py         # vectors + HNSW index; --force to redo
+
+# tests
+pytest tests/ -v                        # 362, offline and database
+pytest tests/ -m network                # the 4 that call the API and cost money
+```
+
+The agent spawns the catalog server itself, so `run_mcp_server.py` is only needed
+to drive the server by hand — from the Inspector, or to tell a catalog fault
+apart from an agent fault. `MCP_CATALOG_ENABLED=false` is what makes "the product
+answers come from MCP" demonstrable: the same binary then has two tools instead
+of six and says the catalogue is unavailable.
+
+Pass the server path, not `-m shopagent.mcp_server.server`, to the Inspector: it
+parses `-m` as one of its own flags and the module never starts.
 
 Findings, decisions and open questions from each day are in
 [JOURNAL.md](JOURNAL.md).
