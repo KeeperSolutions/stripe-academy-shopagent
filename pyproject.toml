@@ -14,16 +14,25 @@ requires-python = ">=3.11"
 where = ["src"]
 
 [tool.pytest.ini_options]
-# Three kinds of test now live side by side, and the difference is what each
+# Four kinds of test now live side by side, and the difference is what each
 # one needs to run:
 #   (unmarked)  nothing outside the process — the D1/D2 rule, still the default
 #   db          the local Postgres from `docker compose up -d`
 #   network     the OpenAI API, which costs money on every run
+#   stripe      the Stripe API in test mode — no money, but a real account
 #
-# `network` is deselected by default so `pytest tests/` stays free and works
-# offline. Run those deliberately: `pytest tests/ -m network`.
+# `network` and `stripe` are both deselected by default so `pytest tests/`
+# stays free and works offline. Run them deliberately: `pytest tests/ -m
+# network`, `pytest tests/ -m stripe`.
+#
+# `stripe` is separate from `network` rather than folded into it because they
+# fail for different reasons and are fixed differently: `network` needs an
+# OpenAI key and spends tokens, `stripe` needs a Stripe test key and spends
+# nothing. Merging them would mean a developer with one key and not the other
+# could run neither.
 markers = [
     "db: needs the local Postgres (docker compose up -d)",
     "network: calls the OpenAI API and spends tokens",
+    "stripe: calls the Stripe API in test mode (needs STRIPE_SECRET_KEY)",
 ]
-addopts = "-m 'not network'"
+addopts = "-m 'not network and not stripe'"

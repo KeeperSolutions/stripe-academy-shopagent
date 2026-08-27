@@ -14,6 +14,7 @@ testable without a database.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
@@ -70,6 +71,36 @@ TERMINAL_STATUSES: frozenset[OrderStatus] = frozenset(
 )
 
 
+# Reaching one of these means the order will never be fulfilled, so the units
+# it reserved have to go back. `fulfilled` is deliberately absent: those units
+# were sold, and `reserved` is what keeps them unsellable until this project
+# grows a fulfilment flow that moves them out of `quantity`.
+RELEASES_RESERVATION: frozenset[OrderStatus] = frozenset(
+    {OrderStatus.CANCELLED, OrderStatus.REFUNDED}
+)
+
+
+@dataclass(frozen=True)
+class TransitionEffects:
+    """What a status change means beyond the status itself.
+
+    `transition()` returns this rather than performing it, which is the whole
+    reason this module still touches no database and the entire transition
+    table is swept offline. The cost of that purity is an obligation on the
+    caller, so the obligation is *named* here instead of being remembered:
+    reading the signature tells you a transition can have consequences.
+
+    Discharging it is `api/services/orders.py`'s job, through
+    `apply_transition`, which is the only sanctioned caller of `transition()`.
+    `tests/test_lifecycle.py` enforces that by scanning the source tree — the
+    fear being a D8 webhook that moves an order to `cancelled` and silently
+    leaves its stock reserved forever.
+    """
+
+    status: OrderStatus
+    releases_reservation: bool
+
+
 class IllegalTransition(Exception):
     """Raised when a status change is not one the lifecycle permits.
 
@@ -103,24 +134,48 @@ class HasStatus(Protocol):
     status: OrderStatus
 
 
-def transition(order: HasStatus, new_status: OrderStatus) -> OrderStatus:
-    """Move `order` to `new_status`, or refuse.
+def check_transition(
+    current: OrderStatus, requested: OrderStatus
+) -> TransitionEffects:
+    """Say what a transition would do, or refuse it, without changing anything.
 
-    Returns the new status so a caller can chain or log it. Mutates in place
-    and does not commit: the session that owns the object owns the write, and
-    a function that committed on its own would break the webhook handler's
-    ability to do this alongside other work in one transaction.
+    Split out of `transition()` so a caller can find out whether a move is
+    legal *before* doing irreversible work. `cancel_order` needs exactly that:
+    it expires the Stripe session before committing the cancellation, and
+    expiring the session of an order it was going to refuse anyway would be a
+    side effect with no transaction to roll it back.
+    """
+    current = OrderStatus(current)
+    requested = OrderStatus(requested)
+
+    if requested not in ALLOWED_TRANSITIONS[current]:
+        raise IllegalTransition(current, requested)
+
+    return TransitionEffects(
+        status=requested,
+        releases_reservation=requested in RELEASES_RESERVATION,
+    )
+
+
+def transition(order: HasStatus, new_status: OrderStatus) -> TransitionEffects:
+    """Move `order` to `new_status`, or refuse, and say what else must happen.
+
+    Mutates the status in place and does not commit: the session that owns the
+    object owns the write, and a function that committed on its own would break
+    a webhook handler's ability to do this alongside other work in one
+    transaction.
+
+    Returns `TransitionEffects` rather than the bare status. The effects are
+    described, never performed — this module has no session and is not going to
+    acquire one, because that is what lets every ordered pair of statuses be
+    tested against a two-line stub. `api/services/orders.py::apply_transition`
+    is what turns the description into rows.
 
     A status transitioning to itself is refused like any other pair not in the
     table. That is the point rather than an edge case: a repeated Stripe event
     arriving as `paid -> paid` should be visibly rejected, not absorbed as a
     no-op that reads like success in the log.
     """
-    current = OrderStatus(order.status)
-    requested = OrderStatus(new_status)
-
-    if requested not in ALLOWED_TRANSITIONS[current]:
-        raise IllegalTransition(current, requested)
-
-    order.status = requested
-    return requested
+    effects = check_transition(OrderStatus(order.status), OrderStatus(new_status))
+    order.status = effects.status
+    return effects

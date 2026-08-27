@@ -39,7 +39,13 @@ pytestmark = pytest.mark.db
 # not listed: FastAPI mounts them as plain Starlette routes rather than
 # `APIRoute`s, so the isinstance filter below already leaves them out, and
 # naming them here would suggest a decision that is not being made.
-PUBLIC_PATHS = {"/health"}
+# `/checkout/success` and `/checkout/cancel` are public because Stripe
+# redirects a *browser* to them and a browser carries no `X-API-Key`. That is
+# acceptable only because they read and never write — the worst a stranger with
+# a session id can do is read the status of a payment they would have had to
+# make. Adding a route here has to be this deliberate: the sweep below found
+# both of them on the day they were mounted.
+PUBLIC_PATHS = {"/health", "/checkout/success", "/checkout/cancel"}
 
 # Any UUID will do — the sweep asserts the request is refused before a handler
 # ever looks at it, so the value only has to parse.
@@ -237,6 +243,23 @@ def test_the_public_surface_is_health_and_the_docs_only():
         "/docs/oauth2-redirect",
         "/redoc",
     }
+
+
+def test_the_public_checkout_pages_only_read():
+    """Their safety rests entirely on this, so it is asserted rather than assumed.
+
+    An unauthenticated route that could write would be a hole; these two look
+    a session up and render HTML. If either ever gains a write, this fails and
+    the decision to leave them unauthenticated has to be made again.
+    """
+    from fastapi.routing import APIRoute as _APIRoute
+
+    for route in walk_api_routes(app.routes):
+        if route.path.startswith("/checkout/"):
+            assert route.methods - {"HEAD", "OPTIONS"} == {"GET"}, (
+                f"{route.path} accepts {sorted(route.methods)} while mounted "
+                "without authentication"
+            )
 
 
 def test_the_route_walk_sees_everything_openapi_does():

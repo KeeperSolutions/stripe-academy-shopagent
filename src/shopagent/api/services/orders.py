@@ -38,10 +38,17 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from shopagent.api.lifecycle import OrderStatus
+from shopagent.api.lifecycle import (
+    OrderStatus,
+    TransitionEffects,
+    check_transition,
+    transition,
+)
 from shopagent.api.models import Cart, CartItem, CartStatus, Order, OrderItem
 from shopagent.api.services.cart import CartNotFound, variant_label
 from shopagent.catalog.models import Inventory, Price, Product, Variant
+from shopagent.payments import stripe_svc
+from shopagent.payments.stripe_svc import MissingStripeKey
 from shopagent.config import get_settings
 
 
@@ -128,6 +135,7 @@ class RenderedOrder:
     lines: list[OrderLine]
     total_cents: int
     created_at: datetime
+    customer_email: str | None
 
 
 def _lock_cart(session: Session, cart_id: uuid.UUID) -> Cart:
@@ -364,4 +372,163 @@ def render_order(session: Session, order_id: uuid.UUID) -> RenderedOrder:
         # snapshot at order time and must not drift from it.
         total_cents=order.total_amount_cents,
         created_at=order.created_at,
+        customer_email=order.customer_email,
     )
+
+
+# --- changing an order's status, with what that implies (D7 step 4) ------
+
+
+class SessionExpiryFailed(OrderError):
+    """The order was cancelled but its Stripe session could not be closed."""
+
+
+def _release_reservation(session: Session, order: Order) -> None:
+    """Give back the units this order was holding.
+
+    The mirror of `_reserve`, and under the same locks for the same reason:
+    `SELECT ... FOR UPDATE` ordered by `variant_id`, so a release racing a
+    concurrent order cannot interleave into a lost update, and two transactions
+    touching the same variants cannot deadlock by taking them in opposite
+    orders.
+
+    `quantity` is untouched here as well. Releasing a reservation means the
+    units are sellable again, which is exactly what lowering `reserved` says;
+    `quantity` only ever changes when goods physically move, and this project
+    has no fulfilment flow that moves them.
+    """
+    rows = session.execute(
+        select(OrderItem.variant_id, OrderItem.quantity).where(
+            OrderItem.order_id == order.id
+        )
+    ).all()
+    if not rows:
+        return
+
+    wanted: dict[int, int] = {}
+    for variant_id, quantity in rows:
+        wanted[variant_id] = wanted.get(variant_id, 0) + quantity
+
+    inventory = _lock_inventory(session, sorted(wanted))
+
+    for variant_id, quantity in wanted.items():
+        stock = inventory.get(variant_id)
+        if stock is None:
+            # The variant is gone from the catalog. Nothing to give back, and
+            # `order_items.variant_id` is RESTRICT so this should be
+            # unreachable — but a missing row must not stop a cancellation.
+            continue
+        # `max(0, ...)` never fires in normal operation, because the transition
+        # table refuses a second release: `cancelled` and `refunded` are
+        # terminal. It is here so that if it ever did, the result is a floor
+        # rather than a CHECK violation that leaves an order half-cancelled.
+        stock.reserved = max(0, stock.reserved - quantity)
+
+
+def apply_transition(
+    session: Session, order: Order, new_status: OrderStatus
+) -> TransitionEffects:
+    """Move an order's status and carry out whatever that implies.
+
+    **The only sanctioned caller of `lifecycle.transition()`.** That function is
+    pure so the transition table can be swept offline, which leaves the
+    consequences as an obligation on somebody — and an obligation spread across
+    callers is one a D8 webhook will eventually forget, leaving stock reserved
+    against an order that will never ship. Concentrating it here makes
+    forgetting a matter of not calling this function at all, which is visible,
+    rather than of calling `transition()` and stopping early, which is not.
+    `tests/test_lifecycle.py` scans the source tree to keep it that way.
+
+    Raises `IllegalTransition` untouched: the router maps it to 409, and the
+    lifecycle's own message already names both statuses.
+    """
+    # Lock the row before reading the status that decides whether stock moves.
+    # Without it two concurrent callers — a refund arriving twice from D8, say —
+    # both read `paid`, both pass the transition table, and both release the
+    # same reservation. Re-locking a row this transaction already holds is free
+    # in Postgres, so `cancel_order` taking the lock first costs nothing here.
+    #
+    # This is the sanctioned boundary for changing a status, so the protection
+    # belongs here rather than in each caller: a caller that forgot the lock
+    # would be exactly as invisible as the caller that forgot the release, and
+    # that is what concentrating this function was meant to prevent.
+    locked = session.scalar(select(Order).where(Order.id == order.id).with_for_update())
+    if locked is None:
+        raise OrderNotFound(f"no order with id {order.id}")
+
+    effects = transition(locked, new_status)
+
+    if effects.releases_reservation:
+        _release_reservation(session, locked)
+
+    session.commit()
+    return effects
+
+
+def cancel_order(session: Session, order_id: uuid.UUID) -> Order:
+    """Cancel a pending order, release its stock, and close its payment page.
+
+    Expiring the Checkout Session is not tidiness. A cancelled order whose
+    session is still open leaves a working payment URL for something that no
+    longer exists — a shopper with that link in a tab can pay for a cancelled
+    order, and D8 would then receive a `checkout.session.completed` for an
+    order it is forbidden to move (`cancelled` is terminal). The money would be
+    real and the order would not.
+
+    Ordered deliberately: the status and the stock are committed first, then
+    Stripe is told. If the expiry call fails, the cancellation still stands and
+    the failure is reported — the alternative is holding a database transaction
+    open across a network round trip, which is what `attach_customer` avoids
+    for the same reason.
+    """
+    order = _lock_cart_free_order(session, order_id)
+
+    # Refuse an illegal cancellation *before* touching Stripe. Expiring the
+    # session of an order that is then refused would be a side effect with no
+    # transaction to undo it.
+    check_transition(OrderStatus(order.status), OrderStatus.CANCELLED)
+
+    # Close the payment page before committing the cancellation, not after.
+    # The other order looks tidier and fails badly: the cancellation commits,
+    # the expiry call then times out, and the order is terminally `cancelled`
+    # while its Checkout URL is still payable — with no way back, because a
+    # retry is refused by the transition table. Expiring first means a failure
+    # here leaves the order untouched and the request retryable, and the only
+    # cost of the reverse failure is a session that expired for an order that
+    # stayed open, which the shopper resolves by starting checkout again.
+    session_id = order.stripe_checkout_session_id
+    if session_id:
+        try:
+            existing = stripe_svc.retrieve_checkout_session(session_id)
+            if existing.status == "open":
+                stripe_svc.expire_checkout_session(session_id)
+        except MissingStripeKey as exc:
+            # A stored session id proves Stripe *was* configured when the order
+            # was placed, so a missing key now is a server misconfiguration
+            # rather than "there was never anything to close". Swallowing it
+            # would cancel the order and leave a payable URL behind in silence.
+            raise SessionExpiryFailed(
+                f"order {order_id} has Checkout Session {session_id}, which "
+                "cannot be closed because STRIPE_SECRET_KEY is not configured. "
+                "The order was not cancelled: cancelling it now would leave a "
+                "payable link for an order that no longer exists."
+            ) from exc
+
+    apply_transition(session, order, OrderStatus.CANCELLED)
+
+    return order
+
+
+def _lock_cart_free_order(session: Session, order_id: uuid.UUID) -> Order:
+    """Load an order for update, without touching its cart.
+
+    `FOR UPDATE` because the status is about to be read and then written, and
+    two concurrent cancellations reading `pending` would both proceed — the
+    second releasing stock that the first already gave back.
+    """
+    order = session.scalar(
+        select(Order).where(Order.id == order_id).with_for_update()
+    )
+    if order is None:
+        raise OrderNotFound(f"no order with id {order_id}")
+    return order

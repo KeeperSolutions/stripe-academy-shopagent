@@ -26,7 +26,12 @@ from sqlalchemy.exc import OperationalError
 from shopagent.api import models as commerce_models  # noqa: F401
 from shopagent.catalog import models as catalog_models  # noqa: F401
 from shopagent.catalog.models import Base
-from shopagent.db import ensure_vector_extension, get_engine
+from shopagent.db import (
+    ensure_vector_extension,
+    find_column_gaps,
+    find_foreign_key_gaps,
+    get_engine,
+)
 
 
 def main() -> int:
@@ -61,6 +66,52 @@ def main() -> int:
         print(f"  {table.name:<12} {state}")
 
     print(f"\n{len(created)} table(s) created, {len(after) - len(created)} unchanged.")
+
+    # `create_all` builds missing tables and never touches an existing one, so
+    # it cannot notice a foreign key that was dropped out from under a table it
+    # is now reporting as "already present". `DROP TABLE ... CASCADE` on the
+    # catalog does exactly that to the commerce tables — see
+    # `find_foreign_key_gaps`. Reporting is the whole job here: repairing would
+    # mean issuing ALTER statements from a script whose entire premise is that
+    # this project has no migration path, and a script that quietly rewrites
+    # constraints is worse than one that names the problem.
+    # `create_all` never alters an existing table, so it cannot notice a column
+    # the models gained after that table was built. On the commerce tables that
+    # change arrives as a hand-applied ALTER from `migrations/`, and nothing
+    # else checks it was run.
+    column_gaps = find_column_gaps(engine)
+    if column_gaps:
+        print(
+            f"\nWARNING: {len(column_gaps)} column(s) declared in the models are "
+            "missing from the database:",
+            file=sys.stderr,
+        )
+        for gap in column_gaps:
+            print(f"  {gap.describe()}", file=sys.stderr)
+        print(
+            "\nThese tables are not disposable, so the fix is an ALTER rather "
+            "than a drop.\nApply the matching file from migrations/ and run "
+            "this again.",
+            file=sys.stderr,
+        )
+        return 2
+
+    gaps = find_foreign_key_gaps(engine)
+    if gaps:
+        print(f"\nWARNING: {len(gaps)} foreign key(s) do not match the models:", file=sys.stderr)
+        for gap in gaps:
+            print(f"  {gap.describe()}", file=sys.stderr)
+        print(
+            "\nThis is what a DROP TABLE ... CASCADE on the catalog leaves "
+            "behind: create_all\nrebuilds the catalog tables but cannot restore "
+            "the constraints the commerce\ntables held into them. Restore them "
+            "with ALTER TABLE ... ADD CONSTRAINT before\nrelying on the "
+            "protection they provide.",
+            file=sys.stderr,
+        )
+        return 2
+
+    print("Columns and foreign keys: all match the models.")
     return 0
 
 

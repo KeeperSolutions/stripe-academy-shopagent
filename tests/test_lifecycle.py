@@ -20,6 +20,7 @@ import pytest
 
 from shopagent.api.lifecycle import (
     ALLOWED_TRANSITIONS,
+    RELEASES_RESERVATION,
     TERMINAL_STATUSES,
     IllegalTransition,
     OrderStatus,
@@ -46,7 +47,8 @@ def test_every_status_pair_is_either_allowed_or_refused(current, requested):
     permitted = requested in ALLOWED_TRANSITIONS[current]
 
     if permitted:
-        assert transition(order, requested) is requested
+        effects = transition(order, requested)
+        assert effects.status is requested
         assert order.status is requested
     else:
         with pytest.raises(IllegalTransition):
@@ -137,7 +139,7 @@ def test_a_plain_string_status_is_accepted_and_normalised():
     # `StrEnum` means the column, the JSON and the enum all compare equal, so
     # a caller handing over `"pending"` is not a mistake worth refusing.
     order = StubOrder("pending")
-    assert transition(order, "paid") is OrderStatus.PAID
+    assert transition(order, "paid").status is OrderStatus.PAID
     assert order.status is OrderStatus.PAID
 
 
@@ -145,3 +147,88 @@ def test_an_unknown_status_is_a_value_error():
     order = StubOrder(OrderStatus.PENDING)
     with pytest.raises(ValueError):
         transition(order, "shipped")
+
+
+# --- what a transition implies, and who is allowed to act on it (D7) -----
+
+
+@pytest.mark.parametrize(("current", "requested"), ALL_PAIRS)
+def test_only_cancelled_and_refunded_release_a_reservation(current, requested):
+    """Swept over the whole table, so a new status cannot arrive undecided."""
+    if requested not in ALLOWED_TRANSITIONS[current]:
+        pytest.skip("not a legal transition")
+
+    effects = transition(StubOrder(current), requested)
+
+    assert effects.releases_reservation is (requested in RELEASES_RESERVATION)
+
+
+def test_fulfilled_does_not_release_a_reservation():
+    """The one that looks like it should and must not.
+
+    Those units were sold. `reserved` is what keeps them unsellable until this
+    project grows a fulfilment flow that moves them out of `quantity`; freeing
+    them here would offer stock that has already left the building.
+    """
+    effects = transition(StubOrder(OrderStatus.PAID), OrderStatus.FULFILLED)
+
+    assert effects.releases_reservation is False
+
+
+def test_the_lifecycle_still_needs_no_database():
+    """The property the whole design of `transition()` exists to keep.
+
+    Every test in this file runs against a two-line stub. If `transition` ever
+    grows a session parameter, the transition table stops being sweepable
+    offline and this file becomes a `db` test — which is the moment to argue
+    about it, not later.
+    """
+    import inspect
+
+    parameters = set(inspect.signature(transition).parameters)
+
+    assert parameters == {"order", "new_status"}, (
+        f"transition() now takes {sorted(parameters)}. It is meant to describe "
+        "consequences, not perform them — see TransitionEffects."
+    )
+
+
+def test_nothing_outside_the_service_layer_calls_transition_directly():
+    """The structural half of the effects decision.
+
+    `transition()` is pure, so acting on what it returns is an obligation on
+    the caller — and an obligation spread across callers is one D8's webhook
+    will eventually forget, leaving stock reserved against an order that will
+    never ship. `api/services/orders.py::apply_transition` is the only
+    sanctioned caller, which turns forgetting into "did not call the service",
+    something a reader can see.
+
+    Scanned rather than trusted, because a comment asking people to remember is
+    exactly what this is replacing.
+    """
+    import ast
+    import pathlib
+
+    source_root = pathlib.Path(__file__).resolve().parents[1] / "src" / "shopagent"
+    allowed = {
+        source_root / "api" / "lifecycle.py",
+        source_root / "api" / "services" / "orders.py",
+    }
+
+    offenders = []
+    for path in source_root.rglob("*.py"):
+        if path in allowed:
+            continue
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = getattr(func, "attr", None) or getattr(func, "id", None)
+                if name == "transition":
+                    offenders.append(f"{path.relative_to(source_root)}:{node.lineno}")
+
+    assert not offenders, (
+        "these call lifecycle.transition() directly instead of going through "
+        f"api/services/orders.py::apply_transition: {offenders}. A transition "
+        "can release a reservation, and calling the pure function skips it."
+    )

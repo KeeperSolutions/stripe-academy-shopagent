@@ -20,7 +20,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from shopagent.api.lifecycle import OrderStatus
 from shopagent.api.models import CartStatus
@@ -82,6 +82,10 @@ class CreateOrderRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cart_id: uuid.UUID
+    # Optional, because D6's flow has no notion of who is buying and still
+    # works. When present it becomes a Stripe Customer, which is what puts the
+    # order in that customer's dashboard timeline rather than standing alone.
+    customer_email: EmailStr | None = None
 
 
 class OrderItemResponse(BaseModel):
@@ -118,3 +122,20 @@ class OrderResponse(BaseModel):
     # The total stored at order time, never recomputed from the catalog.
     total_cents: int
     created_at: datetime
+    customer_email: str | None = None
+
+
+class CheckoutSessionResponse(BaseModel):
+    """Where to send the shopper to pay.
+
+    Deliberately thin. The session id is here because it is what a support
+    conversation and the Stripe dashboard both key on, and the order id so a
+    caller holding only this response can say what was being paid for. Nothing
+    about the payment's *state* is reported: a redirect back from Stripe is not
+    proof of payment — anybody can open that URL — and only D8's webhook may
+    move an order to `paid`.
+    """
+
+    order_id: uuid.UUID
+    checkout_session_id: str
+    checkout_url: str

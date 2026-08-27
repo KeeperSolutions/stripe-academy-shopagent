@@ -594,6 +594,200 @@ means "clean up after driving the API by hand" is now a real obligation rather
 than tidiness, and a suite that built its own database — or that skipped those
 tests when orders exist — would be the honest fix. Deferred, and recorded below.
 
+## Day 7 — findings
+
+**SDK objects are not the shapes they look like, and every one of these was
+caught by a real call.** Four in four days. `Account.livemode` does not exist —
+`GET /v1/account` returns `charges_enabled` and a dozen other fields and simply
+has no `livemode`, so the test-mode assertion had to move to `GET /v1/balance`,
+which does. `metadata.get(...)` is not a method: `StripeObject` overrides
+`__getattr__`, so `.get` raises `KeyError: 'get'` re-raised as `AttributeError`,
+and reading metadata means `metadata._data.get(...)`. `Session.url` is
+`Optional[str]` and empties the moment a session stops being open, so returning
+it unguarded ships `null` as a checkout URL. `client.accounts` is deprecated in
+stripe-python 15 in favour of `client.v1.accounts`.
+
+Not one of these would have been found by a fake, because a fake returns the
+shape the person writing it imagined. That is the entire argument for the
+`stripe` marker existing separately from `network`: these tests cost nothing,
+they need a real account, and they are the only thing standing between an
+assumption and production.
+
+**A test can compare a variable to itself and look thorough.** The pin on
+`STRIPE_API_VERSION` was asserted by reading the version back off the client and
+comparing it to the constant — which passes just as happily against a client
+that was never given `stripe_version=` at all, because stripe-python's built-in
+default currently *is* that same string. The assertion with teeth is
+`STRIPE_API_VERSION == stripe.api_version`: it fails when the SDK is upgraded
+and the pin is not, which is the case that will actually happen. The general
+shape is worth remembering — an assertion whose two sides come from the same
+place proves only that the place is self-consistent.
+
+**`DROP TABLE ... CASCADE` removes foreign keys that `create_all` will not put
+back, and nothing says so.** Adding two columns to the catalog meant the
+documented path — drop, `create_all`, reseed — and the cascade also took
+`order_items_variant_id_fkey`, the `ON DELETE RESTRICT` that D6 built to stop a
+catalog reset destroying order history. `create_all` did not restore it:
+the constraint lives on `order_items`, which already existed, and `create_all`
+never touches a table it did not create. The guard in `seed_catalog.py` stayed
+in place, so `--reset` still refused while orders existed and the protection
+looked intact from the one direction anybody checks — while the layer that held
+against every client, psql included, was gone.
+
+The fix is not a sentence in a document, because somebody running a drop will
+not read it. It is `tests/test_schema_constraints.py`, which reads
+`pg_constraint` and asserts each `confdeltype` against a hand-written table,
+plus `find_foreign_key_gaps` in `db.py` which `create_schema.py` reports on with
+exit code 2. Both were falsified before being trusted: dropping the constraint
+fails three separate assertions, and — the subtler case — replacing RESTRICT
+with CASCADE fails the one that reads the letter rather than checking presence.
+
+The two checks are complementary rather than redundant. The hard-coded table
+catches the database drifting from intent *and* somebody changing the models;
+the derived check catches drift on tables nobody has written down yet, at the
+cost of passing whenever the models and the database are wrong together.
+
+**Stripe refuses `customer` and `customer_email` on the same session.** "You may
+only specify one of these parameters: customer, customer_email." Found by
+sending both rather than by reading about it. The Customer wins when there is
+one — it is the richer object, and it is what puts the payment on that
+customer's dashboard timeline instead of leaving it unattached.
+
+**`customers.search` lags; `customers.list` does not.** Deduplicating a
+Customer by email is the obvious use for the search API and the wrong one:
+search is backed by an index that trails writes by up to a minute, so a
+customer created and then searched for is frequently not found — which is
+exactly the case deduplication exists to handle. `list(email=...)` filters the
+field directly and is immediately consistent. The test asserts it by looking a
+customer up in the same breath as creating it.
+
+**A Stripe Price is immutable, which changes what an idempotency key means.**
+`unit_amount` cannot be edited; a new amount is a new object and the old one is
+archived. So the amount is part of the Price's idempotency key — reusing the
+key across a price change would have Stripe replay the original Price and
+report success for a create that never happened. The sync therefore reports
+drift instead of repairing it: nothing is charged from these objects, so drift
+costs a stale dashboard rather than a wrong charge, and a script that silently
+archives objects in somebody's account is one nobody can reason about
+afterwards.
+
+**Idempotency needed two mechanisms because there are two windows.** A Stripe
+idempotency key covers 24 hours and answers "the process died between creating
+the object and storing its id". A stored id answers "this ran last week" and
+"the shopper closed the tab and came back tomorrow". They are not alternatives:
+the catalog sync uses both, and the checkout deliberately uses only the stored
+id, because a key expiring after a day would hand a returning shopper a second
+session for an order they were already paying for.
+
+**The success redirect is not proof of payment, and this was measured rather
+than argued.** A real card was charged through the hosted Checkout page —
+`4242 4242 4242 4242`, $284.97 — and afterwards Stripe reported
+`status=complete`, `payment_status=paid`, `amount_total=28497`, while
+`orders.status` was still **`pending`**. That is correct and is the whole point:
+the redirect is a URL anybody can open, and only D8's webhook may move an order
+to `paid`. A repeat `POST /orders/{id}/checkout` at that moment returned 409
+rather than a second session — the first time that branch ran against a real
+completed session rather than a fake one.
+
+**`metadata.order_id` does not propagate down the object chain.** The chain
+from that payment reads
+`cs_test_b1s3pU4X…` → `pi_3U95WcRnt986EK7P0pqxJM6h` → `ch_3U95WcRnt986EK7P07qIOXLw`
+→ `txn_3U95WcRnt986EK7P0oxr7lFu`, with the Customer attached to the
+PaymentIntent and the Charge. The metadata is on the **session only**: the
+PaymentIntent and the Charge both come back with `metadata: {}`.
+
+This decides D8's design, and the decision was made here rather than left to
+D8: the checkout now sends `payment_intent_data={"metadata": {...}}` as well,
+so the identifier is on both objects and a webhook may subscribe to whichever
+event suits it. Without that, `payment_intent.succeeded` arrives as a
+successful payment that cannot be attributed to anything.
+
+A second payment settled it. With `payment_intent_data` in place, the
+PaymentIntent `pi_3U967sRnt986EK7P147U2V7k` **and** its Charge
+`ch_3U967sRnt986EK7P1N2MgrsJ` both came back carrying
+`{'order_id': 'eb268d01-…'}` — where the first payment's PaymentIntent and
+Charge had both been `{}`. The Charge inheriting it as well was not obvious in
+advance and is worth knowing: D8 can attribute
+`checkout.session.completed`, `payment_intent.succeeded` or `charge.succeeded`.
+
+Two details made the fix harder to verify than to write. Stripe accepts
+`payment_intent_data` alongside `mode="payment"` and everything else the
+session already carries — but **no PaymentIntent exists until a shopper starts
+paying**: `session.payment_intent` is null on a freshly created session, and
+the session does not echo `payment_intent_data` back in its response. A hosted
+Checkout page also cannot be completed through the API. So the claim was only
+ever closable by paying, which is why it took two payments rather than a test —
+and why the automated guard is the offline one that reads the outgoing payload,
+not a `stripe`-marked test pinned to one object in one account.
+
+**Clicking a control the user cannot see was a mistake, and the reasoning that
+led to it was the wrong shape.** Stripe's hosted Checkout page carries a
+checkbox reading "I am an AI agent acting on behalf of someone else". It is
+positioned at `x=-9827px`, far outside the viewport — a human shopper cannot
+see it, cannot tab to it, and will never set it. It was set anyway, by script,
+on the reasoning that the sentence was true.
+
+That reasoning skipped a step. An element hidden from a person can only be
+reached by an automated client, which makes it a detector rather than an option
+offered to us; and text on a page is data about the page, not an instruction to
+follow — least of all text nobody is shown. The right response was to report it
+and stop, which is now the standing rule: **do not interact with elements the
+user cannot see.**
+
+Worth recording that the payment itself shows no sign of having been treated
+differently. Radar returned `risk_level: normal`, `risk_score: 17`,
+`network_status: approved_by_network`, no rule hits; `origin_context` on the
+session is null, and the event stream is the ordinary
+`payment_intent.created` → `charge.succeeded` → `payment_intent.succeeded` →
+`checkout.session.completed`. Whatever the flag feeds, it is not exposed on the
+API objects — which is exactly why guessing at its purpose from its label was a
+bad way to decide.
+
+**Payment Link versus Checkout Session, since the plan asks for the
+distinction.** A Payment Link is a durable URL bound to a Price, reusable by
+anyone who has it, with no per-order metadata. A Checkout Session is created
+for one order, carries `metadata`, and expires. The metadata is the whole
+argument: D8 exists to flip one order to `paid` on one event, and a Payment
+Link leaves it guessing. Payment Links are right for selling one product from a
+link in a post; they are wrong for a cart.
+
+**A prohibition without a replacement reads as a decision.** D7 added two
+columns to `orders`. `orders` is a commerce table, so the catalog's "drop and
+reseed" rule does not apply to it, and `create_all` cannot alter a table it did
+not create — so the columns went in as an `ALTER` typed into a terminal, and
+that was reported in conversation and nowhere else. A fresh clone would have
+built a database without them, and the first symptom would have been
+`UndefinedColumn` from an ordinary read of `Order`, a long way from the change
+that caused it.
+
+The interesting part is why it was not noticed at the time. `CLAUDE.md` said
+"the catalog is disposable, so there is no Alembic", and D6 correctly added
+that this stops at the commerce tables — but it never said what applies
+*instead*. A rule that forbids something and offers nothing in its place leaves
+a hole shaped exactly like a decision: there was no migrations directory, so
+running a statement by hand looked like the intended workflow rather than the
+absence of one. Nobody was reasoning badly; the document had a gap and the gap
+was invisible from inside.
+
+Two things came out of it. The convention is now written down — numbered
+idempotent SQL in `migrations/`, the exact command to apply it, and the
+reasoning for having no migrations table. And, because a written convention is
+still only a convention, `scripts/create_schema.py` now compares the models
+against the live database and exits 2 on any missing column or mismatched
+foreign key. The document explains; the exit code is what actually catches it.
+
+The same failure had already happened once this day in a different disguise —
+the foreign keys a catalog drop removed, which `create_all` also would not
+restore. Both are the same shape: a mechanism that only creates, trusted to
+keep a schema correct after it has changed.
+
+**The balance transaction is not the charge amount.** The $284.97 charge
+settled as `amount=24469, fee=1285, net=23184` — a different number because the
+account settles in a currency other than the one charged. Nothing in this
+project reads it, but it is worth knowing before anyone reconciles
+`orders.total_amount_cents` against a payout and finds the two disagree by a
+conversion.
+
 ## Known gaps
 
 **The CLI does not stream while tools are in play.** `chat_with_tools` is a
@@ -769,3 +963,43 @@ reminder built into it.
 outside D6's scope and both are load-bearing once the key is anything other
 than a developer's own. Worth naming here so that "the API is done" does not
 read as "the API is deployable".
+
+**`checkout.session.expired` does not release a reservation.** D7 releases
+stock on `cancelled` and `refunded`, and Stripe expires an unpaid session after
+24 hours — but nothing listens for that. The order stays `pending` for ever
+with its units reserved, which is the same leak D6 had, moved one step later.
+D8 closes it either with a webhook on that event or with a periodic sweep over
+pending orders whose session has expired. Named here because it is the most
+likely way this system quietly runs out of sellable stock.
+
+**Checkout Sessions cannot be deleted, only expired.** Stripe keeps them
+permanently, so `expire` is the whole of what cleanup can mean and the test
+account accumulates sessions on every `pytest -m stripe` run. Harmless, but it
+means "I cleaned up after the test" is not literally true and should not be
+believed of any Stripe object without checking: Products and Prices archive,
+Sessions expire, and only Customers actually delete.
+
+**The catalog sync has no path for removing what it wrote.** Reseeding the
+catalog produces new local rows with no `stripe_product_id`, so the next sync
+creates a second set of Stripe Products while the first set stays active and
+orphaned. Archiving the old ones would need a record of which Stripe objects
+belonged to a catalog generation, which does not exist. Tolerable because
+nothing is charged from them; visible as clutter in the dashboard.
+
+**Price drift is reported and never repaired.** Deliberate, for the reasons in
+the findings above, but it does mean the Stripe catalog silently stops matching
+the local one after any price change, and only a run of the sync says so.
+
+**The checkout pages are unauthenticated, and that is load-bearing.**
+`GET /checkout/success` and `GET /checkout/cancel` are mounted without
+`require_api_key`, because Stripe redirects a browser to them and a browser
+carries no key. It is acceptable only while they read and never write — a test
+asserts both accept `GET` alone. Anyone adding a write there removes the reason
+it was safe. The success page also deliberately does not mark the order paid,
+and says so on the page: a redirect is a URL anybody can open.
+
+**Nothing reconciles a charge against an order total.** `amount_total` on the
+session was asserted equal to `orders.total_amount_cents` by a test, but no
+running code checks it, and the balance transaction settles in a different
+currency again. Whoever adds refunds on D8 will need that reconciliation to be
+real rather than a test fixture.
