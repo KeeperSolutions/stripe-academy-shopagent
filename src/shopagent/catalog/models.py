@@ -77,6 +77,16 @@ class Product(Base):
     embedding: Mapped[list[float] | None] = mapped_column(
         Vector(EMBEDDING_DIM), nullable=True
     )
+    # The Stripe Product this row was synced to, or NULL if it never was (D7).
+    # Nullable because the sync is optional: the catalog is complete and
+    # sellable without it, and `scripts/sync_stripe_catalog.py` is something a
+    # developer runs on purpose rather than a step of seeding.
+    #
+    # Nothing in the checkout path reads this. See the same note on
+    # `Variant.stripe_price_id`, which is where it matters.
+    stripe_product_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, unique=True
+    )
 
     variants: Mapped[list[Variant]] = relationship(
         back_populates="product",
@@ -107,6 +117,21 @@ class Variant(Base):
     # Stripe line items (D7) both key on it; a duplicate would silently move
     # stock between two different products.
     sku: Mapped[str] = mapped_column(String(64), unique=True)
+    # The Stripe Price this variant was synced to, or NULL if it never was (D7).
+    #
+    # **The checkout does not use this, and that is deliberate.** D7's
+    # `line_items` are built from the `order_items` snapshot via `price_data`,
+    # not from a Stripe Price id. Charging from this column would make it a
+    # second source of truth for a number `order_items` already froze at order
+    # time: the shopper would be charged Stripe's amount while
+    # `orders.total_amount_cents` claimed a different one, and the two would
+    # diverge silently the moment a local price changed without a re-sync.
+    #
+    # The sync exists so the catalog is visible in the Stripe dashboard and so
+    # the Products/Prices API is exercised — not so anything is billed from it.
+    stripe_price_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, unique=True
+    )
 
     product: Mapped[Product] = relationship(back_populates="variants")
     prices: Mapped[list[Price]] = relationship(

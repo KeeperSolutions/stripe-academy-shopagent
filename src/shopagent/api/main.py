@@ -18,7 +18,7 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from shopagent.api.deps import configured_api_key, require_api_key
-from shopagent.api.routers import cart, orders
+from shopagent.api.routers import cart, checkout_pages, orders
 
 # Read at import, so a server with no usable key dies while uvicorn is loading
 # the module instead of starting and refusing every request afterwards. The
@@ -72,3 +72,8 @@ def health() -> dict[str, str]:
 # `app.routes` to keep that true, and it now has routes to sweep.
 app.include_router(cart.router, dependencies=[Depends(require_api_key)])
 app.include_router(orders.router, dependencies=[Depends(require_api_key)])
+
+# Mounted without authentication, unlike everything above. Stripe redirects a
+# *browser* to these two, and a browser carries no `X-API-Key`. Safe only
+# because they read and never write: see `routers/checkout_pages.py`.
+app.include_router(checkout_pages.router)

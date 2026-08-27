@@ -29,23 +29,57 @@ from shopagent.db import ensure_vector_extension, get_engine
 
 @pytest.fixture(autouse=True)
 def no_accidental_api_calls(request, monkeypatch):
-    """Make an unmarked test that reaches the OpenAI API fail loudly.
+    """Make an unmarked test that reaches a paid or external API fail loudly.
 
-    `search_products` embeds its query by default, so a test that passes one
-    and forgets `mode="keyword"` or `query_embedding=` would quietly spend
-    tokens on every run. That happened once while step 4 was being written,
-    which is why this exists rather than a note asking people to be careful.
+    Two providers, one mechanism: replace the module attribute every call has
+    to pass through with something that raises, unless the test carries the
+    marker that says it meant it.
+
+    OpenAI, because `search_products` embeds its query by default — a test that
+    passes one and forgets `mode="keyword"` or `query_embedding=` would quietly
+    spend tokens on every run. That happened once while D3 step 4 was being
+    written, which is why this exists rather than a note asking people to be
+    careful.
+
+    Stripe, because D7 introduces a second way to leave the process. The seam
+    is the SDK's request funnel rather than our own `get_client()`: building a
+    client makes no network call, and offline tests legitimately build one to
+    read back the pinned API version. Blocking construction would fail those
+    for no reason, while blocking the funnel catches every call however it was
+    reached — including one that bypasses `payments/` and uses the SDK
+    directly.
+
+    `_APIRequestor.request` is private, and `monkeypatch.setattr` with a string
+    target raises `AttributeError` when the attribute is missing. That is
+    deliberate: if a future SDK moves it, every test fails loudly instead of
+    the guard quietly protecting nothing.
     """
-    if request.node.get_closest_marker("network"):
-        return
+    if not request.node.get_closest_marker("network"):
 
-    def refuse() -> None:
-        raise AssertionError(
-            "this test tried to call the OpenAI API. Mark it @pytest.mark.network, "
-            'or pass mode="keyword" / query_embedding= to keep it offline.'
+        def refuse_openai() -> None:
+            raise AssertionError(
+                "this test tried to call the OpenAI API. Mark it "
+                '@pytest.mark.network, or pass mode="keyword" / '
+                "query_embedding= to keep it offline."
+            )
+
+        monkeypatch.setattr("shopagent.catalog.embeddings.default_client", refuse_openai)
+
+    if not request.node.get_closest_marker("stripe"):
+
+        def refuse_stripe(*args, **kwargs):
+            raise AssertionError(
+                "this test tried to call the Stripe API. Mark it "
+                "@pytest.mark.stripe if it is meant to, or keep it offline — "
+                "building a client is free, only requests are guarded."
+            )
+
+        monkeypatch.setattr(
+            "stripe._api_requestor._APIRequestor.request", refuse_stripe
         )
-
-    monkeypatch.setattr("shopagent.catalog.embeddings.default_client", refuse)
+        monkeypatch.setattr(
+            "stripe._api_requestor._APIRequestor.request_async", refuse_stripe
+        )
 
 
 @pytest.fixture(scope="session")

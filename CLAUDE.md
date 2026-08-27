@@ -34,7 +34,10 @@ tracked.
 | `api/schemas.py` | D6, D8 | request and response bodies; where names change |
 | `api/routers/` | D6, D8 | HTTP only — parse, call a service, map an error |
 | `api/services/` | D6, D8 | cart and order logic; imports no FastAPI |
-| `payments/` | D7 | Stripe SDK |
+| `payments/stripe_svc.py` | D7 | the Stripe SDK layer; the only importer of `stripe` |
+| `payments/catalog_sync.py` | D7 | mirrors the catalog into Stripe; nothing bills from it |
+| `payments/checkout.py` | D7 | Checkout Sessions built from the order snapshot |
+| `payments/customers.py` | D7 | attaching a buyer to an order |
 | `agent/` | D9 | memory, guardrails |
 | `obs/` | D10 | Langfuse tracing |
 
@@ -202,6 +205,106 @@ travels to Stripe as `metadata.order_id` on D7, and a serial integer in that
 position invites a shopper to try the neighbouring number. A UUID also exists
 before the row is flushed, which is what makes it safe to put in a response.
 
+**`payments/` imports no FastAPI, and splits the SDK from the decisions.**
+`stripe_svc.py` is the only importer of `stripe` and holds nothing but calls —
+which is what lets every layer above it be tested by replacing one name.
+`checkout.py`, `catalog_sync.py` and `customers.py` hold the rules. Same
+reason `api/services/` exists: D8's webhook and D9's agent tools reach payments
+outside any HTTP request, where an `HTTPException` would have nobody to catch
+it.
+
+**`line_items` are built from the `order_items` snapshot, never from
+`stripe_price_id`.** This is the most important rule of D7. `catalog_sync.py`
+writes a Stripe Price for every variant and the checkout deliberately does not
+read one: `order_items` froze the price at order time — D6 proves that by
+recording the SQL and failing if the catalog is touched — while a Stripe Price
+is a separate object that a re-sync, a dashboard edit or a local price change
+can move. Charging from it would mean the shopper pays Stripe's number while
+`orders.total_amount_cents` claims another, and the two would diverge silently.
+`price_data` carries the snapshot into the session instead, so there is exactly
+one number. It is checked rather than trusted: `build_line_items` refuses to
+return lines whose sum is not the order's total, and nothing is charged.
+
+**The catalog sync is an isolated deliverable and no checkout depends on it.**
+`scripts/sync_stripe_catalog.py` exists so the catalog is visible in the
+dashboard and so the Products/Prices API is exercised. A stale or missing
+Stripe object therefore cannot produce a wrong charge, which is what makes it
+acceptable for the script to report price drift rather than repair it — a
+Stripe Price is immutable, so repairing means creating a replacement and
+archiving the original, and a script that silently retires objects in somebody
+else's account is one nobody can reason about.
+
+**Idempotency uses two different mechanisms for two different windows.** A
+Stripe idempotency key covers 24 hours and protects a script that died between
+creating an object and storing its id; it is derived from the local row, never
+random, and the amount is part of a Price's key because a Price is immutable
+and a different amount is a different object. A stored id — `stripe_product_id`,
+`stripe_price_id`, `orders.stripe_checkout_session_id` — is durable and is what
+makes a second run free and lets a shopper return the next day to the session
+they left. Neither substitutes for the other.
+
+**`metadata.order_id` is mandatory on every Checkout Session, and it does not
+propagate.** Verified against a real payment: the session carries it, and the
+PaymentIntent and Charge it produces both have empty metadata. D8 must
+therefore listen to `checkout.session.completed`; `payment_intent.succeeded`
+arrives with no way to say which order it belongs to. This is also why the
+project uses a Checkout Session rather than a Payment Link — a Payment Link is
+a durable URL bound to a Price, reusable by anyone holding it and carrying no
+per-order metadata at all.
+
+**`lifecycle.transition()` returns `TransitionEffects` and is called only
+through `api/services/orders.py::apply_transition`.** The function stays pure
+and touches no database, which is what keeps the whole transition table
+sweepable offline; the price of that purity is that acting on the result is an
+obligation on the caller, and an obligation spread across callers is one D8's
+webhook will eventually forget — leaving stock reserved against an order that
+will never ship. Concentrating it in one service function turns forgetting into
+"did not call the service", which is visible.
+`tests/test_lifecycle.py` walks the AST of `src/shopagent` and fails if
+anything else calls `transition()`.
+
+Releasing is the mirror of reserving and runs under the same `SELECT ... FOR
+UPDATE` ordered by `variant_id`. Releasing twice would hand back units the
+order never held; what prevents it is the transition table, not a check inside
+the release — `cancelled` and `refunded` are terminal, so a second attempt is
+refused before any stock moves.
+
+**Test mode is the only mode.** `config.py` rejects a `STRIPE_SECRET_KEY`
+beginning `sk_live_` or `rk_live_` at configuration time, which is the last
+moment the mistake is free. `in_test_mode()` is the second layer and reads
+`livemode` from Stripe itself, because a prefix is a string this repo compares
+and `livemode` is not. It reads the balance rather than the account: `GET
+/v1/account` returns no `livemode` field.
+
+**`STRIPE_API_VERSION` is pinned and must be re-pinned deliberately.** Stripe
+advances the default per account and per signup date, so an unpinned client
+returns a differently shaped object one morning with nothing in this repo
+having changed. A test asserts the pin equals `stripe.api_version`, so
+upgrading the SDK fails until somebody has read the changelog — note that
+comparing the client's effective version against the constant proves nothing on
+its own, because an unpinned client currently resolves to the same string.
+
+**A missing Stripe key is not a startup failure.** Unlike `SHOPAGENT_API_KEY`,
+which gates every request, payments are one part of the system: a cart that
+cannot be browsed because Stripe is unconfigured would be the wrong failure.
+`get_client()` raises `MissingStripeKey` at the moment something needs it, and
+the checkout route maps that to **503** — the capability is absent, the server
+is not broken.
+
+**A catalog drop removes the commerce tables' foreign keys, and `create_all`
+does not restore them.** `DROP TABLE ... CASCADE` on `products` also drops
+`order_items_variant_id_fkey` — the `ON DELETE RESTRICT` that stops a reset
+taking order history with it — because the constraint lives on `order_items`,
+which `create_all` will not touch since it already exists. The guard in
+`seed_catalog.py` stays in place, so the protection looks intact from the one
+direction anybody checks. **The documented "drop, `create_all`, reseed" path is
+therefore incomplete: run `scripts/create_schema.py` afterwards and check its
+exit code**, which is 2 when a foreign key is missing or has the wrong delete
+action. `tests/test_schema_constraints.py` asserts the same thing from
+`pg_constraint` with a hand-written table of expectations, because a check
+derived from the models passes whenever the models and the database are wrong
+together.
+
 **A stored vector does not record which model made it.** `products.embedding`
 is 1536 floats and nothing else — no model name, no timestamp. Changing
 `EMBEDDING_MODEL` therefore means drop, reseed and re-embed, not a migration,
@@ -356,6 +459,9 @@ pytest tests/ -m network          # the four that call the API and cost money
 python -m shopagent.llm.loop      # the CLI agent (local tools + MCP catalog)
 python scripts/run_mcp_server.py  # the catalog MCP server alone, on stdio
 uvicorn shopagent.api.main:app --reload --port 8000   # the commerce API
+python scripts/sync_stripe_catalog.py --dry-run       # plan the Stripe catalog sync
+python scripts/sync_stripe_catalog.py                 # create what is missing
+pytest tests/ -m stripe           # the Stripe test-mode tests; needs a key
 ```
 
 The API's interactive docs are at `http://127.0.0.1:8000/docs`. Paste the

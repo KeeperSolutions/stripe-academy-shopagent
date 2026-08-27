@@ -178,6 +178,20 @@ class Order(Base):
     # table that already holds orders is the migration this project has no
     # tool for; two nullable columns cost nothing today and remove that from
     # D7's path entirely.
+    # Who is buying, to the extent this project has a notion of that (D7).
+    #
+    # Deliberately two nullable columns on `orders` rather than a `customers`
+    # table. D6 has no concept of a user at all, and D9 introduces long-term
+    # memory — a name, preferences, past orders — which is the requirement that
+    # would actually shape such a table. Building it now means guessing that
+    # shape a week early and then living with the guess, so an order carries
+    # the little it knows and nothing claims to be a customer record.
+    #
+    # `stripe_customer_id` is set only when a Customer object was created;
+    # `customer_email` can stand alone. Stripe refuses a Checkout Session that
+    # carries both — see `payments/checkout.py`.
+    customer_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     stripe_checkout_session_id: Mapped[str | None] = mapped_column(
         String(255), nullable=True
     )

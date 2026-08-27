@@ -11,7 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Optional
 
-from pydantic import BeforeValidator, Field
+from pydantic import BeforeValidator, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # config.py lives in src/shopagent/, .env sits at the repo root. An absolute
@@ -79,6 +79,12 @@ class Settings(BaseSettings):
 
     # --- Commerce (D6-D7) ---
     currency: str = "usd"
+    # Where Stripe sends the shopper after Checkout. Left as None so the
+    # fallbacks below can derive them from `app_base_url` — one place to change
+    # when the app moves, instead of three that drift apart. Set them
+    # explicitly the moment the success page stops living on this host.
+    checkout_success_url: OptionalStr = None
+    checkout_cancel_url: OptionalStr = None
     # Required, with no default, for the same reason `openai_api_key` is: it is
     # the API's only authentication secret. A default here would be a published
     # one — every deployment that forgot the variable would be protected by a
@@ -90,14 +96,69 @@ class Settings(BaseSettings):
     # that should have been refused.
     shopagent_api_key: str = Field(min_length=1)
 
-    # --- Stripe (D7-D8) --- no values yet, so these must be allowed to be None
+    # --- Stripe (D7-D8) ---
+    # Optional, and deliberately not treated the way `shopagent_api_key` is.
+    # That key gates every request, so the API refuses to start without it;
+    # payments are one part of the system rather than a precondition for the
+    # rest, and a cart that cannot be browsed because Stripe is unconfigured
+    # would be the wrong failure. A missing key therefore surfaces at the
+    # moment something needs it — see `payments/stripe_svc.py` — not at import.
     stripe_secret_key: OptionalStr = None
     stripe_webhook_secret: OptionalStr = None
+
+    @field_validator("stripe_secret_key")
+    @classmethod
+    def _refuse_a_live_key(cls, value: str | None) -> str | None:
+        """Test mode is the only mode this project runs in.
+
+        A live key here would charge real cards against a real balance, and no
+        part of this repo is built to be trusted with that: the seed catalog is
+        fiction, the prices are invented, and D8 will replay webhooks by hand.
+        Refusing at configuration time is the one place the mistake is still
+        free — after the first charge it is a refund, a statement line and a
+        conversation with somebody's bank.
+
+        Deliberately a prefix check rather than a call to Stripe. It costs no
+        network, works offline, and answers before the SDK is ever built.
+        `livemode` on the account is the second layer, asserted by the one test
+        that actually talks to Stripe.
+        """
+        if value is None:
+            return None
+        if value.startswith("sk_live_") or value.startswith("rk_live_"):
+            raise ValueError(
+                "STRIPE_SECRET_KEY is a live key. This project runs in test "
+                "mode only — a live key here charges real cards. Use the key "
+                "beginning sk_test_ from the Stripe dashboard's test mode."
+            )
+        return value
 
     # --- Langfuse (D10) --- same, only populated on D10
     langfuse_public_key: OptionalStr = None
     langfuse_secret_key: OptionalStr = None
     langfuse_host: str = "https://cloud.langfuse.com"
+
+
+    @property
+    def success_url(self) -> str:
+        """Where Checkout returns a shopper who paid.
+
+        Carries `{CHECKOUT_SESSION_ID}`, which Stripe substitutes on redirect.
+        That is what lets the success page look up what actually happened
+        instead of taking the redirect as proof — the redirect is a URL anybody
+        can open, and D8's webhook is the only thing that may flip an order to
+        `paid`.
+        """
+        if self.checkout_success_url:
+            return self.checkout_success_url
+        return f"{self.app_base_url}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}"
+
+    @property
+    def cancel_url(self) -> str:
+        """Where Checkout returns a shopper who backed out."""
+        if self.checkout_cancel_url:
+            return self.checkout_cancel_url
+        return f"{self.app_base_url}/checkout/cancel"
 
 
 @lru_cache(maxsize=1)
