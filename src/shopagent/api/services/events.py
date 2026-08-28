@@ -316,18 +316,24 @@ def _move(
 
     `updates` are columns to write **as part of the same move** — today only
     `stripe_payment_intent_id`, from `checkout.session.completed`. They are
-    applied after the transition has been cleared and before it is performed,
-    so they commit with the status or not at all.
+    handed to `apply_transition`, which assigns them to the locked row once
+    the transition is allowed, so they commit with the status or not at all.
+    Nothing is assigned here, and that is the point rather than a detail: an
+    assignment made in this function is dirty on the Session by the time
+    `apply_transition` issues its `SELECT ... FOR UPDATE`, SQLAlchemy
+    autoflushes it, and a refusal under the lock can no longer take it back.
 
-    That is a correction rather than a refinement. The first version had the
+    Two rounds of review on PR #8 landed on that. The first version had the
     caller assign the column and then call this function, on the reasoning
-    that the check inside would refuse first. It does not: the assignment had
-    already happened, `_move` returning `False` leaves the attribute dirty in
-    the session, and the router's `commit()` then writes it to an order whose
-    status never changed. Raised in review on PR #8, and the damaging case is
-    concrete — a second `checkout.session.completed` for an order already
-    `paid` would overwrite the PaymentIntent the refund endpoint spends, with
-    the one from a session that may never have been charged.
+    that the check inside would refuse first — it does not, the assignment has
+    already happened, and the router's `commit()` writes it to an order whose
+    status never changed. The second moved the assignment here, in front of
+    the preflight check, which fixed the ordinary refusal and left the raced
+    one: the preflight passes, the autoflush fires, the locked check refuses.
+    The damaging case is the same in both — a second
+    `checkout.session.completed` for an order already `paid` overwriting the
+    PaymentIntent the refund endpoint spends, with one from a session that may
+    never have been charged.
 
     **Checked before anything is written, then applied under a lock.** The
     check is not the authority — `apply_transition` locks the row and consults
@@ -379,11 +385,8 @@ def _move(
             )
         return False
 
-    for column, value in (updates or {}).items():
-        setattr(order, column, value)
-
     try:
-        apply_transition(session, order, target)
+        apply_transition(session, order, target, updates=updates)
     except IllegalTransition as exc:
         # Lost a race between the check above and the lock inside
         # `apply_transition`: another delivery moved this order in between.
@@ -396,12 +399,14 @@ def _move(
         # both be true. The old log line even promised a retry that a 200
         # forbids.
         #
-        # What has to be undone is only the attribute assignment above, since
-        # the transition it belonged to did not happen. Expiring the instance
-        # drops those pending values and reloads from the row, leaving the
-        # claim intact to commit. Nothing needs retrying: the order is already
-        # where this event wanted to take it, or somewhere the lifecycle
-        # considers further along.
+        # Nothing of this event's needs undoing — `updates` were never
+        # assigned, because `apply_transition` applies them only after the
+        # locked check it just failed. What expiring buys is that this
+        # instance stops carrying the status this handler read before the
+        # wait, so anything reading it afterwards sees the row as it now is.
+        # The claim stays intact to commit, and nothing needs retrying: the
+        # order is already where this event wanted to take it, or somewhere
+        # the lifecycle considers further along.
         session.expire(order)
         logger.warning(
             "stripe event %s: order %s changed status while this event was "
@@ -455,6 +460,119 @@ def _payment_intent_updates(event: Any, checkout_session: Any) -> dict[str, Any]
     return {}
 
 
+def _may_become(order: Order, target: OrderStatus) -> bool:
+    """Whether the transition table would allow this move right now.
+
+    Unlocked and therefore not authoritative — `apply_transition` asks again
+    under the lock, and that answer is the one that counts. What this buys is
+    the right to do work *before* calling `_move` without doing it pointlessly:
+    `_reconcile_paying_session` below expires a Stripe session, which must not
+    happen for an order the move is going to be refused for anyway.
+    """
+    try:
+        check_transition(OrderStatus(order.status), target)
+    except IllegalTransition:
+        return False
+    return True
+
+
+def _reconcile_paying_session(
+    order: Order, event: Any, checkout_session: Any
+) -> dict[str, Any]:
+    """Make sure the session that paid is the only one that still can.
+
+    Normally the event's session is the one the order points at and this does
+    nothing. The case it exists for is narrow and expensive: an order whose
+    first session expired with a payment already in flight. The expiry handler
+    correctly refuses to cancel such an order — Stripe says the payment is not
+    `unpaid` — so the order stays pending, `_reusable_session` sees an expired
+    session and creates a second one, and the order now points at a session
+    nobody has paid while the first one is still going to complete.
+
+    When that first session completes, the order is genuinely paid and must be
+    marked so. But the newer session is open and chargeable, and a shopper
+    looking at that payment page would pay for the same order twice. So it is
+    expired here, before the transition, and the order is repointed at the
+    session the money actually came through — which is also what makes the
+    refund endpoint and the dashboard agree about which payment this order is.
+    Raised in review on PR #8.
+
+    Returns the columns this implies, for `_move` to apply with the status.
+    """
+    event_id = getattr(event, "id", "<unknown>")
+    paying_id = getattr(checkout_session, "id", None)
+    current_id = order.stripe_checkout_session_id
+
+    if not isinstance(paying_id, str) or paying_id == current_id:
+        return {}
+
+    if current_id is None:
+        # Nothing to close. Worth a line because every order this project
+        # creates has a session id by the time it can be paid, so an order
+        # without one has been reached some other way.
+        logger.warning(
+            "stripe event %s: order %s was paid through session %s but had no "
+            "session recorded; recording this one",
+            event_id,
+            order.id,
+            paying_id,
+        )
+        return {"stripe_checkout_session_id": paying_id}
+
+    logger.error(
+        "stripe event %s: order %s was paid through session %s but points at "
+        "%s, so a second checkout was open when this payment landed. Closing "
+        "the other one so the same order cannot be paid twice",
+        event_id,
+        order.id,
+        paying_id,
+        current_id,
+    )
+
+    try:
+        stripe_svc.expire_checkout_session(current_id)
+    except stripe_svc.InvalidRequestError as exc:
+        # Stripe refuses to expire anything that is not open, so this means the
+        # other session is already complete or already expired. Expired is
+        # harmless. Complete is the one case this whole function was trying to
+        # prevent and did not reach in time, and no code here can undo a second
+        # charge — so it is stated plainly, at ERROR, and a person refunds it.
+        # Caught narrowly on purpose: a connection failure is not this, and it
+        # must keep propagating into a 500 so Stripe retries the delivery.
+        logger.error(
+            "stripe event %s: session %s for order %s could not be closed "
+            "(%s). If it was completed rather than expired, this order has "
+            "been paid twice and needs a refund by hand",
+            event_id,
+            current_id,
+            order.id,
+            exc,
+        )
+
+    return {"stripe_checkout_session_id": paying_id}
+
+
+def _pay(session: Session, order: Order, event: Any, checkout_session: Any) -> None:
+    """Mark an order paid. Shared by the two events that can mean that.
+
+    `checkout.session.completed` and `checkout.session.async_payment_succeeded`
+    differ in what they have to check before they get here and in nothing after
+    it, so the reconciliation and the move live in one place.
+    """
+    if not _may_become(order, OrderStatus.PAID):
+        # Asked before reconciling, not after. `_move` is still what reports
+        # the refusal — with the amount when the case is serious — but this
+        # way an order that cannot become paid never causes somebody else's
+        # Checkout Session to be expired on the way to being told so.
+        _move(session, order, OrderStatus.PAID, event)
+        return
+
+    updates = _payment_intent_updates(event, checkout_session)
+    updates |= _reconcile_paying_session(order, event, checkout_session)
+
+    _move(session, order, OrderStatus.PAID, event, updates=updates)
+
+
 def handle_checkout_completed(session: Session, event: Any) -> None:
     """A shopper finished checkout. Mark the order paid — if the money is there.
 
@@ -476,6 +594,9 @@ def handle_checkout_completed(session: Session, event: Any) -> None:
     PaymentIntent to refund against, and the session is where it first appears.
     It is passed through `_move` rather than assigned here, so it cannot be
     written to an order whose transition was then refused.
+
+    The move itself is `_pay`, which also reconciles the session that paid
+    against the one the order points at — see `_reconcile_paying_session`.
     """
     order = _load_order(session, event)
     if order is None:
@@ -500,13 +621,7 @@ def handle_checkout_completed(session: Session, event: Any) -> None:
         )
         return
 
-    _move(
-        session,
-        order,
-        OrderStatus.PAID,
-        event,
-        updates=_payment_intent_updates(event, checkout_session),
-    )
+    _pay(session, order, event, checkout_session)
 
 
 def handle_async_payment_succeeded(session: Session, event: Any) -> None:
@@ -519,7 +634,8 @@ def handle_async_payment_succeeded(session: Session, event: Any) -> None:
 
     Stripe sends this only once the funds are confirmed, so unlike `completed`
     there is no payment state left to check — but the PaymentIntent is written
-    here too, since `completed` deliberately wrote nothing for this order.
+    here too, since `completed` deliberately wrote nothing for this order, and
+    the session reconciliation applies just the same.
     """
     order = _load_order(session, event)
     if order is None:
@@ -527,33 +643,68 @@ def handle_async_payment_succeeded(session: Session, event: Any) -> None:
 
     checkout_session = getattr(getattr(event, "data", None), "object", None)
 
-    _move(
-        session,
-        order,
-        OrderStatus.PAID,
-        event,
-        updates=_payment_intent_updates(event, checkout_session),
-    )
+    _pay(session, order, event, checkout_session)
 
 
 def handle_async_payment_failed(session: Session, event: Any) -> None:
-    """A delayed payment did not settle. Recorded, and nothing else.
+    """A delayed payment did not settle. Cancel the order and release the stock.
 
-    The order stays `pending` for the same reason a declined card leaves it
-    there: the session is still open until it expires, and `cancelled` is
-    terminal. Expiry is what ends an unpaid order.
+    **Not the same answer as a declined card**, and the difference is the state
+    the Checkout Session is left in. `payment_intent.payment_failed` happens on
+    a session that is still `open`: the shopper can try another card, and if
+    they never do, the session expires and `checkout.session.expired` cancels
+    the order. Neither is true here. This event only arrives *after*
+    `checkout.session.completed`, so the session is `complete` — and a complete
+    session never expires, so `checkout.session.expired` will never come, while
+    `_reusable_session` in `payments/checkout.py` refuses to start a new
+    checkout for an order holding a complete one. The first version of this
+    handler logged and left the order `pending`, which meant no retry path and
+    no release path: the order and its reserved units were stuck for ever.
+    Raised in review on PR #8.
+
+    So the explicit policy is that this payment is over. `cancelled` releases
+    the reservation, and the shopper who wants the goods places a new order.
+
+    Two things make that safe to do without asking Stripe anything, which is
+    the round trip `handle_checkout_expired` does make. The event type is
+    itself Stripe's verdict on the payment — unlike `expired`, which says
+    nothing about money and is why that handler cannot trust it. And if the
+    money did arrive, the order is already `paid` and `paid -> cancelled` is
+    not in the transition table, so `_move` refuses before any stock moves.
+
+    The session guard is the same one the expiry handler uses, for the same
+    reason: a failure on a session the order has already moved on from must not
+    cancel the checkout the shopper is currently looking at.
     """
     order = _load_order(session, event)
     if order is None:
         return
 
+    event_id = getattr(event, "id", "<unknown>")
+    failed_session = getattr(getattr(event, "data", None), "object", None)
+    failed_session_id = getattr(failed_session, "id", None)
+
+    if order.stripe_checkout_session_id != failed_session_id:
+        logger.info(
+            "stripe event %s: the delayed payment on session %s failed, but "
+            "order %s has since moved to session %s — not cancelling",
+            event_id,
+            failed_session_id,
+            order.id,
+            order.stripe_checkout_session_id,
+        )
+        return
+
     logger.warning(
-        "stripe event %s: the delayed payment for order %s failed; the order "
-        "stays %s until its checkout session expires",
-        getattr(event, "id", "<unknown>"),
+        "stripe event %s: the delayed payment for order %s failed on session "
+        "%s, which is complete and can neither be paid again nor expire. "
+        "Cancelling the order so its stock goes back on sale",
+        event_id,
         order.id,
-        order.status,
+        failed_session_id,
     )
+
+    _move(session, order, OrderStatus.CANCELLED, event)
 
 
 def handle_checkout_expired(session: Session, event: Any) -> None:

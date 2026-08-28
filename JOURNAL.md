@@ -1030,6 +1030,86 @@ prevent. It now stores primary keys and deletes only the difference. The script
 written to stop me restoring to a remembered constant was itself restoring to a
 remembered constant.
 
+**The second review round found the same bug I had just fixed, one layer
+down.** Four more comments after the fixes above were pushed. The first is the
+one worth the most.
+
+Moving the `stripe_payment_intent_id` assignment *into* `_move`, in front of
+its transition check, fixed the ordinary refusal and left the raced one
+standing — and I had described the fix as "applied after the transition has
+been cleared", which is a sentence about a check that is not the authoritative
+one. `_move`'s check is unlocked and advisory; the real one is inside
+`apply_transition`, behind `SELECT ... FOR UPDATE`. An attribute assigned
+before that statement is dirty on the Session, **SQLAlchemy autoflushes it as
+part of issuing the select**, and the `UPDATE` is in the transaction before the
+locked check has run. `session.expire()` afterwards drops the attribute and not
+the statement. I did not believe this one either until I wrote the test:
+simulate the race by neutering the preflight, refuse under the lock, commit,
+read the column back from Postgres — `pi_MUST_NOT_BE_WRITTEN`, on a `cancelled`
+order. `updates` now travel through to `apply_transition` and are assigned to
+the locked row after `transition()` allows the move.
+
+The general rule I did not have: **any write made before an autoflushing read
+is already in the transaction, whatever the code does with the attribute
+afterwards.** A check placed between them decides nothing about what commits.
+Three attempts at one column, and the first two both failed because I reasoned
+about where the *assignment* sat relative to a check, rather than about where
+it sat relative to a flush.
+
+**The guard I was proud of created the case it did not cover.** The expiry
+handler refuses to cancel an order whose session Stripe reports as not
+`unpaid` — correct, and it leaves the order `pending`. A shopper returning to
+that order gets a *second* Checkout Session, because `_reusable_session` sees
+an expired one and builds a new one. When the first session completes, the
+order is paid and the second is open and chargeable: the same order, payable
+twice. Nothing about that is exotic; it follows directly from two behaviours I
+wrote deliberately and never composed. The completed handler now expires the
+superseded session and repoints the order at the one the money came through.
+
+**Doing nothing is a policy, and it needs the same justification as doing
+something.** `checkout.session.async_payment_failed` logged and left the order
+`pending`, reasoning "a failed payment leaves the session open until it
+expires" — which is true of `payment_intent.payment_failed` and false here.
+This event arrives only after `checkout.session.completed`, so the session is
+`complete`: it will never expire, and `_reusable_session` refuses to start a
+new checkout for an order holding one. The order and its reserved units were
+stuck for ever. The handler now cancels. What made this invisible was that the
+inaction had a sentence attached to it, so it read as a decision rather than as
+the absence of one.
+
+**The live run found the one thing the tests could not: an aborted upload.**
+Capping the body is what made it visible. A client that goes away mid-upload
+makes Starlette raise `ClientDisconnect` out of `request.stream()`, and left
+alone it reaches uvicorn as an unhandled ASGI exception — a full traceback for
+a request with no client left to answer. Not a regression: `request.body()`
+iterates the same stream and had the same edge. What changed is reachability,
+and on an endpoint that takes uploads from anyone a traceback per aborted one
+is a log whose length a stranger controls. It is a `WARNING` line now.
+
+Worth noting how it surfaced. It appeared once in the log, attached to the
+wrong request — I read it as belonging to the 413, re-ran the 413 in isolation,
+and got no traceback at all. The line actually belonged to a `Content-Length`
+that the *client* library refused to honour, aborting a connection it had
+already opened. The first reading was the plausible one and it was wrong; the
+second came from reproducing rather than from re-reading the log.
+
+That probe settled something else. The offline test named
+`test_a_lying_content_length_does_not_get_past_the_cap` claimed a threat that
+does not exist: a raw socket declaring `Content-Length: 10` and sending 300 KB
+gets its request framed at ten bytes, and the rest is not part of it — HTTP/1.1
+already prevents the smuggle. The test is kept and renamed, because the
+property it really pins is the one that makes the fast path safe: the header is
+consulted and then not relied upon.
+
+**An unauthenticated endpoint reads whatever it is sent before it can refuse
+anyone.** The signature is the credential, and it cannot be checked until the
+body has arrived, so `await request.body()` buffered an anonymous caller's
+payload in full and then ran an HMAC over it. `read_capped_body` streams under
+a 256 KiB cap — set against the largest event on this account, 4,145 bytes, not
+against a guess. The header cannot be what enforces it: `Content-Length` is
+written by the sender and a chunked request need not carry one, so there is a
+test that lies in that header and is still refused with 413.
+
 ## Known gaps
 
 Every entry carries the day it was written. **Open** entries are grouped by
@@ -1116,6 +1196,23 @@ means money can move in a way the database will never reflect. The fix is not a
 status: it is a `refunds` table recording each refund against an order, with the
 order's status derived from the sum. That is a real schema change and belongs to
 whatever day actually needs partial refunds.
+
+**Closing a superseded Checkout Session is best-effort, and the case it misses
+is a double charge.** *(D8, second review round.)* When a payment lands through
+a session the order no longer points at, the newer session is expired so it
+cannot be paid as well. If it has *already* been paid, Stripe refuses to expire
+it and there is nothing this code can do: the order is marked paid once, two
+charges exist, and an ERROR line naming both sessions is the entire record. The
+window is small — it needs an expiry with a payment in flight, a shopper who
+returns, and a second payment made before the first one's event is delivered —
+but it is the same shape as the partial refund above: money has moved in a way
+the database cannot represent. A `payments` table recording each charge against
+an order would fix both, and neither is a reason to build one today.
+
+Worth naming with it: the reconciliation runs only when the money is
+*attributable*. Both events that reach it carry a session, so `order_id` and
+the session id are always there; an order paid some other way, or an event with
+no `order_id` in its metadata, is logged and dropped before any of this.
 
 **Nothing reconciles a charge against an order total.** *(D7, still open after
 D8.)* `amount_total` on the session was asserted equal to

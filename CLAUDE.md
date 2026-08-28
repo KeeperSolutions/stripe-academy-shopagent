@@ -395,6 +395,22 @@ once by name, and once on FastAPI's own `route.body_field`, which is the
 assertion with teeth. Dependencies are allowed — `Depends(get_session)` is not
 a body — and the guard checks for that rather than for an exact parameter list.
 
+**It reads the stream under a cap, not `await request.body()`.** The signature
+*is* the credential on this route, and it cannot be checked until the body has
+arrived — so everything read before that point was sent by somebody holding
+nothing. `request.body()` buffers the whole delivery before the check can
+happen, which turns "send a very large body" into memory and HMAC work an
+anonymous caller can ask for. `read_capped_body` reads `request.stream()` and
+gives up the moment the total passes `MAX_WEBHOOK_BODY_BYTES`, answering
+**413**. `Content-Length` is consulted first only as a fast path: it is a
+header the sender writes and a chunked request need not carry one, so it can
+shorten the work but never enforces the limit — there is a test that lies in
+that header and is still refused. 256 KiB against a measurement rather than a
+guess: the largest of the last hundred events on this account is 4,145 bytes.
+A constant rather than a setting, by the configuration rule above — a limit
+somebody can raise from a `.env` is a limit that stops holding on the day it
+matters. Raised in review on PR #8.
+
 **Insert first, then work — never check-then-act.** The obvious shape is to
 look the event id up and do the work if it is absent, and two concurrent
 redeliveries both read "absent" before either writes. Retries are the condition
@@ -471,6 +487,29 @@ allow-list: only `unpaid` may cancel, because `payment_status` has a third
 value (`no_payment_required`) and `!= "unpaid"` and `== "paid"` differ exactly
 there.
 
+**The session that paid is not always the one the order points at, and the
+other one has to be closed.** That guard has a consequence the guard itself
+creates. An order whose session expired with a payment still in flight is
+correctly left `pending` — Stripe reports it as not `unpaid`, so nothing is
+cancelled — and the shopper who returns gets a *second* Checkout Session,
+because `_reusable_session` sees an expired one and makes a new one. When the
+first session finally completes, the order is genuinely paid while the second
+session is open and chargeable, and a shopper still looking at that payment
+page pays for the same order twice. `_reconcile_paying_session` therefore
+expires the session the order points at, records the one that actually paid,
+and only then moves the order. Raised in the second review round on PR #8.
+
+Three things about it are deliberate. It runs behind `_may_become`, so an
+order that cannot become paid never causes somebody else's session to be
+expired on the way to being told so. The catch around the expiry is narrow —
+`stripe_svc.InvalidRequestError` only, which is Stripe refusing to expire a
+session that is not open; a connection failure is not that and must keep
+propagating into a 500 so the delivery is redelivered. And when the expiry is
+refused the payment is still accepted, because the money that arrived is real:
+the alternative to a possible double charge is a definite unpaid order. That
+case is the one thing here no code can fix, so it is logged at ERROR naming
+both sessions, and a person refunds it.
+
 **Only a full refund moves an order to `refunded`.** `charge.refunded` fires
 for a partial refund too — measured against one real charge refunded twice:
 
@@ -502,6 +541,30 @@ reason. Both async events are handled, because a guard without them would
 strand such an order at `pending` for ever: `completed` has already been and
 gone by the time the funds confirm.
 
+**`checkout.session.async_payment_failed` cancels the order, and a declined
+card does not.** The two look like the same event and leave the session in
+opposite states. `payment_intent.payment_failed` happens while the session is
+still `open`: the shopper can try another card, and if they never do, the
+session expires and `checkout.session.expired` cancels the order — so logging
+and doing nothing is complete. The async failure only ever arrives *after*
+`checkout.session.completed`, so the session is `complete`, and a complete
+session never expires while `_reusable_session` in `payments/checkout.py`
+refuses to start a new checkout for an order holding one. Logging and doing
+nothing there is not a lighter answer but a permanent leak: no retry path, no
+release path, the order and its reserved units stuck for ever. Raised in
+review on PR #8.
+
+The policy is therefore explicit — the payment is over, so the order is
+cancelled and the units go back on sale. It is the second path where stock is
+released without a person, and it asks Stripe nothing, unlike the expiry
+handler. Two things make that safe. The event type is itself Stripe's verdict
+on the payment, where `expired` says nothing about money and is exactly why
+that handler cannot trust it. And if the money did arrive the order is already
+`paid`, so `paid -> cancelled` is refused by the transition table before any
+stock moves — the guard is the table rather than a check somebody has to
+remember. The session-identity guard is the same one the expiry handler uses,
+for the same reason.
+
 **A live-mode event is recorded and never dispatched.** `config.py` refuses an
 `sk_live_` key, which reads like "live events cannot reach this code" and does
 not cover this path at all: `STRIPE_WEBHOOK_SECRET` is a separate credential
@@ -511,23 +574,43 @@ so it verifies just as well. `handle_event` therefore stops on
 genuine and the configuration is what has to change. A guard's coverage is a
 property of the path it sits on, not of the sentence describing it.
 
-**A column that belongs to a transition is written by `_move`, never by the
-caller before it.** `handle_checkout_completed` records
-`stripe_payment_intent_id`, and the obvious shape — assign it, then call
-`_move`, which checks the transition first — is wrong: the assignment has
-already happened, a refusal returns without undoing it, and the router's
-`commit()` writes it to an order whose status never changed. The damaging case
-is concrete: a second `checkout.session.completed` for an order already `paid`
-would overwrite the PaymentIntent the refund endpoint spends with one from a
-session that may never have been charged. Columns travel through `_move`'s
-`updates` and are applied after the transition is cleared. Raised in review on
-PR #8.
+**A column that belongs to a transition is written inside `apply_transition`,
+after the locked check.** `handle_checkout_completed` records
+`stripe_payment_intent_id`, and the damaging case is concrete: a second
+`checkout.session.completed` for an order already `paid` overwriting the
+PaymentIntent the refund endpoint spends, with one from a session that may
+never have been charged. Two rounds of review on PR #8 took two attempts at
+the same mistake, and the second is the instructive one.
 
-For the same reason the lost-race branch inside `_move` expires the instance
-rather than rolling the session back. A rollback there discarded this event's
-`processed_events` claim while the handler still returned normally and the
-router still answered 200 — the delivery recorded nowhere and Stripe told to
-stop, which are the two things that must never both be true.
+The obvious shape — assign the column, then call `_move`, which checks the
+transition first — is wrong because the assignment has already happened: a
+refusal returns without undoing it, and the router's `commit()` writes it to
+an order whose status never changed. Moving the assignment into `_move`, in
+front of its own check, fixed that and left a subtler version standing.
+`_move`'s check is unlocked and advisory; the authoritative one is inside
+`apply_transition`, behind `SELECT ... FOR UPDATE`. An attribute assigned
+before that statement runs is dirty on the Session, **SQLAlchemy autoflushes
+it as part of issuing the select**, and the `UPDATE` is therefore already in
+the transaction by the time the locked check refuses. `session.expire()`
+afterwards drops the attribute and not the statement, so the router commits
+it. Only an assignment made *after* the locked check cannot outlive a refusal,
+which is why `updates` travel through `_move` to `apply_transition` and are
+applied there.
+
+The general form is worth stating, because it is not specific to this column:
+**any write made before an autoflushing read is already in the transaction,
+whatever the code does with the attribute afterwards.** A check that runs
+between them decides nothing about what commits.
+`test_a_transition_refused_under_the_lock_writes_no_column_either` simulates
+the race by neutering the preflight, which is exactly the state a caller is in
+when a concurrent delivery moved the order between the two checks.
+
+The lost-race branch inside `_move` still expires the instance rather than
+rolling the session back, now for one reason instead of two: it drops the
+status this handler read before the wait. A rollback there discarded this
+event's `processed_events` claim while the handler still returned normally and
+the router still answered 200 — the delivery recorded nowhere and Stripe told
+to stop, which are the two things that must never both be true.
 
 **`apply_transition` asks for `populate_existing` under its lock.** The order
 is usually already in the Session's identity map, and an ORM select that

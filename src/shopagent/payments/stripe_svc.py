@@ -363,6 +363,12 @@ def delete_customer(customer_id: str) -> Any:
 # retries, and which therefore loses the delivery for good.
 SignatureVerificationError = stripe.SignatureVerificationError
 
+# Re-exported for the same reason: `events.py` has to tell "Stripe refused this
+# request" apart from "Stripe could not be reached", because the first is
+# permanent and the second is worth a retry — and `payments/stripe_svc.py` is
+# the only module allowed to import `stripe`.
+InvalidRequestError = stripe.InvalidRequestError
+
 
 # What Stripe allows between the timestamp it signed and the moment we verify.
 # Five minutes, and it is the SDK's own default rather than a number chosen

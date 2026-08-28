@@ -24,11 +24,13 @@ is the one place the two are deliberately compared, which pins the scheme.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import hmac
 import inspect
 import json
 import logging
+import textwrap
 import time
 
 import pytest
@@ -36,6 +38,7 @@ import stripe
 from fastapi import Depends, FastAPI, Request, params
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 from pydantic import BaseModel, ValidationError
 
 from sqlalchemy import func, text
@@ -775,15 +778,148 @@ def test_the_body_parameter_guard_actually_catches_one():
 
 
 def test_the_handler_reads_the_raw_body():
-    """The positive half: `await request.body()` is what the handler calls.
+    """The positive half: raw bytes off the stream are what the handler uses.
 
     Read from the source rather than mocked, so it stays true of whatever the
     handler grows into. Together with the guard above this pins both ends —
     no parsed body in, raw bytes used.
-    """
-    source = inspect.getsource(webhooks.stripe_webhook)
 
-    assert "await request.body()" in source
+    The route delegates to `read_capped_body`, so the claim is checked in two
+    places: the handler calls it, and it is the thing that touches the request.
+    """
+    assert "read_capped_body(request)" in inspect.getsource(webhooks.stripe_webhook)
+
+    reader = ast.parse(textwrap.dedent(inspect.getsource(webhooks.read_capped_body)))
+    reached = {
+        node.func.attr
+        for node in ast.walk(reader)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "request"
+    }
+
+    # Walked rather than grepped: this function's docstring names `body()` in
+    # order to explain why it is not used, and a substring check cannot tell
+    # the explanation from the call. `body()` would buffer the whole delivery
+    # before the cap could refuse it, which is what the cap exists to prevent.
+    assert "stream" in reached
+    assert "body" not in reached
+
+
+# --- how much of an anonymous body this endpoint will read ---------------
+#
+# Raised in the second review round on PR #8. A signature is the credential
+# here, and it cannot be checked until the body has arrived — so everything
+# read before that point was sent by somebody who holds nothing.
+
+
+def oversized() -> bytes:
+    return b"x" * (webhooks.MAX_WEBHOOK_BODY_BYTES + 1)
+
+
+def test_a_body_over_the_cap_is_refused(client):
+    response = post(client, oversized(), sign(b"whatever"))
+
+    assert response.status_code == 413
+    assert str(webhooks.MAX_WEBHOOK_BODY_BYTES) in response.json()["detail"]
+
+
+def test_the_oversized_body_is_refused_before_any_signature_work(client, monkeypatch):
+    """The point of the cap, and the only assertion that shows it.
+
+    Refusing after verification would still have buffered the whole body and
+    done the HMAC over it, which is the work being denied. So verification must
+    not be reached at all.
+    """
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("the signature was verified over an oversized body")
+
+    monkeypatch.setattr(stripe_svc, "construct_webhook_event", must_not_run)
+
+    assert post(client, oversized(), sign(b"whatever")).status_code == 413
+
+
+def test_a_chunked_body_over_the_cap_is_refused(client):
+    """`Content-Length` is the fast path, not the enforcement.
+
+    It is a header the sender writes, and a chunked request need not carry one
+    at all — so the cap has to hold while the stream is being read. Passing an
+    iterator makes httpx send `Transfer-Encoding: chunked` with no length.
+    """
+    chunk = b"x" * 8192
+    count = webhooks.MAX_WEBHOOK_BODY_BYTES // len(chunk) + 2
+
+    response = client.post(
+        "/webhooks/stripe",
+        content=(chunk for _ in range(count)),
+        headers={"Content-Type": "application/json", "Stripe-Signature": sign(b"x")},
+    )
+
+    assert response.status_code == 413
+
+
+def test_the_cap_holds_when_the_declared_length_is_wrong(client):
+    """The stream check enforces the cap on its own, header or no header.
+
+    Not a smuggling scenario — checked with a raw socket against the running
+    server, and HTTP/1.1 framing already prevents that: a request declaring
+    `Content-Length: 10` *is* ten bytes long, and whatever follows is not part
+    of it. What this pins is narrower and still worth pinning, because it is
+    the reason the fast path is safe to have at all: the header is consulted
+    and then not relied upon, so a wrong one cannot raise the limit.
+    """
+    response = client.post(
+        "/webhooks/stripe",
+        content=(c for c in [oversized()]),
+        headers={
+            "Content-Type": "application/json",
+            "Stripe-Signature": sign(b"x"),
+            "Content-Length": "10",
+        },
+    )
+
+    assert response.status_code == 413
+
+
+def test_a_caller_that_disconnects_mid_body_is_a_refusal_not_a_crash(client, monkeypatch):
+    """Found by the live run, not by a test — which is why it is one now.
+
+    Starlette raises `ClientDisconnect` out of `request.stream()` when a caller
+    goes away mid-upload. Left alone it reaches uvicorn as an unhandled ASGI
+    exception and prints a full traceback for a request that has no client left
+    to answer. `request.body()` had the same edge, so this is not new; what is
+    new is how reachable it became once the body is streamed under a cap, and
+    an unauthenticated endpoint whose log length a stranger controls is worth
+    closing.
+    """
+    async def disconnects():
+        yield b'{"partial":'
+        raise ClientDisconnect()
+
+    monkeypatch.setattr(
+        webhooks.Request, "stream", lambda self: disconnects(), raising=False
+    )
+
+    response = post(client, b"ignored", sign(b"ignored"))
+
+    assert response.status_code == 400
+    assert "incomplete" in response.json()["detail"]
+
+
+def test_a_body_at_the_cap_is_read_normally(client):
+    """The limit is not off by one, and padding is not what refuses a delivery.
+
+    A real event this large would be extraordinary — the biggest measured on
+    this account is 4,145 bytes — but the assertion that matters is that a body
+    right up against the cap reaches verification rather than the 413.
+    """
+    padded = event_body()
+    padding = webhooks.MAX_WEBHOOK_BODY_BYTES - len(padded) - len(b', "pad": ""')
+    payload = padded[:-1] + b', "pad": "' + b"x" * padding + b'"}'
+    assert len(payload) == webhooks.MAX_WEBHOOK_BODY_BYTES
+
+    assert post(client, payload, sign(payload)).status_code == 200
 
 
 # --- what the log says ---------------------------------------------------

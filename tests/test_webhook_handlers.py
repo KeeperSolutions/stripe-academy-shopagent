@@ -19,6 +19,7 @@ import json
 import logging
 import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select, text
@@ -1458,28 +1459,276 @@ def test_a_delayed_payment_that_settles_later_marks_the_order_paid(client, sessi
     assert order.stripe_payment_intent_id == "pi_settled_late"
 
 
-def test_a_delayed_payment_that_fails_leaves_the_order_pending(client, session, caplog):
-    caplog.set_level(logging.INFO, logger="shopagent.api.services.events")
-    variant = make_variant(session, sku="RV-ASYNC-FAIL", quantity=30)
-    order_id = make_order(client, variant, quantity=2)
-    attach_session(session, order_id)
-    before = stock(session, variant.id)
-
-    failed = event(
+def async_failed_event(order_id, *, session_id="cs_test_handler"):
+    return event(
         "checkout.session.async_payment_failed",
         {
-            "id": "cs_test_handler",
+            "id": session_id,
             "object": "checkout.session",
             "payment_status": "unpaid",
             "metadata": {"order_id": str(order_id)},
         },
     )
+
+
+def test_a_delayed_payment_that_fails_cancels_the_order(client, session, caplog):
+    """The second review round: `pending` here was a permanent leak.
+
+    This event only follows `checkout.session.completed`, so the session is
+    `complete` — it will never expire, and `payments/checkout.py` refuses to
+    start a new checkout while the order holds one. Leaving the order pending
+    therefore left it and its reserved units stuck with no way out at all.
+    """
+    caplog.set_level(logging.INFO, logger="shopagent.api.services.events")
+    variant = make_variant(session, sku="RV-ASYNC-FAIL", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id)
+    quantity, reserved_before = stock(session, variant.id)
+
+    assert deliver(client, async_failed_event(order_id)).status_code == 200
+
+    session.expire_all()
+    assert session.get(Order, order_id).status == OrderStatus.CANCELLED
+    # The units go back on sale. `quantity` never moves — nothing shipped.
+    assert stock(session, variant.id) == (quantity, reserved_before - 2)
+    assert any("delayed payment" in r.getMessage() for r in caplog.records)
+
+
+def test_a_delayed_failure_on_an_old_session_cancels_nothing(client, session, caplog):
+    """The same guard the expiry handler has, and for the same reason.
+
+    An order that has moved on to a second checkout must not be cancelled by a
+    failure on the first — the shopper is looking at the newer payment page.
+    """
+    caplog.set_level(logging.INFO, logger="shopagent.api.services.events")
+    variant = make_variant(session, sku="RV-ASYNC-FAIL-OLD", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id, "cs_test_current")
+    before = stock(session, variant.id)
+
+    failed = async_failed_event(order_id, session_id="cs_test_superseded")
     assert deliver(client, failed).status_code == 200
 
     session.expire_all()
     assert session.get(Order, order_id).status == OrderStatus.PENDING
     assert stock(session, variant.id) == before
-    assert any("delayed payment" in r.getMessage() for r in caplog.records)
+    assert any("not cancelling" in r.getMessage() for r in caplog.records)
+
+
+def test_a_delayed_failure_cannot_cancel_an_order_that_was_paid(client, session):
+    """The backstop the handler relies on instead of asking Stripe again.
+
+    If the money did arrive, the order is `paid`, and `paid -> cancelled` is
+    not in the transition table — so the refusal happens before any stock
+    moves rather than being a check this handler has to remember to make.
+    """
+    variant = make_variant(session, sku="RV-ASYNC-FAIL-PAID", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id)
+    assert deliver(client, completed_event(order_id)).status_code == 200
+    session.expire_all()
+    paid_stock = stock(session, variant.id)
+
+    assert deliver(client, async_failed_event(order_id)).status_code == 200
+
+    session.expire_all()
+    assert session.get(Order, order_id).status == OrderStatus.PAID
+    assert stock(session, variant.id) == paid_stock
+
+
+# --- the session that paid vs the session the order points at ------------
+#
+# Raised in the second review round on PR #8. An order whose first session
+# expired with a payment in flight is left pending by the expiry guard, then
+# gets a second session — and when the first one completes, the order is paid
+# while the second is still open and chargeable.
+
+
+def record_expiries(monkeypatch) -> list[str]:
+    expired: list[str] = []
+    monkeypatch.setattr(
+        stripe_svc,
+        "expire_checkout_session",
+        lambda session_id: expired.append(session_id),
+    )
+    return expired
+
+
+def test_a_payment_through_a_superseded_session_closes_the_newer_one(
+    client, session, monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO, logger="shopagent.api.services.events")
+    expired = record_expiries(monkeypatch)
+    variant = make_variant(session, sku="RV-SUPERSEDED", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id, "cs_test_second")
+
+    paid_through = completed_event(
+        order_id, session_id="cs_test_first", payment_intent="pi_from_the_first"
+    )
+    assert deliver(client, paid_through).status_code == 200
+
+    # The open one is closed, so the same order cannot be paid a second time.
+    assert expired == ["cs_test_second"]
+
+    session.expire_all()
+    order = session.get(Order, order_id)
+    assert order.status == OrderStatus.PAID
+    assert order.stripe_payment_intent_id == "pi_from_the_first"
+    # Repointed at the session the money actually came through, so the refund
+    # endpoint and the dashboard agree about which payment this order is.
+    assert order.stripe_checkout_session_id == "cs_test_first"
+    # Closed cleanly, so nothing asks for a person.
+    assert not any("refund by hand" in r.getMessage() for r in caplog.records)
+    assert any(
+        "a second checkout was open" in r.getMessage()
+        and r.levelno == logging.ERROR
+        for r in caplog.records
+    )
+
+
+def test_the_ordinary_payment_closes_nothing(client, session, monkeypatch):
+    """The path every real payment takes must not make a Stripe call."""
+    expired = record_expiries(monkeypatch)
+    variant = make_variant(session, sku="RV-NO-EXPIRY", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id, "cs_test_only")
+
+    assert deliver(
+        client, completed_event(order_id, session_id="cs_test_only")
+    ).status_code == 200
+
+    assert expired == []
+    session.expire_all()
+    assert session.get(Order, order_id).status == OrderStatus.PAID
+
+
+def test_a_payment_that_cannot_be_accepted_closes_nothing(
+    client, session, monkeypatch
+):
+    """`_may_become` before the reconciliation, not after.
+
+    An order that cannot become paid must not cause somebody else's Checkout
+    Session to be expired on the way to being told so.
+    """
+    stripe_says(monkeypatch, "unpaid", status="open")
+    expired = record_expiries(monkeypatch)
+    variant = make_variant(session, sku="RV-NO-EXPIRY-REFUSED", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id, "cs_test_current")
+    assert client.post(f"/orders/{order_id}/cancel").status_code == 200
+    expired.clear()
+
+    late = completed_event(order_id, session_id="cs_test_first")
+    assert deliver(client, late).status_code == 200
+
+    assert expired == []
+    session.expire_all()
+    order = session.get(Order, order_id)
+    assert order.status == OrderStatus.CANCELLED
+    assert order.stripe_checkout_session_id == "cs_test_current"
+
+
+def test_a_session_that_will_not_close_is_reported_and_the_money_still_lands(
+    client, session, monkeypatch, caplog
+):
+    """Stripe refuses to expire a session that is not open.
+
+    Already expired is harmless; already complete means this order has been
+    paid twice and no code here can undo that. Either way the payment that did
+    arrive is real, so the order becomes paid and the log carries the warning.
+    """
+    caplog.set_level(logging.INFO, logger="shopagent.api.services.events")
+
+    def refuses(session_id):
+        raise stripe_svc.InvalidRequestError(
+            "You may only expire a session that is in the open state", "session"
+        )
+
+    monkeypatch.setattr(stripe_svc, "expire_checkout_session", refuses)
+
+    variant = make_variant(session, sku="RV-CLOSE-FAILS", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id, "cs_test_second")
+
+    assert deliver(
+        client, completed_event(order_id, session_id="cs_test_first")
+    ).status_code == 200
+
+    session.expire_all()
+    assert session.get(Order, order_id).status == OrderStatus.PAID
+    assert any(
+        "refund by hand" in r.getMessage() and r.levelno == logging.ERROR
+        for r in caplog.records
+    )
+
+
+def test_a_transport_failure_while_closing_the_other_session_is_a_500(
+    client, session, monkeypatch
+):
+    """The narrow catch, checked from the other side.
+
+    `InvalidRequestError` is permanent and swallowed; anything else is not, and
+    has to become a 500 so Stripe redelivers rather than the payment being
+    recorded against a session nobody closed.
+    """
+    def unreachable(session_id):
+        raise RuntimeError("connection reset")
+
+    monkeypatch.setattr(stripe_svc, "expire_checkout_session", unreachable)
+
+    variant = make_variant(session, sku="RV-CLOSE-DOWN", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id, "cs_test_second")
+
+    with pytest.raises(RuntimeError):
+        deliver(client, completed_event(order_id, session_id="cs_test_first"))
+
+
+def test_a_transition_refused_under_the_lock_writes_no_column_either(
+    client, session, monkeypatch
+):
+    """The same bug one layer down, found by the second review round.
+
+    Moving the assignment into `_move` fixed the ordinary refusal and left the
+    raced one: the unlocked preflight passes, the attribute is set, and
+    `apply_transition`'s `SELECT ... FOR UPDATE` autoflushes it before the
+    authoritative check runs. `session.expire()` afterwards drops the attribute
+    but not the UPDATE, so the router's commit persisted it against an order
+    whose status never changed.
+
+    The race is simulated rather than threaded: neutering the preflight is
+    exactly the state a caller is in when a concurrent delivery moved the order
+    between the two checks. `updates` now travel to `apply_transition` and are
+    assigned only after the locked check, so nothing is dirty when the flush
+    happens.
+    """
+    variant = make_variant(session, sku="RV-AUTOFLUSH", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    order = attach_session(session, order_id)
+
+    order.status = OrderStatus.CANCELLED.value
+    session.flush()
+    monkeypatch.setattr(event_service, "check_transition", lambda a, b: None)
+
+    moved = event_service._move(
+        session,
+        order,
+        OrderStatus.PAID,
+        SimpleNamespace(id="evt_raced"),
+        updates={"stripe_payment_intent_id": "pi_MUST_NOT_BE_WRITTEN"},
+    )
+    assert moved is False
+
+    session.commit()
+    stored = session.execute(
+        text(
+            "SELECT stripe_payment_intent_id, status FROM orders WHERE id = :i"
+        ),
+        {"i": order_id},
+    ).one()
+    assert stored.status == OrderStatus.CANCELLED.value
+    assert stored.stripe_payment_intent_id is None
 
 
 def test_a_refused_transition_never_writes_the_payment_intent(client, session):

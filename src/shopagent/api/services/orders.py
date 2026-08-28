@@ -430,7 +430,11 @@ def _release_reservation(session: Session, order: Order) -> None:
 
 
 def apply_transition(
-    session: Session, order: Order, new_status: OrderStatus
+    session: Session,
+    order: Order,
+    new_status: OrderStatus,
+    *,
+    updates: dict[str, Any] | None = None,
 ) -> TransitionEffects:
     """Move an order's status and carry out whatever that implies.
 
@@ -445,6 +449,22 @@ def apply_transition(
 
     Raises `IllegalTransition` untouched: the router maps it to 409, and the
     lifecycle's own message already names both statuses.
+
+    `updates` are columns that belong to this move and to nothing else —
+    `stripe_payment_intent_id`, written when a checkout completes. They are
+    assigned to the **locked** row, after `transition()` has allowed the move
+    and before the commit, so they reach the database only if the status does.
+
+    That they are applied here rather than by the caller is the second
+    correction to the same mistake, both raised in review on PR #8. The first
+    version had the caller assign the column and then ask for the transition;
+    the second moved the assignment into `_move`, past its unlocked preflight,
+    which read as safe and was not. Any assignment made before this function
+    runs is dirty on the Session when the `SELECT ... FOR UPDATE` below
+    triggers an autoflush, so the UPDATE is already issued by the time
+    `transition()` refuses — and `expire()` afterwards drops the attribute
+    without undoing the statement, leaving the webhook router to commit it.
+    Only an assignment made after the locked check cannot outlive a refusal.
     """
     # Lock the row before reading the status that decides whether stock moves.
     # Without it two concurrent callers — a refund arriving twice from D8, say —
@@ -480,6 +500,12 @@ def apply_transition(
         raise OrderNotFound(f"no order with id {order.id}")
 
     effects = transition(locked, new_status)
+
+    # After the check, never before it. This is the only point at which the
+    # move is certain, and an assignment made any earlier survives a refusal —
+    # see the docstring.
+    for column, value in (updates or {}).items():
+        setattr(locked, column, value)
 
     if effects.releases_reservation:
         _release_reservation(session, locked)

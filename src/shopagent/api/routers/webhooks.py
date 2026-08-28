@@ -53,6 +53,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from starlette.requests import ClientDisconnect
 from sqlalchemy.orm import Session
 
 from shopagent.api.db import get_session
@@ -68,6 +69,72 @@ router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 # The header Stripe signs with. Named rather than typed inline because two
 # places read it — the handler and the log line that says whether it arrived.
 SIGNATURE_HEADER = "Stripe-Signature"
+
+# The largest delivery this endpoint will read, in bytes.
+#
+# This route is unauthenticated by necessity — a signature is the credential
+# and it cannot be checked until the body has arrived — so until then anything
+# read here was sent by an anonymous caller. `await request.body()` buffers the
+# whole stream into memory before that check, which turns "send a very large
+# body" into memory and HMAC work nobody had to hold a secret to cause. Raised
+# in review on PR #8.
+#
+# 256 KiB, set against a measurement rather than a guess: of the last hundred
+# events on this account the largest serialises to 4,145 bytes, a
+# `checkout.session.expired`. That leaves about sixty times the room for an
+# event with many more line items than anything here produces, while still
+# being a number an anonymous caller cannot grow.
+# Deliberately a constant rather than a setting — see the configuration rule in
+# CLAUDE.md; a limit somebody can raise from a `.env` is a limit that stops
+# holding on the day it matters.
+MAX_WEBHOOK_BODY_BYTES = 256 * 1024
+
+
+class WebhookBodyTooLarge(Exception):
+    """The delivery exceeded `MAX_WEBHOOK_BODY_BYTES` and was not read."""
+
+
+class WebhookBodyIncomplete(Exception):
+    """The caller stopped sending before the body was complete."""
+
+
+async def read_capped_body(request: Request) -> bytes:
+    """The raw request body, refusing anything over the cap.
+
+    Reads `request.stream()` in chunks and gives up as soon as the total passes
+    the limit, so an oversized body is never fully in memory. `request.body()`
+    would have buffered it all before returning, and checking `len()` afterwards
+    is a check made after the damage.
+
+    `Content-Length` is consulted first only as a fast path: it is a header the
+    sender controls and a chunked request need not carry one, so it can shorten
+    the work but is never what enforces the limit.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit():
+        if int(declared) > MAX_WEBHOOK_BODY_BYTES:
+            raise WebhookBodyTooLarge(int(declared))
+
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > MAX_WEBHOOK_BODY_BYTES:
+                raise WebhookBodyTooLarge(size)
+            chunks.append(chunk)
+    except ClientDisconnect as exc:
+        # A caller that goes away mid-upload. Starlette raises this out of the
+        # stream, and left alone it reaches uvicorn as an unhandled ASGI
+        # exception and prints a full traceback — for a request that has no
+        # client left to answer and did nothing. `request.body()` had the same
+        # edge, since it iterates this same stream; capping the body did not
+        # introduce it but did make it easy to reach, because this endpoint
+        # takes uploads from anyone and a traceback per aborted one is a log
+        # somebody else controls the size of. One line instead.
+        raise WebhookBodyIncomplete(size) from exc
+
+    return b"".join(chunks)
 
 
 class MissingWebhookSecret(RuntimeError):
@@ -240,8 +307,9 @@ async def stripe_webhook(
     non-ASCII character. `tests/test_webhooks.py` fails if a parameter is ever
     added.
 
-    So: `Request` in, `await request.body()` for the raw bytes, and the parsed
-    event comes back from the SDK's verification rather than from FastAPI.
+    So: `Request` in, the raw bytes read off `request.stream()` under a size
+    cap, and the parsed event comes back from the SDK's verification rather
+    than from FastAPI.
     """
     try:
         secret = webhook_signing_secret()
@@ -256,7 +324,36 @@ async def stripe_webhook(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
 
-    payload = await request.body()
+    try:
+        payload = await read_capped_body(request)
+    except WebhookBodyIncomplete as exc:
+        # 400, and mostly nobody reads it: the connection is generally gone by
+        # the time this is written. It exists so the request ends as a refusal
+        # rather than as a crash.
+        logger.warning(
+            "stripe webhook rejected: the caller disconnected after %s bytes",
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="the request body was incomplete",
+        ) from exc
+    except WebhookBodyTooLarge as exc:
+        # 413 rather than 400: the body was never parsed and may well have been
+        # a perfectly good event. What is being refused is its size, and that is
+        # what the status has to say — Stripe retries a 413 like any non-2xx,
+        # which is right, because if a genuine event is ever this large the cap
+        # is what has to change.
+        logger.warning(
+            "stripe webhook rejected: body over %d bytes (%s)",
+            MAX_WEBHOOK_BODY_BYTES,
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"body must be at most {MAX_WEBHOOK_BODY_BYTES} bytes",
+        ) from exc
+
     signature = request.headers.get(SIGNATURE_HEADER)
 
     # The plan's rule — log every delivery before doing anything with it,
