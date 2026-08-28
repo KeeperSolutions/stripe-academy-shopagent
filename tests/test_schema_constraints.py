@@ -263,12 +263,16 @@ def test_the_recorded_migration_covers_the_columns_day_7_added():
 def test_the_recorded_migration_creates_the_table_day_8_added():
     """The first *table* the convention creates, rather than columns it adds.
 
-    The two cases differ in a way that makes this file easy to skip:
-    `create_all` does build a table that does not exist, so a fresh clone gets
-    `processed_events` without anyone running this migration. A database
-    created before D8 is the case that matters — it already has every other
-    table, `create_all` leaves it alone, and nothing would report the missing
-    one until the first insert failed.
+    Easy to think unnecessary, because `create_all` checks tables one at a
+    time and builds any it does not find — a fresh clone and a pre-D8 database
+    alike. An earlier version of this docstring said `create_all` would leave
+    such a database alone, which is wrong; review on PR #8 corrected it.
+
+    What the migration is for is the record: a file saying what changed, which
+    a deployment can read before running it. `create_all` builds whatever it
+    finds missing and says nothing about which change was needed. This test
+    only asserts the file exists and is idempotent, which is the part a
+    convention can enforce.
     """
     import pathlib
 

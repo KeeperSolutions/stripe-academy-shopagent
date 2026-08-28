@@ -6,12 +6,18 @@
 -- `create_all`. The catalog's four tables keep their own rule.
 --
 -- This is the first *table* the convention creates rather than the first
--- columns it adds, and the two cases differ in one way worth stating.
--- `create_all` does build a table that does not exist, so a fresh clone gets
--- this one without running anything here — which is exactly what makes the
--- file easy to skip. It is not skippable: a database created before today
--- already has every other table, `create_all` leaves it alone, and nothing
--- would say the new one is missing until the first insert failed.
+-- columns it adds, and it is worth being exact about what that changes.
+-- `create_all` checks tables one at a time, so it would build this one on any
+-- database that lacks it — a fresh clone and a pre-D8 database alike. An
+-- earlier version of this comment claimed otherwise, and review corrected it.
+--
+-- So this file is not the only way the table can come to exist. What it is, is
+-- the recorded change: the repository's own statement of what a database built
+-- before D8 needs, applied the way every other commerce change is applied, and
+-- the thing `0003` will extend when a column is added here. Reaching for
+-- `create_all` instead means running a script that will silently build
+-- anything else it finds missing, which is the opposite of a change somebody
+-- can read before it runs.
 --
 -- Apply with, from the repository root:
 --   docker compose exec -T db psql -U shopagent -d shopagent \

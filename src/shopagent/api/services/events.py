@@ -10,15 +10,47 @@ raises an `HTTPException`, and nothing here decides a status code: the router
 turns "already seen" into a 200, and a reconciliation pass that runs outside
 any request would turn it into a log line.
 
-**One event type moves an order and the rest do not**, which is the decision
-worth reading before the code. `checkout.session.completed` is the one that
-marks an order paid. `payment_intent.succeeded` describes the same money and
-deliberately does nothing: a single payment produces both, they arrive in an
-order nobody controls, and having two events race for one transition would
-mean the second is refused by the transition table every time — a permanent
-warning in the log describing normal operation. `completed` is the primary
-because it says the *checkout* finished, not merely that a charge settled,
-and it is the event that carries the session this project created.
+**Five event types move an order and two deliberately do not**, which is the
+decision worth reading before the code. This paragraph said "one moves an
+order" until review on PR #8 pointed out that it had stopped being true two
+handlers ago — the module overview contradicting `HANDLERS` is the kind of
+staleness a reader has no way to detect.
+
+Moving, and what each one means:
+
+  * `checkout.session.completed` -> `paid`, but only when `payment_status`
+    says the money is there. For a delayed-notification method it arrives
+    `unpaid` and settles later.
+  * `checkout.session.async_payment_succeeded` -> `paid`, which is how such an
+    order eventually gets there; `completed` has been and gone by then.
+  * `checkout.session.async_payment_failed` -> `cancelled`. That session is
+    `complete`, so it can neither be paid again nor expire, and leaving the
+    order pending would strand it and its stock for ever.
+  * `checkout.session.expired` -> `cancelled`, the most defensive handler
+    here, because it is a path where stock is released without a person.
+
+Not moving, each for its own reason:
+
+  * `payment_intent.succeeded` describes the same money as `completed`. A
+    single payment produces both, they arrive in an order nobody controls, and
+    having two events race for one transition would mean the loser is refused
+    by the transition table every time — a permanent warning in the log
+    describing normal operation. `completed` is the primary because it says
+    the *checkout* finished rather than that a charge settled, and it carries
+    the session this project created. It is kept as a handler rather than left
+    to the unknown-type branch so the log distinguishes "nothing handles this"
+    from "nothing should".
+  * `payment_intent.payment_failed` is a declined card on a session that is
+    still open. The shopper can try again, and expiry is what ends an unpaid
+    order.
+
+And one more that moves, listed apart because it is the only one that is not
+about a checkout: `charge.refunded` -> `refunded`, but only for a *full* refund
+of the order's *own* charge. A partial refund has no representation here, and a
+charge that is not the one the order recorded is not this order's payment.
+
+Three of those five land on a terminal status, which is why the guards in front
+of them are longer than the transitions themselves.
 
 **Errors split two ways, and the split is what the status code means to
 Stripe.** A permanent failure — an event type nothing handles, an order id
@@ -59,7 +91,7 @@ from sqlalchemy.orm import Session
 
 from shopagent.api.lifecycle import IllegalTransition, OrderStatus, check_transition
 from shopagent.api.models import Order, ProcessedEvent
-from shopagent.api.services.orders import apply_transition
+from shopagent.api.services.orders import apply_transition, lock_order
 from shopagent.payments import stripe_svc
 
 logger = logging.getLogger(__name__)
@@ -746,6 +778,8 @@ def handle_checkout_expired(session: Session, event: Any) -> None:
     expired_session_id = getattr(expired_session, "id", None)
 
     if order.stripe_checkout_session_id != expired_session_id:
+        # Advisory, and it saves a round trip rather than deciding anything.
+        # The authoritative comparison is the one below, under the row lock.
         logger.info(
             "stripe event %s: session %s expired, but order %s has since moved "
             "to session %s — not cancelling",
@@ -772,6 +806,29 @@ def handle_checkout_expired(session: Session, event: Any) -> None:
             expired_session_id,
             payment_status,
             order.id,
+        )
+        return
+
+    # Re-read the order under `FOR UPDATE` and compare the session again. The
+    # check above ran before a network call to Stripe, which takes long enough
+    # for a shopper to start a second checkout: `_reusable_session` sees an
+    # expired session, builds a new one, and writes it here. Cancelling on the
+    # strength of the earlier read would then release the stock of an order
+    # whose new payment page is open and chargeable — the same shape as the
+    # transition preflight, an unlocked read deciding a write. Holding the lock
+    # from here to the commit means nothing can move in between, and
+    # `apply_transition` re-locking a row this transaction already holds is
+    # free. Raised in review on PR #8.
+    order = lock_order(session, order.id)
+
+    if order.stripe_checkout_session_id != expired_session_id:
+        logger.info(
+            "stripe event %s: session %s expired, but order %s moved to "
+            "session %s while this event was being handled — not cancelling",
+            event_id,
+            expired_session_id,
+            order.id,
+            order.stripe_checkout_session_id,
         )
         return
 
@@ -836,6 +893,49 @@ def handle_payment_succeeded(session: Session, event: Any) -> None:
     )
 
 
+def _charge_belongs_to(order: Order, charge: Any, event_id: str) -> bool:
+    """Is this refunded Charge the one that paid this order?
+
+    `order_id` in the metadata says which order a charge is *about*; it does
+    not say that this charge is the payment the order recorded. Those come
+    apart in exactly one case, and this project documented that case before it
+    guarded it: when a superseded Checkout Session was already paid, two
+    Charges exist carrying the same `order_id`, and only one of them is in
+    `orders.stripe_payment_intent_id`.
+
+    Refunding the *other* one — the duplicate, which is the one a person
+    reconciling would refund first — would otherwise read here as a full
+    refund of the order: `amount` and `amount_refunded` are that charge's own
+    numbers and they balance. The order would go to `refunded`, terminally,
+    and hand back the whole reservation, while the payment it actually
+    recorded stays charged. Raised in review on PR #8.
+
+    So the attribution is checked against the column rather than the metadata.
+    A charge that does not match changes nothing and is logged at ERROR,
+    because a refund did happen and this server is deliberately not acting on
+    it. An order with no recorded PaymentIntent fails this too, and that is
+    the intended answer: `refunded` is terminal and releases stock, so an
+    attribution that cannot be verified is not one to act on.
+    """
+    charge_intent = getattr(charge, "payment_intent", None)
+
+    if isinstance(charge_intent, str) and charge_intent == order.stripe_payment_intent_id:
+        return True
+
+    logger.error(
+        "stripe event %s: a charge was refunded naming order %s, but its "
+        "payment_intent is %r while the order recorded %r. This is not the "
+        "payment this order is holding, so nothing is being changed — if the "
+        "order was charged twice, the duplicate is what was just refunded and "
+        "the order is still paid. Reconcile by hand",
+        event_id,
+        order.id,
+        charge_intent,
+        order.stripe_payment_intent_id,
+    )
+    return False
+
+
 def handle_charge_refunded(session: Session, event: Any) -> None:
     """Money went back. Move the order to `refunded` — but only if all of it did.
 
@@ -878,6 +978,10 @@ def handle_charge_refunded(session: Session, event: Any) -> None:
 
     event_id = getattr(event, "id", "<unknown>")
     charge = getattr(getattr(event, "data", None), "object", None)
+
+    if not _charge_belongs_to(order, charge, event_id):
+        return
+
     amount = getattr(charge, "amount", None)
     amount_refunded = getattr(charge, "amount_refunded", None)
     flagged_full = getattr(charge, "refunded", None)

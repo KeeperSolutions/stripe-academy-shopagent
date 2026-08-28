@@ -47,7 +47,7 @@ python scripts/create_schema.py   # exits 2 if a column or foreign key is missin
 # 7. verify
 docker compose exec db psql -U shopagent -d shopagent \
   -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
-pytest tests/ -v          # 728 tests; add -m network for the 4 that call the API
+pytest tests/ -v          # 732 tests; add -m network for the 4 that call the API
 ```
 
 Step 6 matters on any database that predates a schema change: `create_all`
@@ -106,7 +106,7 @@ python scripts/seed_catalog.py          # 30 products; --reset to rebuild
 python scripts/embed_catalog.py         # vectors + HNSW index; --force to redo
 
 # tests
-pytest tests/ -v                        # 728, offline and database
+pytest tests/ -v                        # 732, offline and database
 pytest tests/ -m network                # the 4 that call the API and cost money
 pytest tests/ -m stripe                 # the 16 that call Stripe in test mode (free)
 ```

@@ -1,10 +1,19 @@
-"""The Stripe webhook endpoint (D8, step 1).
+"""The Stripe webhook endpoint (D8).
 
-A delivery is authenticated, claimed in `processed_events`, and answered 200.
-No order changes state yet — dispatching on event type is step 3, and
-`process_event` below is the empty seam it fills. Separating that from
-verification and idempotency is deliberate: both are easy to get wrong while
-attention is on what the events *mean*.
+A delivery is authenticated, claimed in `processed_events`, dispatched, and
+answered 200. Orders really do change state through here — this is where a
+payment becomes `paid`, an expiry becomes `cancelled` and a full refund becomes
+`refunded`. The docstring said otherwise for a while, because the file was
+built in steps and the sentence describing step 1 outlived it; review on PR #8
+caught that, and it is worth knowing that a reader who trusted it would have
+mistaken the production endpoint for verification-only code.
+
+What is still true is the *shape* those steps left. Verification, the
+idempotency claim and dispatch are three separable things and stay separable:
+this module does the first two and hands the third to `services/events.py`
+through `process_event`, which is a seam rather than a step. The reason is the
+one that made them separate steps in the first place — both are easy to get
+wrong while attention is on what the events *mean*.
 
 **A duplicate is answered 200 and does nothing.** Stripe delivers at least
 once, so a second arrival of an event is ordinary rather than an error, and
@@ -294,7 +303,7 @@ def process_event(session: Session, event: object) -> None:
 async def stripe_webhook(
     request: Request, session: Session = Depends(get_session)
 ) -> dict[str, object]:
-    """Verify a delivery, record it, and do nothing else (step 1).
+    """Verify a delivery, claim it, dispatch it, and answer 200.
 
     **This handler takes no body parameter and must never take one.** FastAPI
     reads the request body once and hands a declared parameter the *parsed*

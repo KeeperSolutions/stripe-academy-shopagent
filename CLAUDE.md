@@ -389,8 +389,10 @@ re-serialised body is dangerous precisely because it mostly works —
 `json.dumps` reproduces many payloads exactly — so it would pass every test,
 every `stripe listen` session and every demo, and then fail intermittently on
 whichever real event carried a float, a non-ASCII character or a key order the
-encoder did not preserve. The handler therefore takes `Request` and reads
-`await request.body()`. `tests/test_webhooks.py` fails if a parameter is added:
+encoder did not preserve. The handler therefore takes `Request` and reads the
+raw bytes itself — through `read_capped_body`, never `await request.body()`,
+for the size reason the next rule gives.
+`tests/test_webhooks.py` fails if a parameter is added:
 once by name, and once on FastAPI's own `route.body_field`, which is the
 assertion with teeth. Dependencies are allowed — `Depends(get_session)` is not
 a body — and the guard checks for that rather than for an exact parameter list.
@@ -487,6 +489,25 @@ allow-list: only `unpaid` may cancel, because `payment_status` has a third
 value (`no_payment_required`) and `!= "unpaid"` and `== "paid"` differ exactly
 there.
 
+**The session comparison happens twice, and only the second one decides.** The
+first runs before the Stripe call and exists to skip a round trip. The
+authoritative one runs after it, on a row re-read through
+`orders.lock_order` — `SELECT ... FOR UPDATE` with `populate_existing` — and
+is held until the commit. The reason is the gap the network call opens: a
+retrieve takes long enough for a shopper to start a second checkout, and
+`_reusable_session` will happily build one because the first session is
+expired. Cancelling on the earlier read then releases the stock of an order
+whose new payment page is open and chargeable. It is the same defect shape as
+the transition preflight — an unlocked read deciding a write — and it was found
+the same way, in review on PR #8.
+
+`populate_existing` on that re-read is load-bearing rather than defensive:
+`_load_order` has already put this order in the Session's identity map, so
+without it the locked select returns the instance with the attributes it was
+loaded with, and the whole point of waiting for the lock is lost.
+`test_a_second_checkout_started_during_the_stripe_call_stops_the_expiry` fails
+without it, which is how that was established rather than assumed.
+
 **The session that paid is not always the one the order points at, and the
 other one has to be closed.** That guard has a consequence the guard itself
 creates. An order whose session expired with a payment still in flight is
@@ -509,6 +530,35 @@ refused the payment is still accepted, because the money that arrived is real:
 the alternative to a possible double charge is a definite unpaid order. That
 case is the one thing here no code can fix, so it is logged at ERROR naming
 both sessions, and a person refunds it.
+
+**A refund is attributed by PaymentIntent, not by `metadata.order_id`.**
+`order_id` says which order a charge is *about*; it does not say the charge is
+the payment that order recorded, and the two come apart in exactly the case
+this file already documents — a superseded Checkout Session that was paid
+anyway leaves two Charges carrying the same `order_id`. Refunding the
+duplicate is what a person reconciling does first, and its own `amount` and
+`amount_refunded` balance perfectly, so without a check it reads as a full
+refund of the order: terminal status, whole reservation released, and the
+recorded payment still charged. `_charge_belongs_to` compares
+`charge.payment_intent` against `orders.stripe_payment_intent_id` and refuses
+anything else, including an order with no PaymentIntent recorded — `refunded`
+is terminal and releases stock, so an attribution that cannot be verified is
+not one to act on. Raised in review on PR #8.
+
+The fixture is the other half of that story. `refunded_event` in the tests did
+not carry `payment_intent` at all, so no test could have noticed the check was
+missing; a fixture that omits a field the real object always has is a blind
+spot with the shape of coverage.
+
+**A zero-total order is paid with nothing to refund, and that is not a
+defect.** `total_amount_cents >= 0` and `prices.amount_cents >= 0` both permit
+zero, and Stripe settles such a checkout as `no_payment_required`, which
+`SETTLED_PAYMENT_STATUSES` accepts deliberately — so the order becomes `paid`
+with no PaymentIntent, legitimately. `refund_order` used to call that state
+impossible and tell the caller to refund a payment in the dashboard that never
+existed. It is a plain 409 now, and the ERROR is kept for a positive total,
+where the same state really does mean a bug here. Raised in review on PR #8:
+this codebase allowed the order to exist and then declared it unreachable.
 
 **Only a full refund moves an order to `refunded`.** `charge.refunded` fires
 for a partial refund too — measured against one real charge refunded twice:
@@ -638,10 +688,15 @@ handles this" from "nothing happened because nothing should".
 **Editing an applied migration reaches no database that already ran it.**
 `0002_d8_processed_events.sql` is the convention's first *table* rather than
 its first columns, and that difference makes the file easy to think
-unnecessary: `create_all` does build a table that does not exist, so a fresh
-clone gets `processed_events` without running anything. The database that
-matters is the one created before D8 — it has every other table, `create_all`
-leaves it alone, and nothing reports the missing one until an insert fails.
+unnecessary: `create_all` checks tables one at a time and builds any it does
+not find, so a fresh clone gets `processed_events` without running anything —
+and so would a database created before D8. This document previously claimed
+`create_all` would leave such a database alone, which is wrong and was
+corrected in review on PR #8. The migration's justification is not that
+nothing else can create the table; it is that the repository has to *record*
+what changed. `create_all` is a script that will build whatever it finds
+missing without saying so, and reading it tells nobody which change a
+deployment needs.
 The consequence for later: adding a fifth column to `processed_events` means
 `0003` with `ADD COLUMN IF NOT EXISTS`, **not** an edit to `0002`. Idempotency
 makes re-running safe; it does not make a rewrite retroactive.

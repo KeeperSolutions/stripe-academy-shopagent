@@ -530,7 +530,7 @@ def cancel_order(session: Session, order_id: uuid.UUID) -> Order:
     open across a network round trip, which is what `attach_customer` avoids
     for the same reason.
     """
-    order = _lock_cart_free_order(session, order_id)
+    order = lock_order(session, order_id)
 
     # Refuse an illegal cancellation *before* touching Stripe. Expiring the
     # session of an order that is then refused would be a side effect with no
@@ -568,15 +568,34 @@ def cancel_order(session: Session, order_id: uuid.UUID) -> Order:
     return order
 
 
-def _lock_cart_free_order(session: Session, order_id: uuid.UUID) -> Order:
+def lock_order(session: Session, order_id: uuid.UUID) -> Order:
     """Load an order for update, without touching its cart.
 
     `FOR UPDATE` because the status is about to be read and then written, and
     two concurrent cancellations reading `pending` would both proceed — the
     second releasing stock that the first already gave back.
+
+    Public, and named for what it does rather than for who first needed it,
+    because `services/events.py` needs it too: a webhook that decides whether
+    to cancel by comparing a column has to read that column under the same
+    lock the transition will take, or the comparison is about a row somebody
+    else is free to change in between. Re-locking a row this transaction
+    already holds is free in Postgres, so taking it here and again inside
+    `apply_transition` costs nothing. Raised in review on PR #8.
+
+    `populate_existing` for the same reason `apply_transition` asks for it, and
+    here it is not a precaution: the caller in `services/events.py` has already
+    loaded this order, so it is in the Session's identity map, and without this
+    the select returns that instance with the attributes it was loaded with.
+    The point of the lock is to read a column *after* waiting, so a cached read
+    defeats it entirely — `test_a_second_checkout_started_during_the_stripe_call
+    _stops_the_expiry` fails without it, which is how this was found.
     """
     order = session.scalar(
-        select(Order).where(Order.id == order_id).with_for_update()
+        select(Order)
+        .where(Order.id == order_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if order is None:
         raise OrderNotFound(f"no order with id {order_id}")
@@ -621,19 +640,34 @@ def refund_order(session: Session, order_id: uuid.UUID) -> Any:
     issued against an order that a webhook is concurrently moving to
     `refunded`.
     """
-    order = _lock_cart_free_order(session, order_id)
+    order = lock_order(session, order_id)
 
     # Checked before Stripe is touched, for the reason `cancel_order` gives:
     # a refund issued against an order that is then refused would be money
     # moved with no transaction to undo it.
     check_transition(OrderStatus(order.status), OrderStatus.REFUNDED)
 
+    if not order.stripe_payment_intent_id and order.total_amount_cents == 0:
+        # Not a defect, and the branch below would have called it one. A
+        # zero-total order is schema-legal — `total_amount_cents >= 0` and
+        # `prices.amount_cents >= 0` — and Stripe settles such a checkout with
+        # `payment_status="no_payment_required"`, which
+        # `SETTLED_PAYMENT_STATUSES` deliberately accepts. The session then
+        # names no PaymentIntent, so the order is legitimately paid with
+        # nothing to refund. Raised in review on PR #8: this file allowed that
+        # order to exist and the next branch declared it impossible.
+        raise OrderNotRefundable(
+            f"order {order_id} was placed for {order.currency} 0 and nothing "
+            "was ever charged, so there is nothing to refund."
+        )
+
     if not order.stripe_payment_intent_id:
-        # This is not a state a shopper can produce. An order becomes `paid`
-        # only through `checkout.session.completed`, and that handler writes
-        # the PaymentIntent id in the same transaction as the status — so a
-        # `paid` order without one means this project has a bug, or somebody
-        # edited the row.
+        # With a positive total this really is not a state a shopper can
+        # produce. An order becomes `paid` only through
+        # `checkout.session.completed` or its async twin, and both write the
+        # PaymentIntent id in the same transaction as the status — so a `paid`
+        # order that was charged for something and has no PaymentIntent means
+        # this project has a bug, or somebody edited the row.
         #
         # Logged at ERROR because of that, and answered 409 anyway: from the
         # caller's side the order genuinely cannot be refunded, no retry

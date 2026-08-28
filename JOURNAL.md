@@ -1110,6 +1110,66 @@ against a guess. The header cannot be what enforces it: `Content-Length` is
 written by the sender and a chunked request need not carry one, so there is a
 test that lies in that header and is still refused with 413.
 
+**The third review round: two guards I had just written, checked in the wrong
+order.** Four more comments after the second round was pushed, and the two
+substantive ones are the same defect I had already been corrected on twice.
+
+`handle_checkout_expired` compares the event's session against the order's,
+then asks Stripe whether the session was really unpaid, then cancels. The
+comparison is before a *network call* — hundreds of milliseconds in which a
+shopper can start a second checkout, which `_reusable_session` will build
+because the first session is expired. Cancelling on that earlier read releases
+the stock of an order whose new payment page is open and payable. I had spent
+the previous round learning that an unlocked check does not decide anything,
+written that down in three places, and then left the same shape untouched one
+function below.
+
+Writing the test found a second thing I would not have predicted. The fix is a
+re-read under `FOR UPDATE`, and it did not work: `lock_order` had no
+`populate_existing`, so the select returned the instance already in the
+identity map, with the value it was loaded with. That is precisely the
+mechanism review claimed in round one and I disproved — I had measured it
+against `apply_transition`, concluded the concern was unfounded, and added
+`populate_existing` there anyway. The concern was not unfounded; it was in a
+different function. Disproving a claim about one call site is not disproving
+the claim.
+
+**`metadata.order_id` says which order a charge is about, not that it is the
+order's charge.** The double-charge case this journal documented one round
+earlier leaves two Charges carrying the same `order_id`. Refunding the
+duplicate — the first thing a person reconciling would do — read as a full
+refund of the order, because `amount` and `amount_refunded` on that charge
+balance perfectly. Terminal status, whole reservation released, recorded
+payment still charged. The check is one comparison against
+`stripe_payment_intent_id`.
+
+What let it stand is worth more than the fix: `refunded_event` in the tests
+did not carry `payment_intent` at all. No test could have noticed the missing
+check, because the fixture did not model the field. A fixture that omits
+something the real object always carries is a blind spot shaped exactly like
+coverage.
+
+**Documentation that contradicts the code is a defect with a delay.** Five of
+the eight comments were prose, and dismissing them as prose would have been
+wrong twice over. The webhook module still opened with "no order changes state
+yet — dispatching is step 3", written when that was true and left in place
+through the step that made it false; a reader trusting it would have taken the
+production endpoint for verification-only code. The module overview of
+`services/events.py` still said one event type moves an order, when five do.
+Two of the entries were written by me *in this PR*: a rule instructing future
+work to use `await request.body()` on the same page as the rule that added the
+cap, and a known gap stating there is no request-size cap in the commit that
+adds one.
+
+And one was simply wrong on the facts. `0002_d8_processed_events.sql` argued
+it was necessary because `create_all` "leaves alone" a database created before
+D8 — it does not; `create_all` checks tables one at a time and would build the
+missing one. The same sentence had been copied into CLAUDE.md and into a test
+docstring, so a mistaken justification had been repeated into looking settled.
+The migration is still right to exist, for a reason I had to actually work out:
+it is the recorded change, readable before it runs, where `create_all` is a
+script that silently builds whatever it finds missing.
+
 ## Known gaps
 
 Every entry carries the day it was written. **Open** entries are grouped by
@@ -1206,7 +1266,14 @@ charges exist, and an ERROR line naming both sessions is the entire record. The
 window is small — it needs an expiry with a payment in flight, a shopper who
 returns, and a second payment made before the first one's event is delivered —
 but it is the same shape as the partial refund above: money has moved in a way
-the database cannot represent. A `payments` table recording each charge against
+the database cannot represent.
+
+Narrowed in the third review round rather than closed. Refunding the duplicate
+charge no longer marks the whole order refunded — `_charge_belongs_to`
+compares the charge's PaymentIntent against the one the order recorded — so
+the wrong-direction failure is gone. What remains is that the second charge
+exists at all and nothing here knows about it: the order shows one payment,
+the dashboard shows two, and only a log line connects them. A `payments` table recording each charge against
 an order would fix both, and neither is a reason to build one today.
 
 Worth naming with it: the reconciliation runs only when the money is
@@ -1407,13 +1474,15 @@ are outside D6's scope and both are load-bearing once the key is anything other
 than a developer's own. Worth naming here so that "the API is done" does not read
 as "the API is deployable".
 
-**The webhook endpoint trusts that it is reachable only by Stripe *for
-authenticity*, not for load.** *(D8.)* Signature verification means nothing
-unsigned is acted on, but every request still costs a body read and an HMAC
-before it is refused. There is no rate limit and no request size cap, so an
-unauthenticated caller can make this endpoint do work. The entry above names the
-same gap for the API as a whole; this route makes it more pointed by being the
-one address that must stay open to the internet.
+**The webhook endpoint is bounded per request but not across requests.**
+*(D8, narrowed in the second review round.)* Signature verification means
+nothing unsigned is acted on, and since review there is a 256 KiB streaming cap
+so a single anonymous request cannot buy unbounded memory or HMAC work. What is
+still missing is the other axis: there is no rate limit, so the work is bounded
+per delivery and not per caller, and a stranger can still make this endpoint do
+it repeatedly. The entry above names the same gap for the API as a whole; this
+route makes it more pointed by being the one address that must stay open to the
+internet.
 
 **Three routes are unauthenticated, and each for a different reason.** *(D7,
 extended on D8.)* `GET /checkout/success` and `GET /checkout/cancel` are public

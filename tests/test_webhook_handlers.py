@@ -908,12 +908,25 @@ def test_a_failed_account_lookup_does_not_break_the_delivery(
 # --- charge.refunded (D8 step 4) -----------------------------------------
 
 
-def refunded_event(order_id, *, amount=3000, amount_refunded=3000, refunded=None, **kw):
+def refunded_event(
+    order_id,
+    *,
+    amount=3000,
+    amount_refunded=3000,
+    refunded=None,
+    payment_intent="pi_test_handler",
+    **kw,
+):
     """A `charge.refunded` shaped the way Stripe really sends one.
 
     `refunded` defaults to whatever the amounts imply, because that is the
     invariant Stripe maintains; tests that want the two to disagree pass it
     explicitly.
+
+    `payment_intent` defaults to the one `completed_event` writes, so the
+    charge belongs to the order the way a real one does. That it was missing
+    here entirely is why review had to point out that nothing checked it: the
+    fixture did not model the field, so no test could have noticed its absence.
     """
     if refunded is None:
         refunded = amount_refunded >= amount
@@ -926,10 +939,56 @@ def refunded_event(order_id, *, amount=3000, amount_refunded=3000, refunded=None
             "amount_refunded": amount_refunded,
             "refunded": refunded,
             "currency": "usd",
+            "payment_intent": payment_intent,
             "metadata": {"order_id": str(order_id)},
         },
         **kw,
     )
+
+
+def test_a_refund_of_a_different_charge_does_not_refund_the_order(
+    client, session, caplog
+):
+    """The double-charge case, which this project documented before guarding it.
+
+    Two Charges can carry the same `order_id` — one from a superseded Checkout
+    Session that was paid anyway. Refunding the duplicate is what a person
+    reconciling does first, and its own `amount`/`amount_refunded` balance
+    perfectly, so without an attribution check it reads as a full refund of
+    the order: terminal status, whole reservation released, and the payment
+    the order actually holds still charged.
+    """
+    caplog.set_level(logging.INFO, logger="shopagent.api.services.events")
+    variant, order_id = paid_order(client, session, sku="RV-OTHER-CHARGE")
+    before = stock(session, variant.id)
+
+    other = refunded_event(order_id, payment_intent="pi_the_duplicate_charge")
+    assert deliver(client, other).status_code == 200
+
+    session.expire_all()
+    assert session.get(Order, order_id).status == OrderStatus.PAID
+    assert stock(session, variant.id) == before
+    assert any(
+        "not the payment this order is holding" in r.getMessage()
+        and r.levelno == logging.ERROR
+        for r in caplog.records
+    )
+
+
+def test_a_refund_with_no_payment_intent_on_the_charge_changes_nothing(
+    client, session
+):
+    """Unverifiable attribution is not acted on, because `refunded` is terminal."""
+    variant, order_id = paid_order(client, session, sku="RV-NO-PI-CHARGE")
+    before = stock(session, variant.id)
+
+    assert deliver(
+        client, refunded_event(order_id, payment_intent=None)
+    ).status_code == 200
+
+    session.expire_all()
+    assert session.get(Order, order_id).status == OrderStatus.PAID
+    assert stock(session, variant.id) == before
 
 
 def paid_order(client, session, *, sku: str, quantity: int = 2):
@@ -1239,6 +1298,39 @@ def test_a_paid_order_with_no_payment_intent_is_409_and_never_reaches_stripe(
         for r in caplog.records
         if r.levelno == logging.ERROR
     )
+
+
+def test_a_zero_total_order_has_nothing_to_refund_and_is_not_a_defect(
+    client, session, monkeypatch, caplog
+):
+    """The branch above called this impossible, and this file allows it.
+
+    `total_amount_cents >= 0` and `prices.amount_cents >= 0` both permit zero,
+    and Stripe settles a zero-total checkout with
+    `payment_status="no_payment_required"` — which `SETTLED_PAYMENT_STATUSES`
+    accepts on purpose. Such a session names no PaymentIntent, so the order is
+    legitimately paid with nothing to refund. Answering 409 is right; calling
+    it a defect and telling the caller to refund a payment that never existed
+    is not. Raised in review on PR #8.
+    """
+    caplog.set_level(logging.INFO, logger="shopagent.api.services.orders")
+
+    def refuse(payment_intent_id, *, idempotency_key=None):
+        raise AssertionError("Stripe was asked to refund a zero-total order")
+
+    monkeypatch.setattr(stripe_svc, "create_refund", refuse)
+    variant, order_id = paid_order(client, session, sku="RF-ZERO", quantity=2)
+    order = session.get(Order, order_id)
+    order.stripe_payment_intent_id = None
+    order.total_amount_cents = 0
+    session.commit()
+
+    response = client.post(f"/orders/{order_id}/refund")
+
+    assert response.status_code == 409
+    assert "nothing to refund" in response.json()["detail"]
+    # No ERROR: nothing here is broken.
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
 def test_a_missing_stripe_key_makes_the_refund_route_503(client, session, monkeypatch):
@@ -1781,6 +1873,108 @@ def test_a_cancelled_order_receiving_a_completed_event_keeps_no_payment_intent(
     order = session.get(Order, order_id)
     assert order.status == OrderStatus.CANCELLED
     assert order.stripe_payment_intent_id is None
+
+
+def test_a_second_checkout_started_during_the_stripe_call_stops_the_expiry(
+    engine, monkeypatch
+):
+    """The expiry guard was an unlocked read deciding a write.
+
+    `handle_checkout_expired` compares the event's session against the order's,
+    then asks Stripe whether the session was really unpaid — a network call,
+    which is long enough for a shopper to start a second checkout.
+    `_reusable_session` sees an expired session, builds a new one and writes it
+    to the order. Cancelling on the strength of the earlier read then releases
+    the stock of an order whose new payment page is open and chargeable.
+    Raised in review on PR #8.
+
+    The race is made deterministic rather than threaded: the Stripe stub is
+    where the concurrent write happens, from its own connection, which is
+    exactly the window the real call opens. Committed rather than run in the
+    `session` fixture's transaction, for the reason the test below gives.
+    """
+    from shopagent.api.services import events as ev
+    from shopagent.api.services.cart import add_item, create_cart
+    from shopagent.api.services.orders import place_order
+
+    with Session(engine) as setup:
+        variant_id, quantity, reserved_before = setup.execute(
+            select(Inventory.variant_id, Inventory.quantity, Inventory.reserved)
+            .where(Inventory.quantity - Inventory.reserved >= 3)
+            .order_by(Inventory.variant_id)
+            .limit(1)
+        ).one()
+        cart = create_cart(setup)
+        add_item(setup, cart.id, variant_id, 3)
+        order = place_order(setup, cart.id)
+        order_id, cart_id = order.id, cart.id
+        order.stripe_checkout_session_id = "cs_test_expired_one"
+        setup.commit()
+
+    def stripe_answers_while_a_second_checkout_starts(session_id):
+        with Session(engine) as other:
+            other.execute(
+                text(
+                    "UPDATE orders SET stripe_checkout_session_id = "
+                    "'cs_test_the_new_one' WHERE id = :o"
+                ),
+                {"o": order_id},
+            )
+            other.commit()
+        return FakeSession("unpaid", "expired")
+
+    monkeypatch.setattr(
+        stripe_svc,
+        "retrieve_checkout_session",
+        stripe_answers_while_a_second_checkout_starts,
+    )
+
+    try:
+        with Session(engine) as handling:
+            ev.handle_checkout_expired(
+                handling,
+                SimpleNamespace(
+                    id="evt_expiry_race",
+                    livemode=False,
+                    data=SimpleNamespace(
+                        object=SimpleNamespace(
+                            id="cs_test_expired_one",
+                            metadata=SimpleNamespace(
+                                _data={"order_id": str(order_id)}
+                            ),
+                        )
+                    ),
+                ),
+            )
+            handling.commit()
+
+        with Session(engine) as check:
+            order = check.get(Order, order_id)
+            assert order.status == OrderStatus.PENDING, (
+                "the old session's expiry cancelled an order that had already "
+                "moved to a new, payable checkout"
+            )
+            assert order.stripe_checkout_session_id == "cs_test_the_new_one"
+            after = check.execute(
+                select(Inventory.reserved).where(Inventory.variant_id == variant_id)
+            ).scalar()
+        # Still reserved: the shopper is on the new payment page.
+        assert int(after) == int(reserved_before) + 3
+    finally:
+        with Session(engine) as cleanup:
+            cleanup.execute(
+                text("DELETE FROM order_items WHERE order_id = :o"), {"o": order_id}
+            )
+            cleanup.execute(text("DELETE FROM orders WHERE id = :o"), {"o": order_id})
+            cleanup.execute(
+                text("DELETE FROM cart_items WHERE cart_id = :c"), {"c": cart_id}
+            )
+            cleanup.execute(text("DELETE FROM carts WHERE id = :c"), {"c": cart_id})
+            cleanup.execute(
+                text("UPDATE inventory SET reserved = :r WHERE variant_id = :v"),
+                {"r": int(reserved_before), "v": int(variant_id)},
+            )
+            cleanup.commit()
 
 
 def test_two_concurrent_transitions_release_the_reservation_once(engine):
