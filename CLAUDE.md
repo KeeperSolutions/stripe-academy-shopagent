@@ -43,6 +43,7 @@ tracked.
 | `api/routers/checkout_pages.py` | D7 | the two pages Stripe redirects a browser back to |
 | `api/routers/webhooks.py` | D8 | `POST /webhooks/stripe` — verify, claim, dispatch |
 | `api/services/events.py` | D8 | idempotency and what each event type means |
+| `agent/prompt.py` | D9 | the system prompt; the only file that says it |
 | `agent/` | D9 | memory, guardrails |
 | `obs/` | D10 | Langfuse tracing |
 
@@ -700,6 +701,48 @@ deployment needs.
 The consequence for later: adding a fifth column to `processed_events` means
 `0003` with `ADD COLUMN IF NOT EXISTS`, **not** an edit to `0002`. Idempotency
 makes re-running safe; it does not make a rewrite retroactive.
+
+**The system prompt lives in `agent/prompt.py`, never in `llm/loop.py`.** The
+loop is a mechanism — a `while`, a message list, a dispatch — and it has been
+byte-stable since D2 on purpose, which is a claim D5 and D9 both leaned on when
+they changed where tools come from. What the assistant is told is policy, it is
+the part of the system most likely to be edited, and editing a sentence about
+quoting a price should not touch the file whose stability is an argument.
+`initial_messages()` assembles four blocks: role, catalog-or-not, cart, money.
+
+Two things are kept out of it by test rather than by intention. Nothing about
+confirming a checkout — that is a gate in code, which can see *who* said yes
+where an instruction cannot, and a prompt that got there first would leave
+nobody able to say which of the two was stopping a purchase. Nothing that
+restates a tool's failure message either: `tools/commerce.py` writes those
+against measured failures, and a paraphrase here would be the copy that goes
+stale.
+
+The one exception carved into the D1 rule is money. `never do arithmetic in
+your head` is from D2, where the model answered `5 factorial` from memory; but
+every amount in this system arrives as an integer number of minor units, and
+turning 9499 into $94.99 is arithmetic somebody has to do. A base rule the
+model must break to answer at all is a rule it stops reading, so the conversion
+is named as the only one permitted and producing a *new* amount — a total, a
+difference, a comparison — is refused outright.
+
+**A diagnostic tool is not advertised to the model.** `ping` was in the
+catalog server's `tools/list` from D5 to D9 with no commercial meaning, and the
+cost was never that the model called it — it never did. The tool list is what
+the model reads to work out what it can do, so a name in it that means nothing
+is one it must rule out on every turn. `MCP_EXPOSE_PING` (default false)
+decides one `add_tool` call in `mcp_server/server.py`; the tool itself is
+unchanged and still separates "the server is unreachable" from "the catalog is
+broken" for whoever is debugging.
+
+The fix belongs on the server and nowhere else. Filtering by name in
+`mcp_client/` would make this project's client know about this project's
+server, and registering whatever a server lists is the property D5 exists to
+demonstrate. What actually let this sit for four days is that no test said what
+the tool list *was*: every test named the tools it cared about. There are now
+two that name the whole set, offline against a fake catalog client and against
+the real server under `db`, so the next unintended publication fails rather
+than quietly costing the model a decision.
 
 **Chat Completions, not the Responses API.** Responses keeps conversation state
 on the server, which hides the very loop this project exists to learn.

@@ -70,6 +70,18 @@ class Settings(BaseSettings):
     # be un-leaked. Set false deliberately, on a developer's own machine, when
     # reading back what the model actually searched for.
     mcp_log_redact_query: bool = True
+    # Whether the catalog server advertises its `ping` diagnostic in
+    # `tools/list`. Off, because the tool list is what the model reads to
+    # decide what it can do, and a name in it that means nothing commercially
+    # is a name it has to rule out on every turn. `ping` keeps its value for a
+    # person — it separates "the server is unreachable" from "the catalog is
+    # broken" — and this is the switch that hands it back, on the machine of
+    # whoever is debugging. Deliberately a server-side switch rather than a
+    # filter in `mcp_client/`: the client registers whatever the server lists,
+    # which is the property D5 exists to demonstrate, and a name check there
+    # would be this project's own client knowing about this project's own
+    # server.
+    mcp_expose_ping: bool = False
 
     # --- Infrastructure (D3, D6) ---
     database_url: str = (
@@ -95,6 +107,15 @@ class Settings(BaseSettings):
     # Both failures happen when configuration is read, not at the first request
     # that should have been refused.
     shopagent_api_key: str = Field(min_length=1)
+    # Where the agent's commerce tools (D9) reach that API. Deliberately not
+    # `app_base_url`, which is the URL a *browser* is sent to — Stripe puts it
+    # in a redirect, so it has to be public, and the day this runs behind ngrok
+    # or in compose the two stop being the same string: the shopper returns to
+    # https://shopagent.example while the agent process still has to call
+    # http://api:8000. One field serving both would make that a choice between
+    # a redirect the shopper cannot follow and a call the agent cannot make.
+    # Same default, because on one machine they do coincide.
+    commerce_api_base_url: str = "http://localhost:8000"
 
     # --- Stripe (D7-D8) ---
     # Optional, and deliberately not treated the way `shopagent_api_key` is.

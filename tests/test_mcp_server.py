@@ -50,7 +50,14 @@ from shopagent.mcp_server.server import (
 # The tool names the model sees. They are pinned as a list because the set of
 # tools *is* the interface: D5 loads them dynamically, so a rename here is a
 # silent change to what the agent can do.
-EXPECTED_TOOLS = ["ping", "search_products", "get_product_details", "check_stock"]
+#
+# `ping` left this list on D9. It is a diagnostic with no business meaning, and
+# it sat among the three that mean something for four days — the Known gaps
+# entry that tracked it also named the only correct place to fix it, which is
+# here rather than in a name check on the client side. It is still a tool and
+# still reachable; the server simply does not advertise it unless asked. See
+# MCP_EXPOSE_PING.
+EXPECTED_TOOLS = ["search_products", "get_product_details", "check_stock"]
 
 # What `search_products` exposes, and nothing else. `session`, `mode` and
 # `query_embedding` are deliberately absent — see the module docstring in
@@ -129,6 +136,39 @@ def test_server_name_is_the_recognisable_one():
     assert SERVER_NAME == "shopagent-catalog"
 
 
+@pytest.fixture
+def ping_exposed():
+    """The server as `MCP_EXPOSE_PING=true` builds it.
+
+    Registering it here rather than reloading the module with the variable set:
+    the flag decides one `add_tool` call, and this makes the same call. What
+    that leaves untested is the reading of the setting itself, which
+    `test_the_switch_is_what_decides_whether_ping_is_registered` covers by
+    asserting the branch is the only thing between the two states.
+    """
+    server.add_tool(ping)
+    try:
+        yield
+    finally:
+        server.remove_tool("ping")
+
+
+def test_ping_is_not_advertised_to_the_model():
+    """Closed on D9: a diagnostic does not belong in a shopper's tool list.
+
+    The cost of it being there was never that the model called it — across
+    every demo scenario it never did. It is that the list is what the model
+    reads to decide what it can do, and every name in it that means nothing is
+    a name it has to rule out first.
+    """
+    assert "ping" not in [tool.name for tool in call(server.list_tools)]
+
+
+def test_the_switch_is_what_decides_whether_ping_is_registered(ping_exposed):
+    """With the switch on, it is an ordinary tool again."""
+    assert "ping" in [tool.name for tool in call(server.list_tools)]
+
+
 def test_ping_is_callable_without_the_server():
     """The tool is a plain function; the decorator only registers it.
 
@@ -143,7 +183,7 @@ def test_every_tool_is_registered_under_its_expected_name():
     assert [tool.name for tool in call(server.list_tools)] == EXPECTED_TOOLS
 
 
-def test_ping_advertises_a_schema_with_no_arguments():
+def test_ping_advertises_a_schema_with_no_arguments(ping_exposed):
     """An argument-free tool still needs a schema, and it must not invent one."""
     schema = schema_of("ping")
 
@@ -210,7 +250,7 @@ def test_id_parameters_are_required_and_described(tool_name, field):
     assert schema["properties"][field]["description"]
 
 
-def test_ping_description_comes_from_the_docstring():
+def test_ping_description_comes_from_the_docstring(ping_exposed):
     """The docstring is the contract the model reads; MCP derives it from here.
 
     Asserting the first line rather than the whole string keeps this from
@@ -224,7 +264,7 @@ def test_ping_description_comes_from_the_docstring():
     assert description.startswith("Check that the catalog server is reachable.")
 
 
-def test_ping_over_the_in_memory_transport_returns_pong():
+def test_ping_over_the_in_memory_transport_returns_pong(ping_exposed):
     """The end-to-end path a stdio client takes, minus the pipe."""
     result = call_over_transport("ping", {})
 

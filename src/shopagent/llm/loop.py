@@ -13,6 +13,11 @@ deltas is bookkeeping that would obscure the chaining this file is meant to
 show. `LLMClient.stream_chat` is unchanged and still works; it is simply not
 what the CLI drives now.
 
+D9 took the system prompt out to `agent/prompt.py`. This file is a mechanism
+— a `while`, a message list, a dispatch — and what it says to the model is
+policy; keeping them apart is what lets a sentence about quoting prices be
+edited without opening the loop that D2 and D5 both claimed had not changed.
+
 D5 added the catalog, and the shape of that change is the point. `run_tool_loop`
 below is byte-for-byte what D2 left: it takes a registry and a list of schemas
 and does not care where either came from. Everything D5 needed happens before
@@ -29,46 +34,16 @@ import sys
 from contextlib import ExitStack
 from dataclasses import dataclass
 
+from shopagent.agent.prompt import initial_messages
 from shopagent.config import get_settings
 from shopagent.llm.client import LLMClient, Message, ToolCall
 from shopagent.llm.usage import UsageTracker
 from shopagent.mcp_client.client import MCPToolClient
 from shopagent.mcp_client.registration import register_mcp_tools
 from shopagent.tools.basic import REGISTRY
+from shopagent.tools.commerce import CommerceSession, register_commerce_tools
+from shopagent.tools.http import CommerceAPI
 from shopagent.tools.registry import ToolRegistry, ToolResult
-
-SYSTEM_PROMPT = (
-    "You are ShopAgent, an online shopping assistant. "
-    "Always reply in English, regardless of the language of the question. "
-    "Keep answers short and concrete, with no preamble and no restating of "
-    "the question. If you do not know something or lack the data, say so "
-    "plainly — never guess. "
-    "Use the tools for anything they cover: you have no clock, so never state "
-    "a time from memory, and never do arithmetic in your head."
-)
-
-# What the catalog tools are for, not how they work. Each one already carries a
-# description written for a model to read, and repeating that here would give
-# the same contract two authors and let them drift. This says only when to
-# reach for them, and what is never allowed to come from memory.
-CATALOG_PROMPT = (
-    " The product catalogue is available through tools. Every product name, "
-    "price, size, colour and stock level you state must have come from a tool "
-    "result in this conversation — never from memory, and never inferred from "
-    "what a product sounds like. When the user asks about products, search "
-    "first and answer from what comes back. If a search returns a count of 0, "
-    "say plainly that nothing matched and suggest a broader search; do not "
-    "offer a product that was not in a result."
-)
-
-# Said when the catalog server could not be reached, so the model does not
-# apologise for its own memory when the real answer is that a tool is missing.
-NO_CATALOG_PROMPT = (
-    " The product catalogue is NOT available in this session: the tools that "
-    "search it could not be loaded. If the user asks about products, prices or "
-    "stock, say the catalogue is unavailable right now. Do not answer from "
-    "memory and do not invent products."
-)
 
 # One user input may legitimately need several rounds: a tool call, a look at
 # the result, another call. Eight leaves room for the D9 chain (search, check
@@ -89,11 +64,6 @@ Commands:
   /tools   the tools available to the model
   /help    this list
   /exit    quit"""
-
-
-def _initial_messages(catalog_available: bool = True) -> list[Message]:
-    extra = CATALOG_PROMPT if catalog_available else NO_CATALOG_PROMPT
-    return [{"role": "system", "content": SYSTEM_PROMPT + extra}]
 
 
 def _shorten(text: str, limit: int = MAX_SHOWN_RESULT) -> str:
@@ -178,6 +148,12 @@ class ToolSetup:
     registry: ToolRegistry
     catalog_available: bool
     note: str | None = None
+    # The cart and order this conversation is holding (D9, step 1). Exposed
+    # here because it is the one piece of a session's state that lives outside
+    # the message list, and something has to be able to see it: today the
+    # tests, on step 3 `agent/memory.py`, which takes it over. The model is
+    # never shown any of it.
+    commerce: CommerceSession | None = None
 
 
 def build_tool_setup(
@@ -203,6 +179,21 @@ def build_tool_setup(
     for spec in REGISTRY.specs():
         registry.register(spec)
 
+    # The commerce tools go in unconditionally, and before the catalog is even
+    # considered. They reach a different service over a different protocol, so
+    # `MCP_CATALOG_ENABLED` has no business deciding whether a cart exists —
+    # and a session that can list a basket but not search is a comprehensible
+    # state, where a switch that turned off both would make one failure look
+    # like the other.
+    #
+    # Nothing here can fail the way the catalog can: building the client opens
+    # no connection, so an API that is down is discovered at the first call and
+    # answered by the tool itself, in words written for the model. The stack
+    # owns the client for the same reason it owns the MCP subprocess — whatever
+    # ends the session closes the sockets.
+    commerce = CommerceSession()
+    register_commerce_tools(registry, stack.enter_context(CommerceAPI()), commerce)
+
     if catalog_enabled is None:
         catalog_enabled = get_settings().mcp_catalog_enabled
 
@@ -210,6 +201,7 @@ def build_tool_setup(
         return ToolSetup(
             registry=registry,
             catalog_available=False,
+            commerce=commerce,
             note="catalog disabled (MCP_CATALOG_ENABLED=false)",
         )
 
@@ -224,10 +216,11 @@ def build_tool_setup(
         return ToolSetup(
             registry=registry,
             catalog_available=False,
+            commerce=commerce,
             note=f"catalog unavailable ({type(exc).__name__}: {exc})",
         )
 
-    return ToolSetup(registry=registry, catalog_available=True)
+    return ToolSetup(registry=registry, catalog_available=True, commerce=commerce)
 
 
 def main() -> None:
@@ -250,7 +243,7 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
     lifetime: everything below runs inside the `ExitStack` that owns the server.
     """
     registry = setup.registry
-    messages = _initial_messages(setup.catalog_available)
+    messages = initial_messages(setup.catalog_available)
     tools = registry.openai_schemas()
 
     print(
@@ -280,7 +273,7 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
             print(tracker.summary())
             continue
         if user_input == "/reset":
-            messages = _initial_messages(setup.catalog_available)
+            messages = initial_messages(setup.catalog_available)
             print("[conversation history cleared; session cost is kept]")
             continue
         if user_input == "/tools":

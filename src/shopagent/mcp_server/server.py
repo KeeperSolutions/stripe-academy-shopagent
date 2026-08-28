@@ -1,7 +1,14 @@
-"""The catalog MCP server (D4).
+"""The catalog MCP server (D4, narrowed on D9).
 
-Four tools: a diagnostic `ping` and three thin wrappers over
-`catalog/search.py`. No search logic lives here — no filtering, no SQL, no
+Three tools, all thin wrappers over `catalog/search.py`, and a fourth the
+server keeps to itself. `ping` is a diagnostic with no business meaning, and
+D5 recorded the cost of advertising it: it sat in the model's tool list beside
+the three that mean something, and the list is what the model reads to work
+out what it can do. The same entry named the only place the fix belongs —
+here, by not publishing it, rather than in a name check inside `mcp_client/`,
+which registers whatever a server lists and must go on doing so. It is still a
+tool, still callable, and `MCP_EXPOSE_PING=true` puts it back in `tools/list`
+for whoever is debugging. No search logic lives here — no filtering, no SQL, no
 reshaping of an individual product. Every question about *what* the catalog
 returns is settled in `catalog/`, which is what lets D5 swap the transport
 without touching search.
@@ -285,7 +292,6 @@ def _reject_impossible_price_range(min_price_cents: int | None, max_price_cents:
         )
 
 
-@server.tool()
 def ping() -> str:
     """Check that the catalog server is reachable.
 
@@ -298,8 +304,18 @@ def ping() -> str:
 
     Returns the string "pong". It says nothing whatsoever about the catalog,
     and a successful call is not evidence that any product exists.
+
+    **Not registered by default** — see MCP_EXPOSE_PING and this module's
+    docstring. The switch decides one `add_tool` call below, which is also why
+    turning it on is not a different code path: the tool a debugger reaches is
+    the same object, registered the same way, and the only thing that changed
+    is whether the model was told about it.
     """
     return "pong"
+
+
+if get_settings().mcp_expose_ping:
+    server.add_tool(ping)
 
 
 @server.tool()

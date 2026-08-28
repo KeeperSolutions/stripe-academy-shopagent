@@ -1446,14 +1446,6 @@ interpreter and cheerfully started the real server instead. Harmless today,
 because nothing needs to change it. The day the server command comes from
 configuration, it has to be read inside the call.
 
-**`ping` is offered to the model.** *(D5.)* It is a diagnostic tool with no
-business meaning, and it sits in the model's tool list alongside the four that
-matter. Filtering it out would mean matching on a tool name in the client, which
-is the one thing D5 exists to avoid — the adapter registers whatever the server
-lists. It was never called across any of the demo scenarios. If a future server
-exposes enough diagnostics to crowd the list, the fix belongs on the server (not
-advertising them) rather than in a name check here.
-
 ---
 
 ### Open — deployment and operations
@@ -1500,6 +1492,37 @@ the page: a redirect is a URL anybody can open.
 ---
 
 ### Closed
+
+**`ping` was offered to the model.** *(D5 → closed D9.)* The original entry
+read: "It is a diagnostic tool with no business meaning, and it sits in the
+model's tool list alongside the four that matter. Filtering it out would mean
+matching on a tool name in the client, which is the one thing D5 exists to
+avoid — the adapter registers whatever the server lists. It was never called
+across any of the demo scenarios. If a future server exposes enough diagnostics
+to crowd the list, the fix belongs on the server (not advertising them) rather
+than in a name check here."
+
+D9 took the fix the entry named. `mcp_server/server.py` registers `ping` only
+when `MCP_EXPOSE_PING` is true, which defaults to false, so `tools/list` carries
+three names and the agent sees ten tools instead of eleven. Nothing in
+`mcp_client/` mentions a tool name, which was the constraint: the client still
+registers whatever it is given, and that is the property D5 exists to show.
+
+The switch rather than a deletion, because the diagnostic's value was real and
+is unrelated to the model. `ping` is what separates "the server process is not
+answering" from "the catalog behind it is broken" — when a catalog tool fails,
+those two are indistinguishable from the client side, and the answer decides
+whether to look at the pipe or at Postgres. Two tests used it as exactly that
+probe and now browse a category instead, which is free and works, but a person
+debugging a broken server has no such substitute.
+
+What the entry did not say, and what actually made this worth doing, is that no
+test ever asserted what the tool list *was*. `ping` sat in it for four days
+because every test named the tools it cared about and none named the whole set.
+D9 added that assertion in two places — offline against a fake catalog client,
+and against the real server under `db` — so the next name that arrives without
+anybody deciding to publish it fails a test rather than quietly costing the
+model a decision on every turn.
 
 **Reservations were never released.** *(D6 → closed D7, verified D8.)* The
 original entry read: "`place_order` adds to `inventory.reserved` and nothing
