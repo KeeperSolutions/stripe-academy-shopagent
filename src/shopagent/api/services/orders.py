@@ -31,7 +31,9 @@ from the thing that catches the bug into the thing that never has to.
 
 from __future__ import annotations
 
+import logging
 import uuid
+from typing import Any
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -48,6 +50,8 @@ from shopagent.api.models import Cart, CartItem, CartStatus, Order, OrderItem
 from shopagent.api.services.cart import CartNotFound, variant_label
 from shopagent.catalog.models import Inventory, Price, Product, Variant
 from shopagent.payments import stripe_svc
+
+logger = logging.getLogger(__name__)
 from shopagent.payments.stripe_svc import MissingStripeKey
 from shopagent.config import get_settings
 
@@ -532,3 +536,82 @@ def _lock_cart_free_order(session: Session, order_id: uuid.UUID) -> Order:
     if order is None:
         raise OrderNotFound(f"no order with id {order_id}")
     return order
+
+
+class OrderNotRefundable(OrderError):
+    """Raised when an order cannot be refunded in the state it is in.
+
+    Distinct from `IllegalTransition`, which the lifecycle raises about a
+    *status* move. This one also covers an order whose status permits a refund
+    but which has no PaymentIntent to refund against — a state the system is
+    not supposed to be able to reach.
+    """
+
+
+def refund_order(session: Session, order_id: uuid.UUID) -> Any:
+    """Ask Stripe to refund an order in full. Does not change its status.
+
+    **The status moves on `charge.refunded`, not here**, and it is the same
+    argument D7 made about the success redirect: a successful API call is not
+    the same event as money arriving back. A refund can be `pending` for days
+    on some payment methods, and it can fail after being accepted. Writing
+    `refunded` because the call returned would put the order in a terminal
+    state describing something that has not happened yet — and terminal means
+    there is no way to correct it.
+
+    So this issues the refund and returns Stripe's object. The webhook is what
+    moves the order, which also means a refund issued from the Stripe dashboard
+    lands in exactly the same place as one issued here.
+
+    Nothing is written to the database. There is deliberately no `refund_id`
+    column: it would be a second record of a fact Stripe already owns, it would
+    need a migration, and its only real job — stopping a double refund — is
+    done better by an idempotency key derived from the order id. See
+    `stripe_svc.create_refund`.
+
+    The row is still locked. It does not serialise the *Stripe* call in any
+    useful way, because the status does not change and a second caller would
+    read the same refundable order; what it does is make the status check and
+    the call atomic with respect to `apply_transition`, so a refund cannot be
+    issued against an order that a webhook is concurrently moving to
+    `refunded`.
+    """
+    order = _lock_cart_free_order(session, order_id)
+
+    # Checked before Stripe is touched, for the reason `cancel_order` gives:
+    # a refund issued against an order that is then refused would be money
+    # moved with no transaction to undo it.
+    check_transition(OrderStatus(order.status), OrderStatus.REFUNDED)
+
+    if not order.stripe_payment_intent_id:
+        # This is not a state a shopper can produce. An order becomes `paid`
+        # only through `checkout.session.completed`, and that handler writes
+        # the PaymentIntent id in the same transaction as the status — so a
+        # `paid` order without one means this project has a bug, or somebody
+        # edited the row.
+        #
+        # Logged at ERROR because of that, and answered 409 anyway: from the
+        # caller's side the order genuinely cannot be refunded, no retry
+        # changes it, and 500 would invite one while telling them nothing. The
+        # status code is for the client; the log line is for us.
+        logger.error(
+            "order %s is %s but has no stripe_payment_intent_id, which should "
+            "be impossible: checkout.session.completed writes that column in "
+            "the same transaction that sets the status. Refusing the refund",
+            order.id,
+            order.status,
+        )
+        raise OrderNotRefundable(
+            f"order {order_id} has no recorded payment to refund. Its status "
+            "says it was paid, so this is a defect in this server rather than "
+            "something to retry — the payment has to be refunded from the "
+            "Stripe dashboard."
+        )
+
+    return stripe_svc.create_refund(
+        order.stripe_payment_intent_id,
+        # Derived from the order, never random, by the rule D7 wrote down: a
+        # random key would make every retry a fresh refund, which is the exact
+        # failure the key exists to prevent.
+        idempotency_key=f"shopagent-refund-v1-{order.id}",
+    )

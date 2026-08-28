@@ -788,7 +788,231 @@ project reads it, but it is worth knowing before anyone reconciles
 `orders.total_amount_cents` against a payout and finds the two disagree by a
 conversion.
 
+## Day 8 — findings
+
+**Two halves of one `.env` belonged to two different Stripe accounts, and the
+symptom was silence.** `STRIPE_SECRET_KEY` was a sandbox account's;
+`STRIPE_WEBHOOK_SECRET` came from `stripe listen` on a *different* account the
+CLI happened to be logged into. Checkout sessions were created on the first,
+`stripe listen` was fed by the second, and the two never met.
+
+Nothing failed. Signatures verified — the signing secret matched the account
+whose events were arriving — so every `stripe trigger` fixture came back 200
+and the endpoint looked healthy. Only the deliveries that mattered were
+missing, and a missing delivery is indistinguishable from a quiet afternoon. It
+cost a full real payment to notice: `$189.98` charged, `payment_status=paid` on
+the session, and `orders.status` still `pending` with no error anywhere.
+
+This is the ninth time in this project that a successful envelope has hidden an
+empty payload, and the first time the envelope was configuration rather than
+code. The previous eight were object shapes; this one had no object to inspect.
+
+**The check I was asked to write would not have worked, and finding that out
+was the useful part.** The proposal was to compare `event.account` against the
+key's account and warn on a mismatch. But `account` is a Connect field: Stripe
+sets it only on events forwarded from a connected account, and an ordinary
+event does not carry the key at all — `getattr(event, "account", None)` is
+`None` and `"account"` is absent from the payload, checked against five real
+events. The comparison would have been dead code that looked exactly like a
+safeguard.
+
+The offered alternative was worse in a more interesting way: assert that
+`retrieve_account().id` matches the account of the latest event from
+`events.list()`. That call uses our key, so it returns our account's events by
+construction. The assertion would have agreed with itself no matter how the CLI
+was configured — the same shape as D7's API-version pin that compared a
+variable to itself.
+
+The real difference was never visible from any event, because it is a
+difference between two *local* configurations. So the check reads both:
+`stripe config --list` against `configured_account_id()`, as a `stripe`-marked
+test that fails with both ids and the exact fix. The Connect comparison was
+still written, because it is genuinely right for the case it covers — and it
+costs nothing, because the absent-field early return means an ordinary delivery
+never looks the account up.
+
+The general lesson is worth keeping separate from the Stripe detail: **a check
+placed where the failure cannot be observed is not a weak check, it is a
+decoration.** Deciding where a failure is *visible* has to come before deciding
+what to compare.
+
+**A falsification probe passed for the wrong reason, twice, in two different
+ways.** Both were caught by falsifying the falsification, which is the only
+reason they are in this section rather than in the code.
+
+The first: a test asserting the webhook handler declares no request body, with
+a throwaway FastAPI route carrying a Pydantic parameter to prove the check has
+teeth. The model was defined *inside* the test function, and `from __future__
+import annotations` makes every annotation a string that FastAPI resolves
+against module globals. A model declared in a function body is invisible there,
+so the annotation stayed an unresolved string, FastAPI treated the parameter as
+an ordinary one, and the probe reported no body — making the falsification pass
+while proving nothing.
+
+The second is sharper. A test asserting that an ordinary event never triggers
+the account lookup, written with a stub that raises `AssertionError` when
+called. But `warn_on_account_mismatch` catches broadly on purpose — a
+diagnostic must not be able to cause the outage it describes — so it swallowed
+the stub's exception, and the test passed with the early return deleted. That
+is precisely the regression it existed to catch. **A counter cannot be
+swallowed; an exception can.** Rewritten to count calls, it fails as intended.
+
+Both share a shape: the test and the code agreed about the mechanism, and the
+agreement was the bug.
+
+**`StripeObject` raises for an absent key rather than returning `None`, and
+that turns a missing field into a retried outage.** `Event.api_version` is
+typed `Optional[str]`, so `event.api_version` reads as safe. It is not: for an
+event whose payload lacks the key entirely, `__getattr__` raises
+`AttributeError`. Measured across all three shapes —
+
+    present   -> '2026-06-24.dahlia'
+    absent    -> AttributeError: api_version
+    null      -> None
+
+— which means a plain attribute read would 500 a request that had *already
+passed signature verification*. Stripe treats 5xx as retryable, so the same
+delivery would return every few minutes for three days. Every read of an event
+field in this project goes through `getattr(..., None)` for that reason, and
+the same applies to `metadata`: `.get` raises `AttributeError: get`,
+`dict(metadata)` raises `KeyError: 0`, and `metadata["order_id"]` raises for an
+absent key. Only `metadata._data.get(...)` is safe, which is what
+`checkout_pages.py` already reached for on D7.
+
+**A unique violation aborts the whole transaction, and the failure surfaces
+somewhere else entirely.** Insert-first idempotency means a duplicate is an
+*expected* outcome the code continues past. But in Postgres a constraint
+violation poisons the transaction: the next statement on that connection
+returns `InFailedSqlTransaction — current transaction is aborted, commands
+ignored`, and SQLAlchemy raises `PendingRollbackError` for everything after.
+
+So catching `IntegrityError` and carrying on produces a bug that does not
+appear at the duplicate at all. It appears at whatever the request touches
+next, for reasons that have nothing to do with it — the worst kind of stack
+trace to be handed. `session.begin_nested()` unwinds to a SAVEPOINT instead:
+everything before the insert survives and the session stays usable, which is
+what makes "return `False` and continue" a state a caller can act on rather
+than a trap.
+
+**Three idempotency layers, proven independent by making each one catch a
+delivery the others could not.** The claim was written on D8 step 2 and
+demonstrated only at step 5, on one live order already `paid`:
+
+- The same event redelivered by `stripe events resend` was stopped by the
+  `processed_events` primary key. The handler was never entered — the log says
+  *"was already processed — no action taken"* and the row count did not move.
+- The same *work* under a new event id — the real event hand-signed with its
+  `id` replaced — passed the primary key (a new row was written, correctly)
+  and was stopped by the **transition table**: *"order … is already paid —
+  nothing to do"*. `paid -> paid` is not in the table.
+- The lock inside `apply_transition` covers what neither can see: two
+  transitions racing on one order, each with a distinct event id, each reading
+  a legal starting status. That one is only reachable under concurrency and
+  stays a test rather than a live demonstration.
+
+Writing this down as three layers was cheap. Showing that each catches
+something the others let through is what made it a claim rather than a slogan,
+and it is the argument for why `lifecycle.transition()` refuses `paid -> paid`
+instead of absorbing it as a harmless no-op.
+
+**Arithmetic and a flag say the same thing until they do not, and the tiebreak
+matters more than the comparison.** `charge.refunded` fires for partial refunds
+as well as full ones — established by refunding one real charge twice:
+
+    partial   amount=18998  amount_refunded=100    refunded=False
+    full      amount=18998  amount_refunded=18998  refunded=True
+
+So the event type carries no information about completeness, and either the
+amounts or the `refunded` boolean could decide. The amounts do, with the flag
+as a cross-check, and the reason is asymmetric failure: numbers cannot be
+quietly redefined, whereas a deprecated flag read through `getattr` returns
+`None` and silently means "never full" — turning the handler off without a
+single test noticing. Falsifying this was instructive: switching the decision
+to the flag alone still passed the headline test and failed only on
+`no_payment_required` and `None`, which is exactly why the parametrised
+allow-list exists.
+
+When the two disagree, nothing moves. `refunded` is terminal and a
+contradiction is not a case to resolve by picking a favourite.
+
+**A lock that looks like it serialises something, and does not.** `refund_order`
+takes `SELECT ... FOR UPDATE` on the order, which reads like protection against
+a double refund. It is not: the row does not change — the status stays `paid`
+until the webhook lands — so two requests seconds apart both read a refundable
+order and both reach Stripe. The lock is real but it guards a different thing
+(a refund racing a concurrent `apply_transition`), and the double refund is
+stopped by an idempotency key derived from the order id.
+
+Worth recording because the lock would have been *credited* with the protection
+by anyone reading the code, including whoever wrote it. A lock protects an
+invariant that a write establishes; where nothing is written, it protects
+nothing.
+
+**`livemode` is stored on `processed_events` even though this project refuses
+live keys.** `config.py` rejects an `sk_live_` key at configuration time, which
+reads like "live events cannot reach this code". It does not cover this path:
+`STRIPE_WEBHOOK_SECRET` is a separate credential, and a live endpoint's signing
+secret would verify a live event here perfectly. If one is ever acted on, that
+column is the only place it would be recorded. A guard's coverage is a property
+of the path it sits on, not of the sentence describing it.
+
+**The window between 202 and the webhook, measured.** `POST
+/orders/{id}/refund` returned 202 with Stripe already reporting
+`refund_status=succeeded`, and the order was still `paid` when checked 1.1
+seconds later; `charge.refunded` arrived and moved it within the next second.
+Roughly a second on a card in test mode — small enough that a 200 would seem to
+work, large enough that a client polling immediately would read `paid` and
+conclude the refund had failed. On payment methods where refunds are pending
+for days it is not a window at all. This is the concrete number behind
+choosing 202, and behind naming the unchanged `order_status` in the response
+body.
+
 ## Known gaps
+
+**A partial refund has no representation in this system.** `orders.status` has
+`paid` and `refunded` and nothing between, so a partially refunded order stays
+`paid` and the only record is an ERROR line. That is the right refusal today —
+inventing a status a week early would be a guess, and `refunded` is terminal so
+the wrong half of the guess is unrecoverable — but it means money can move in a
+way the database will never reflect. The fix is not a status: it is a
+`refunds` table recording each refund against an order, with the order's status
+derived from the sum. That is a real schema change and belongs to whatever day
+actually needs partial refunds.
+
+**Nothing retries from our side once Stripe gives up.** Stripe redelivers for
+three days and then stops. If this server is down for longer, or answers 500
+for longer, those events are gone and the orders they described stay in
+whatever status they had — a paid order stuck at `pending`, with its stock
+reserved. `events.list()` makes a reconciliation sweep straightforward (fetch
+recent events, skip the ones in `processed_events`, replay the rest through
+`handle_event`), and the idempotency work is already done, which is what would
+make such a sweep safe to run at any time. It is not built.
+
+**`stripe listen` cannot be pinned to an API version, so the mismatch warning
+fires on every local delivery.** The CLI offers the account's default version
+or `--latest` and nothing between; measured on this account, the default is
+`2026-06-24.dahlia` and `--latest` is `2026-08-26.dahlia`, while
+`STRIPE_API_VERSION` pins `2026-07-29.dahlia`. There is no `--stripe-version`
+flag, which an earlier draft of the warning text wrongly advertised. So the
+warning is correct and permanently noisy in development, and a warning people
+learn to scroll past is one that will not be read on the day it means
+something. The honest fixes are to upgrade the account's default to match the
+pin, or to downgrade the warning to INFO for the specific local case — neither
+was done, because both trade a real signal for quiet.
+
+**Nothing bounds the growth of `processed_events`.** One row per delivery, for
+ever, with no pruning. Harmless at this scale and a real question at any other:
+rows older than Stripe's three-day retry window can no longer prevent anything,
+because no delivery that old will arrive again. A periodic delete on
+`processed_at` is the whole fix, and it is not written.
+
+**The webhook endpoint trusts that it is reachable only by Stripe *for
+authenticity*, not for load.** Signature verification means nothing unsigned is
+acted on, but every request still costs a body read and an HMAC before it is
+refused. There is no rate limit and no request size cap, so an unauthenticated
+caller can make this endpoint do work. D6 named the same gap for the API as a
+whole; this route makes it slightly more pointed by being the one address that
+must stay open to the internet.
 
 **The CLI does not stream while tools are in play.** `chat_with_tools` is a
 blocking call; `stream_chat` still exists and is still tested, but nothing
@@ -964,13 +1188,20 @@ outside D6's scope and both are load-bearing once the key is anything other
 than a developer's own. Worth naming here so that "the API is done" does not
 read as "the API is deployable".
 
-**`checkout.session.expired` does not release a reservation.** D7 releases
-stock on `cancelled` and `refunded`, and Stripe expires an unpaid session after
-24 hours — but nothing listens for that. The order stays `pending` for ever
-with its units reserved, which is the same leak D6 had, moved one step later.
-D8 closes it either with a webhook on that event or with a periodic sweep over
-pending orders whose session has expired. Named here because it is the most
-likely way this system quietly runs out of sellable stock.
+**`checkout.session.expired` does not release a reservation.** *(Closed on
+D8.)* D7 released stock on `cancelled` and `refunded`, and Stripe expires an
+unpaid session after 24 hours — but nothing listened for that. The order stayed
+`pending` for ever with its units reserved, which was the same leak D6 had,
+moved one step later.
+
+D8 closed it with a webhook handler rather than the periodic sweep this entry
+offered as the alternative, and the handler turned out to need two guards that
+were not obvious when the gap was written down. The event is not trusted about
+payment — Stripe can expire a session whose payment is in flight — and the
+event's session must be the one the order currently points at, or an order on
+its second checkout is cancelled by the first session's expiry. Verified end to
+end: an expired unpaid session moved a `pending` order to `cancelled` and
+returned exactly the units it held. See "Day 8 — findings".
 
 **Checkout Sessions cannot be deleted, only expired.** Stripe keeps them
 permanently, so `expire` is the whole of what cleanup can mean and the test

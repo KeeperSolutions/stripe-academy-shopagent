@@ -28,6 +28,7 @@ from datetime import datetime
 from enum import StrEnum
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     Enum,
@@ -255,6 +256,67 @@ class OrderItem(Base):
     quantity: Mapped[int] = mapped_column(Integer)
 
     order: Mapped[Order] = relationship(back_populates="items")
+
+
+class ProcessedEvent(Base):
+    """One Stripe webhook delivery this server has already dealt with (D8).
+
+    The table exists for one reason: Stripe redelivers. A delivery that got no
+    2xx is retried with backoff for up to three days, and a delivery that
+    *did* succeed can still arrive twice — at-least-once is what the service
+    promises, and duplicates are documented behaviour rather than a fault. Two
+    arrivals of one `checkout.session.completed` must not reserve stock twice
+    or send a second confirmation.
+
+    **The row is written before the work, not after, and that ordering is the
+    whole design.** The obvious shape — look the id up, and if it is absent do
+    the work — is check-then-act, and two concurrent redeliveries of one event
+    both read "absent" before either writes. The same race review caught on
+    D7's customer lookup. Here the `INSERT` goes first and the primary key
+    decides: the second one cannot insert, so the second one does nothing.
+    Postgres arbitrates, rather than an `if` in Python that has already gone
+    stale by the time it is read.
+
+    The insert and the work it guards commit together, in one transaction. If
+    the work fails, the row goes with it — otherwise a retry would find "already
+    processed" for an order nothing ever did anything to, which is the one
+    failure worse than doing it twice.
+
+    **No part of the event body is stored.** The event lives in Stripe, where
+    it can be read by whoever is entitled to, and copying it here would make
+    this a second store of customer emails and amounts under different access
+    rules — the argument D5 made about the MCP server's argument log. What is
+    here is what answers a question at three in the morning.
+    """
+
+    __tablename__ = "processed_events"
+
+    # Stripe's own id, `evt_...`, and the point of the whole table. A string
+    # primary key rather than a surrogate integer with a unique index, because
+    # the identity *is* the id: there is nothing to say about an event that is
+    # not said by which event it was.
+    event_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    # "Which kind was it." Without this the table can only confirm an id
+    # somebody already has, and the question that actually gets asked is the
+    # other one — did the paid event ever arrive at all, and how many of each
+    # kind came through last night. One `GROUP BY` answers it here; the
+    # alternative is the dashboard and a lot of clicking.
+    event_type: Mapped[str] = mapped_column(String(255))
+    # Whether Stripe considered this live data. Kept despite this project
+    # refusing live secret keys in `config.py`, because that check does not
+    # cover this path: `STRIPE_WEBHOOK_SECRET` is a separate credential and a
+    # live endpoint's signing secret would verify perfectly here. If a live
+    # event is ever acted on by this server, this column is the only place
+    # that would be recorded.
+    livemode: Mapped[bool] = mapped_column(Boolean)
+    # When the work finished, not when the delivery landed. The row is
+    # inserted first, but it only survives if the transaction commits — and
+    # that commit happens after the handler is done — so for every row that
+    # exists, this is the time it was processed. Server-side default, so the
+    # database's clock decides rather than the app server's.
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class OrdersExist(Exception):

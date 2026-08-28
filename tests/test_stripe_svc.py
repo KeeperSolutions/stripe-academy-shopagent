@@ -214,3 +214,64 @@ def test_the_key_reaches_a_real_test_mode_account():
         "this key is operating in LIVE mode. Stop and replace it with a "
         "test-mode key before running anything else in this project."
     )
+
+
+# --- the two halves of a local setup that must agree ---------------------
+
+
+@pytest.mark.stripe
+def test_the_stripe_cli_is_logged_into_the_account_this_key_belongs_to():
+    """The check for a misconfiguration that produces silence, not an error.
+
+    On 2026-08-28 this repo's `.env` held a `STRIPE_SECRET_KEY` for one Stripe
+    account and a `STRIPE_WEBHOOK_SECRET` for another, because `stripe login`
+    had been run against a different account than the key came from. Checkout
+    sessions were created on the key's account; `stripe listen` was fed by the
+    CLI's; and the two never met. Nothing failed — signatures verified, the
+    endpoint answered 200 to every `stripe trigger` fixture, and the events
+    that mattered simply never arrived. It cost a full end-to-end payment to
+    notice.
+
+    It is asserted here rather than in the webhook handler because no event can
+    see it. Non-Connect events carry no `account` field at all — verified
+    against five real ones — so a runtime comparison has nothing to compare,
+    and `events.list()` is worse than useless for it: that call uses this
+    key, so it returns this account's events by construction and would agree
+    with itself no matter how the CLI is configured. The difference lives in
+    two local configurations, so it is read from both.
+
+    Skips rather than fails when the CLI is absent or logged out. A developer
+    who does not use `stripe listen` cannot have this problem, and a test that
+    fails for not having a tool installed is one people learn to ignore.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("stripe") is None:
+        pytest.skip("the Stripe CLI is not installed, so nothing forwards webhooks")
+
+    result = subprocess.run(
+        ["stripe", "config", "--list"], capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0:
+        pytest.skip("`stripe config --list` failed; the CLI is probably logged out")
+
+    cli_accounts = [
+        line.split("=", 1)[1].strip().strip("'\"")
+        for line in result.stdout.splitlines()
+        if line.strip().startswith("account_id")
+    ]
+    if not cli_accounts:
+        pytest.skip("the Stripe CLI reports no account_id; run `stripe login`")
+
+    key_account = stripe_svc.configured_account_id()
+
+    assert key_account in cli_accounts, (
+        f"the Stripe CLI is logged into {cli_accounts} but STRIPE_SECRET_KEY "
+        f"belongs to {key_account}. `stripe listen` will forward that other "
+        "account's events, so checkouts created by this server produce webhooks "
+        "nothing here ever receives — and the failure is silent, because the "
+        "deliveries that do arrive verify correctly. Run `stripe login` against "
+        f"{key_account} and put the whsec_ it prints into .env, or point "
+        "STRIPE_SECRET_KEY at the account the CLI is using."
+    )

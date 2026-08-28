@@ -14,11 +14,47 @@ is attached.
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from shopagent.api.deps import configured_api_key, require_api_key
-from shopagent.api.routers import cart, checkout_pages, orders
+from shopagent.api.routers import cart, checkout_pages, orders, webhooks
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """Give this project's loggers somewhere to write when uvicorn is the host.
+
+    D8's webhook logs every delivery before doing anything with it, which is
+    the only trace of what arrived when something goes wrong — and without
+    this it would go nowhere. Uvicorn installs handlers on its own `uvicorn.*`
+    loggers and leaves the root logger bare, so an `INFO` record from
+    `shopagent.*` propagates to a root with no handler and is dropped by the
+    fallback, which only emits `WARNING` and above. The endpoint would work
+    perfectly and appear to log nothing.
+
+    Attached to the `shopagent` logger rather than through `basicConfig`,
+    which configures the *root* logger and would therefore also start printing
+    every library's records through this format. Guarded on `handlers`, so
+    importing the app twice does not double every line, and so a process that
+    has already configured logging deliberately — a test, or a deployment with
+    its own dictConfig — keeps what it set up. `propagate` is left alone:
+    `caplog` works by attaching to the root logger, and severing propagation
+    here would leave every logging assertion in the suite passing vacuously.
+    """
+    package_logger = logging.getLogger("shopagent")
+    if package_logger.handlers:
+        return
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(levelname)s %(name)s: %(message)s")
+    )
+    package_logger.addHandler(handler)
+    package_logger.setLevel(level)
+
+
+configure_logging()
 
 # Read at import, so a server with no usable key dies while uvicorn is loading
 # the module instead of starting and refusing every request afterwards. The
@@ -77,3 +113,13 @@ app.include_router(orders.router, dependencies=[Depends(require_api_key)])
 # *browser* to these two, and a browser carries no `X-API-Key`. Safe only
 # because they read and never write: see `routers/checkout_pages.py`.
 app.include_router(checkout_pages.router)
+
+# Also without authentication, and for a different reason worth keeping
+# distinct from the one above. Stripe does not send this server's key; it signs
+# the body and puts the digest in `Stripe-Signature`, so the signature is the
+# credential. Mounting this behind `require_api_key` would refuse every real
+# delivery with a 401 while accepting nothing extra — Stripe has no key to
+# send. This route does write, from step 2 onwards, which is why the
+# verification in `routers/webhooks.py` runs before anything else in the
+# handler rather than being a property of where it is mounted.
+app.include_router(webhooks.router)
