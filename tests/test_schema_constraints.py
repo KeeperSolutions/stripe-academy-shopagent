@@ -260,6 +260,60 @@ def test_the_recorded_migration_covers_the_columns_day_7_added():
     assert "IF NOT EXISTS" in sql
 
 
+def test_the_recorded_migration_creates_the_table_day_8_added():
+    """The first *table* the convention creates, rather than columns it adds.
+
+    Easy to think unnecessary, because `create_all` checks tables one at a
+    time and builds any it does not find — a fresh clone and a pre-D8 database
+    alike. An earlier version of this docstring said `create_all` would leave
+    such a database alone, which is wrong; review on PR #8 corrected it.
+
+    What the migration is for is the record: a file saying what changed, which
+    a deployment can read before running it. `create_all` builds whatever it
+    finds missing and says nothing about which change was needed. This test
+    only asserts the file exists and is idempotent, which is the part a
+    convention can enforce.
+    """
+    import pathlib
+
+    migrations = pathlib.Path(__file__).resolve().parents[1] / "migrations"
+    sql = "\n".join(path.read_text() for path in migrations.glob("*.sql"))
+
+    assert "CREATE TABLE IF NOT EXISTS processed_events" in sql
+
+
+def test_the_migration_and_the_model_declare_the_same_columns():
+    """Two artifacts describing one table, kept from drifting apart.
+
+    `api/models.py` is what `create_all` builds on a fresh clone;
+    `migrations/0002` is what an existing database gets. A column added to one
+    and not the other produces two schemas that are both "correct" depending
+    on when the database was created — and `find_column_gaps` only catches it
+    on a machine that actually ran the migration, which is not the machine the
+    mistake is made on.
+
+    Compared by name against the migration's text rather than by parsing SQL:
+    a real parser here would be a second implementation of Postgres, and the
+    failure being caught is a forgotten column, not a subtle type difference.
+    """
+    import pathlib
+
+    from shopagent.api.models import ProcessedEvent
+
+    sql = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "migrations"
+        / "0002_d8_processed_events.sql"
+    ).read_text()
+
+    for column in ProcessedEvent.__table__.columns:
+        assert column.name in sql, (
+            f"the model declares processed_events.{column.name} and migration "
+            "0002 does not create it — a database built from the migration "
+            "would be missing it"
+        )
+
+
 def test_every_migration_can_be_applied_twice(session):
     """Idempotency is the whole reason this project needs no migrations table.
 

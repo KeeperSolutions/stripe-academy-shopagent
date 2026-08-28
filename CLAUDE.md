@@ -31,13 +31,18 @@ tracked.
 | `api/deps.py` | D6 | `X-API-Key` authentication |
 | `api/models.py` | D6 | carts and orders, on the catalog's `Base` |
 | `api/lifecycle.py` | D6 | `OrderStatus` and the transitions between them |
-| `api/schemas.py` | D6, D8 | request and response bodies; where names change |
-| `api/routers/` | D6, D8 | HTTP only — parse, call a service, map an error |
-| `api/services/` | D6, D8 | cart and order logic; imports no FastAPI |
+| `api/schemas.py` | D6→D8 | request and response bodies; where names change |
+| `api/routers/cart.py` | D6 | the cart endpoints |
+| `api/routers/orders.py` | D6→D8 | orders, checkout, cancel, refund |
+| `api/services/cart.py` | D6 | cart rules; the advisory stock check |
+| `api/services/orders.py` | D6→D8 | `place_order`, `apply_transition`, cancel, refund |
 | `payments/stripe_svc.py` | D7 | the Stripe SDK layer; the only importer of `stripe` |
 | `payments/catalog_sync.py` | D7 | mirrors the catalog into Stripe; nothing bills from it |
 | `payments/checkout.py` | D7 | Checkout Sessions built from the order snapshot |
 | `payments/customers.py` | D7 | attaching a buyer to an order |
+| `api/routers/checkout_pages.py` | D7 | the two pages Stripe redirects a browser back to |
+| `api/routers/webhooks.py` | D8 | `POST /webhooks/stripe` — verify, claim, dispatch |
+| `api/services/events.py` | D8 | idempotency and what each event type means |
 | `agent/` | D9 | memory, guardrails |
 | `obs/` | D10 | Langfuse tracing |
 
@@ -301,11 +306,12 @@ produced both came back with `metadata: {}`. So the checkout also passes
 confirmed the identifier then reaches the PaymentIntent *and* its Charge.
 
 The distinction matters when reading this code: **nothing propagates
-automatically, and the explicit copy is why all three objects carry it.** D8 may
-therefore subscribe to `checkout.session.completed`,
-`payment_intent.succeeded` or `charge.succeeded` and attribute any of them —
-but only for as long as that parameter keeps being sent, which is what the
-offline test on the outgoing payload exists to guard. No PaymentIntent exists
+automatically, and the explicit copy is why all three objects carry it.** D8
+took that up — `services/events.py::order_id_from` reads `order_id` the same
+way off a Session, a PaymentIntent and a Charge, and `charge.refunded` carries
+nothing else to attribute a refund by. It works only for as long as that
+parameter keeps being sent, which is what the offline test on the outgoing
+payload exists to guard. No PaymentIntent exists
 until a shopper starts paying, so nothing on an unpaid session can prove the
 copy arrived.
 
@@ -375,6 +381,325 @@ re-embeds what it is pointed at, so running it after a model change over a
 catalog that was only partly re-embedded leaves two models' vectors in one
 column, silently comparable and quietly wrong. A dimension change fails loudly
 instead, because the column type is `VECTOR(1536)`.
+
+**The webhook handler takes no body parameter, and never may.** FastAPI reads
+a request body once and hands a declared parameter the *parsed* result; a
+Stripe signature is an HMAC over the bytes that arrived. Verifying against a
+re-serialised body is dangerous precisely because it mostly works —
+`json.dumps` reproduces many payloads exactly — so it would pass every test,
+every `stripe listen` session and every demo, and then fail intermittently on
+whichever real event carried a float, a non-ASCII character or a key order the
+encoder did not preserve. The handler therefore takes `Request` and reads the
+raw bytes itself — through `read_capped_body`, never `await request.body()`,
+for the size reason the next rule gives.
+`tests/test_webhooks.py` fails if a parameter is added:
+once by name, and once on FastAPI's own `route.body_field`, which is the
+assertion with teeth. Dependencies are allowed — `Depends(get_session)` is not
+a body — and the guard checks for that rather than for an exact parameter list.
+
+**It reads the stream under a cap, not `await request.body()`.** The signature
+*is* the credential on this route, and it cannot be checked until the body has
+arrived — so everything read before that point was sent by somebody holding
+nothing. `request.body()` buffers the whole delivery before the check can
+happen, which turns "send a very large body" into memory and HMAC work an
+anonymous caller can ask for. `read_capped_body` reads `request.stream()` and
+gives up the moment the total passes `MAX_WEBHOOK_BODY_BYTES`, answering
+**413**. `Content-Length` is consulted first only as a fast path: it is a
+header the sender writes and a chunked request need not carry one, so it can
+shorten the work but never enforces the limit — there is a test that lies in
+that header and is still refused. 256 KiB against a measurement rather than a
+guess: the largest of the last hundred events on this account is 4,145 bytes.
+A constant rather than a setting, by the configuration rule above — a limit
+somebody can raise from a `.env` is a limit that stops holding on the day it
+matters. Raised in review on PR #8.
+
+**Insert first, then work — never check-then-act.** The obvious shape is to
+look the event id up and do the work if it is absent, and two concurrent
+redeliveries both read "absent" before either writes. Retries are the condition
+this table exists for, so that race is the normal operating condition rather
+than a corner case. `services/events.py::record_event` inserts into
+`processed_events` and lets the primary key arbitrate; a duplicate comes back
+as `False`, not as an exception the caller has to interpret.
+
+The insert is wrapped in `session.begin_nested()`, and that is load-bearing. A
+unique violation aborts the *entire* Postgres transaction — the next statement
+on that connection returns `InFailedSqlTransaction` and SQLAlchemy raises
+`PendingRollbackError` for everything after it. A duplicate is the one outcome
+this code expects to continue past, so without a SAVEPOINT the failure would
+not appear on the duplicate at all: it would appear on whatever the request
+touched next.
+
+**The claim and the work are one transaction.** `process_event` runs inside the
+transaction holding that event's `processed_events` row, and the router rolls
+both back together on any exception. A row that outlived a failed handler would
+tell Stripe's retry — the mechanism that exists to recover from exactly this —
+that the event was already handled, and the payment would silently never land.
+The rollback is in the handler rather than left to `get_session`, because the
+invariant belongs to the code that owns both halves.
+
+**Three independent layers make this idempotent, and they catch different
+things.** Proven separately against a live account rather than argued:
+
+- **`processed_events` primary key** catches the *same event id* arriving
+  twice — Stripe's own redelivery. The handler is never entered.
+- **The transition table** catches the *same work* arriving under a different
+  event id: a manual replay, or two event types describing one payment.
+  `paid -> paid` is not in the table, so it is refused after the claim
+  succeeded. This is why `lifecycle.py` refuses a status transitioning to
+  itself instead of absorbing it as a no-op.
+- **The `SELECT ... FOR UPDATE` inside `apply_transition`** catches two
+  transitions racing on one order, which neither of the above can see: both
+  hold distinct event ids and both read a legal starting status.
+
+None of the three subsumes another, and removing any one leaves a real hole.
+
+**500 means retry, 200 means stop, and the choice is about Stripe not about
+us.** Stripe redelivers anything that is not 2xx, with backoff, for three days.
+So a *transient* failure — the database is unreachable, Stripe timed out,
+anything unexpected — propagates and becomes a 500, which is what makes the
+retry useful. A *permanent* one — an event type nothing handles, an order id
+absent from the metadata, an order that does not exist here, a transition the
+lifecycle refuses — is logged and answered **200**, because no redelivery
+improves it and three days of retries would only bury the log line that
+explains it. `handle_event` catches almost nothing, which is how that split
+stays honest.
+
+**An order's status changes only through a webhook.** No endpoint that calls
+Stripe also writes the status it expects to result. `POST /orders/{id}/refund`
+issues the refund and answers **202**: the refund has been accepted, not
+completed. Measured on a real card, the order stayed `paid` for between 1.1
+and 2.1 seconds after the 202 before `charge.refunded` arrived — and on other
+payment methods a refund can be pending for days. The response names the
+unchanged `order_status` for that reason: it is the field a caller would
+otherwise assume had moved. This is the same rule the success redirect
+follows, and it means a refund issued from the Stripe dashboard lands in
+exactly the same place as one issued here.
+
+**`checkout.session.expired` is the only path where stock is released without
+a person, so it is the most defensive handler.** `cancelled` is terminal, and
+getting this wrong is unrecoverable in both directions at once: the money is
+real and the reservation is gone. Two guards, neither optional. The event is
+not trusted about payment — the session is fetched from Stripe and
+`payment_status` read from the answer, because Stripe can expire a session
+whose payment is in flight and delivery order is not guaranteed. And the
+event's session must be the one the order currently points at, or an order
+that started a second checkout would be cancelled by the first session's
+expiry while the shopper is on the new payment page. The comparison is an
+allow-list: only `unpaid` may cancel, because `payment_status` has a third
+value (`no_payment_required`) and `!= "unpaid"` and `== "paid"` differ exactly
+there.
+
+**The session comparison happens twice, and only the second one decides.** The
+first runs before the Stripe call and exists to skip a round trip. The
+authoritative one runs after it, on a row re-read through
+`orders.lock_order` — `SELECT ... FOR UPDATE` with `populate_existing` — and
+is held until the commit. The reason is the gap the network call opens: a
+retrieve takes long enough for a shopper to start a second checkout, and
+`_reusable_session` will happily build one because the first session is
+expired. Cancelling on the earlier read then releases the stock of an order
+whose new payment page is open and chargeable. It is the same defect shape as
+the transition preflight — an unlocked read deciding a write — and it was found
+the same way, in review on PR #8.
+
+`populate_existing` on that re-read is load-bearing rather than defensive:
+`_load_order` has already put this order in the Session's identity map, so
+without it the locked select returns the instance with the attributes it was
+loaded with, and the whole point of waiting for the lock is lost.
+`test_a_second_checkout_started_during_the_stripe_call_stops_the_expiry` fails
+without it, which is how that was established rather than assumed.
+
+**The session that paid is not always the one the order points at, and the
+other one has to be closed.** That guard has a consequence the guard itself
+creates. An order whose session expired with a payment still in flight is
+correctly left `pending` — Stripe reports it as not `unpaid`, so nothing is
+cancelled — and the shopper who returns gets a *second* Checkout Session,
+because `_reusable_session` sees an expired one and makes a new one. When the
+first session finally completes, the order is genuinely paid while the second
+session is open and chargeable, and a shopper still looking at that payment
+page pays for the same order twice. `_reconcile_paying_session` therefore
+expires the session the order points at, records the one that actually paid,
+and only then moves the order. Raised in the second review round on PR #8.
+
+Three things about it are deliberate. It runs behind `_may_become`, so an
+order that cannot become paid never causes somebody else's session to be
+expired on the way to being told so. The catch around the expiry is narrow —
+`stripe_svc.InvalidRequestError` only, which is Stripe refusing to expire a
+session that is not open; a connection failure is not that and must keep
+propagating into a 500 so the delivery is redelivered. And when the expiry is
+refused the payment is still accepted, because the money that arrived is real:
+the alternative to a possible double charge is a definite unpaid order. That
+case is the one thing here no code can fix, so it is logged at ERROR naming
+both sessions, and a person refunds it.
+
+**A refund is attributed by PaymentIntent, not by `metadata.order_id`.**
+`order_id` says which order a charge is *about*; it does not say the charge is
+the payment that order recorded, and the two come apart in exactly the case
+this file already documents — a superseded Checkout Session that was paid
+anyway leaves two Charges carrying the same `order_id`. Refunding the
+duplicate is what a person reconciling does first, and its own `amount` and
+`amount_refunded` balance perfectly, so without a check it reads as a full
+refund of the order: terminal status, whole reservation released, and the
+recorded payment still charged. `_charge_belongs_to` compares
+`charge.payment_intent` against `orders.stripe_payment_intent_id` and refuses
+anything else, including an order with no PaymentIntent recorded — `refunded`
+is terminal and releases stock, so an attribution that cannot be verified is
+not one to act on. Raised in review on PR #8.
+
+The fixture is the other half of that story. `refunded_event` in the tests did
+not carry `payment_intent` at all, so no test could have noticed the check was
+missing; a fixture that omits a field the real object always has is a blind
+spot with the shape of coverage.
+
+**A zero-total order is paid with nothing to refund, and that is not a
+defect.** `total_amount_cents >= 0` and `prices.amount_cents >= 0` both permit
+zero, and Stripe settles such a checkout as `no_payment_required`, which
+`SETTLED_PAYMENT_STATUSES` accepts deliberately — so the order becomes `paid`
+with no PaymentIntent, legitimately. `refund_order` used to call that state
+impossible and tell the caller to refund a payment in the dashboard that never
+existed. It is a plain 409 now, and the ERROR is kept for a positive total,
+where the same state really does mean a bug here. Raised in review on PR #8:
+this codebase allowed the order to exist and then declared it unreachable.
+
+**Only a full refund moves an order to `refunded`.** `charge.refunded` fires
+for a partial refund too — measured against one real charge refunded twice:
+
+    partial   amount=18998  amount_refunded=100    refunded=False
+    full      amount=18998  amount_refunded=18998  refunded=True
+
+The event type says nothing about completeness. A partially refunded order is
+not finished — the shopper still has the goods — and there is no status
+between `paid` and `refunded`, so acting on one would drive a terminal status
+and hand back the whole reservation for a fraction of the money: $1 returned
+on a $190 order would free every unit. So a partial refund changes nothing and
+is logged at **ERROR**, because this system genuinely cannot represent what
+happened and that line is the only record. The decision is arithmetic
+(`amount_refunded >= amount`) with the `refunded` flag as a cross-check:
+numbers cannot be quietly redefined, whereas a flag can be deprecated into
+absence and `getattr` on an absent flag would silently mean "never full". When
+the two disagree, nothing moves.
+
+**`checkout.session.completed` does not mean the money arrived.** For
+delayed-notification payment methods Stripe sends it with
+`payment_status="unpaid"` and settles later through
+`checkout.session.async_payment_succeeded`, or fails through
+`checkout.session.async_payment_failed`. Nothing in `payments/checkout.py`
+restricts `payment_method_types`, so which methods are offered is a dashboard
+setting this code does not control — reading `payment_status` removes the
+assumption instead of documenting it. The allow-list is `paid` and
+`no_payment_required`, the same shape the expiry guard uses and for the same
+reason. Both async events are handled, because a guard without them would
+strand such an order at `pending` for ever: `completed` has already been and
+gone by the time the funds confirm.
+
+**`checkout.session.async_payment_failed` cancels the order, and a declined
+card does not.** The two look like the same event and leave the session in
+opposite states. `payment_intent.payment_failed` happens while the session is
+still `open`: the shopper can try another card, and if they never do, the
+session expires and `checkout.session.expired` cancels the order — so logging
+and doing nothing is complete. The async failure only ever arrives *after*
+`checkout.session.completed`, so the session is `complete`, and a complete
+session never expires while `_reusable_session` in `payments/checkout.py`
+refuses to start a new checkout for an order holding one. Logging and doing
+nothing there is not a lighter answer but a permanent leak: no retry path, no
+release path, the order and its reserved units stuck for ever. Raised in
+review on PR #8.
+
+The policy is therefore explicit — the payment is over, so the order is
+cancelled and the units go back on sale. It is the second path where stock is
+released without a person, and it asks Stripe nothing, unlike the expiry
+handler. Two things make that safe. The event type is itself Stripe's verdict
+on the payment, where `expired` says nothing about money and is exactly why
+that handler cannot trust it. And if the money did arrive the order is already
+`paid`, so `paid -> cancelled` is refused by the transition table before any
+stock moves — the guard is the table rather than a check somebody has to
+remember. The session-identity guard is the same one the expiry handler uses,
+for the same reason.
+
+**A live-mode event is recorded and never dispatched.** `config.py` refuses an
+`sk_live_` key, which reads like "live events cannot reach this code" and does
+not cover this path at all: `STRIPE_WEBHOOK_SECRET` is a separate credential
+and a live endpoint's signing secret begins `whsec_` exactly like a test one,
+so it verifies just as well. `handle_event` therefore stops on
+`event.livemode`, logs at ERROR and returns — 200, because the delivery is
+genuine and the configuration is what has to change. A guard's coverage is a
+property of the path it sits on, not of the sentence describing it.
+
+**A column that belongs to a transition is written inside `apply_transition`,
+after the locked check.** `handle_checkout_completed` records
+`stripe_payment_intent_id`, and the damaging case is concrete: a second
+`checkout.session.completed` for an order already `paid` overwriting the
+PaymentIntent the refund endpoint spends, with one from a session that may
+never have been charged. Two rounds of review on PR #8 took two attempts at
+the same mistake, and the second is the instructive one.
+
+The obvious shape — assign the column, then call `_move`, which checks the
+transition first — is wrong because the assignment has already happened: a
+refusal returns without undoing it, and the router's `commit()` writes it to
+an order whose status never changed. Moving the assignment into `_move`, in
+front of its own check, fixed that and left a subtler version standing.
+`_move`'s check is unlocked and advisory; the authoritative one is inside
+`apply_transition`, behind `SELECT ... FOR UPDATE`. An attribute assigned
+before that statement runs is dirty on the Session, **SQLAlchemy autoflushes
+it as part of issuing the select**, and the `UPDATE` is therefore already in
+the transaction by the time the locked check refuses. `session.expire()`
+afterwards drops the attribute and not the statement, so the router commits
+it. Only an assignment made *after* the locked check cannot outlive a refusal,
+which is why `updates` travel through `_move` to `apply_transition` and are
+applied there.
+
+The general form is worth stating, because it is not specific to this column:
+**any write made before an autoflushing read is already in the transaction,
+whatever the code does with the attribute afterwards.** A check that runs
+between them decides nothing about what commits.
+`test_a_transition_refused_under_the_lock_writes_no_column_either` simulates
+the race by neutering the preflight, which is exactly the state a caller is in
+when a concurrent delivery moved the order between the two checks.
+
+The lost-race branch inside `_move` still expires the instance rather than
+rolling the session back, now for one reason instead of two: it drops the
+status this handler read before the wait. A rollback there discarded this
+event's `processed_events` claim while the handler still returned normally and
+the router still answered 200 — the delivery recorded nowhere and Stripe told
+to stop, which are the two things that must never both be true.
+
+**`apply_transition` asks for `populate_existing` under its lock.** The order
+is usually already in the Session's identity map, and an ORM select that
+returns an instance it already holds is not obliged to overwrite attributes
+loaded earlier. If it did not, a caller that waited behind a concurrent
+transition would evaluate the status from *before* the wait and two refunds
+could each release the same reservation. SQLAlchemy 2.0.52 does refresh under
+`with_for_update()`; asking explicitly turns that from an observation into part
+of the statement, and
+`test_two_concurrent_transitions_release_the_reservation_once` is what would
+catch it changing — two connections and one order, rather than a test that
+reads the emitted SQL for `FOR UPDATE`.
+
+**`payment_intent.succeeded` deliberately changes nothing.** One payment
+produces it *and* `checkout.session.completed`, in an order nobody controls.
+If both drove the transition, whichever lost would be refused by the
+transition table on every successful payment — a permanent stream of warnings
+describing the system working. `checkout.session.completed` is the primary
+because it says the *checkout* finished rather than that a charge settled, it
+carries the session this project created, and its `payment_status` is what the
+expiry guard reads. It is kept as a handler rather than left to the
+unknown-type branch so the log distinguishes "nothing happened because nothing
+handles this" from "nothing happened because nothing should".
+
+**Editing an applied migration reaches no database that already ran it.**
+`0002_d8_processed_events.sql` is the convention's first *table* rather than
+its first columns, and that difference makes the file easy to think
+unnecessary: `create_all` checks tables one at a time and builds any it does
+not find, so a fresh clone gets `processed_events` without running anything —
+and so would a database created before D8. This document previously claimed
+`create_all` would leave such a database alone, which is wrong and was
+corrected in review on PR #8. The migration's justification is not that
+nothing else can create the table; it is that the repository has to *record*
+what changed. `create_all` is a script that will build whatever it finds
+missing without saying so, and reading it tells nobody which change a
+deployment needs.
+The consequence for later: adding a fifth column to `processed_events` means
+`0003` with `ADD COLUMN IF NOT EXISTS`, **not** an edit to `0002`. Idempotency
+makes re-running safe; it does not make a rewrite retroactive.
 
 **Chat Completions, not the Responses API.** Responses keeps conversation state
 on the server, which hides the very loop this project exists to learn.
@@ -509,32 +834,46 @@ carries usage alongside an empty `choices` list.
 
 ## Commands
 
+**The runnable command list lives in `README.md`, and deliberately only there.**
+This file used to carry its own copy, which is a second record of the same fact
+— the failure mode this document argues against everywhere else, and it had
+already drifted: `stripe listen`, `manual_test_state.py` and the cancel and
+refund endpoints were in one list and not the other, so neither could be
+trusted without checking the other. A reader who follows a stale command finds
+out slowly.
+
+What belongs here instead is the handful of invocations that exist to explain a
+*rule* rather than to get work done, because those are arguments and not
+operations:
+
 ```bash
-docker compose up -d              # Postgres 16 + pgvector
-pip install -r requirements.txt
-python scripts/create_schema.py   # pgvector + create_all, idempotent
-python scripts/seed_catalog.py    # 30 products; --reset to rebuild
-python scripts/embed_catalog.py   # vectors + HNSW index; --force to redo
-pytest tests/ -v                  # offline and database tests
-pytest tests/ -m network          # the four that call the API and cost money
-python -m shopagent.llm.loop      # the CLI agent (local tools + MCP catalog)
-python scripts/run_mcp_server.py  # the catalog MCP server alone, on stdio
-uvicorn shopagent.api.main:app --reload --port 8000   # the commerce API
-python scripts/sync_stripe_catalog.py --dry-run       # plan the Stripe catalog sync
-python scripts/sync_stripe_catalog.py                 # create what is missing
-pytest tests/ -m stripe           # the Stripe test-mode tests; needs a key
+# The catalog's off switch. False runs the same CLI with the two local tools
+# and no MCP server, which is what makes "the product answers come from MCP"
+# demonstrable rather than asserted.
+MCP_CATALOG_ENABLED=false python -m shopagent.llm.loop
+
+# Applying a migration. The path matters: `-f /dev/stdin` from the repository
+# root, because the file is not inside the container.
+docker compose exec -T db psql -U shopagent -d shopagent \
+  -f /dev/stdin < migrations/0002_d8_processed_events.sql
+
+# The check that says whether it worked. Exit 2 on any missing column or
+# mismatched foreign key — a migrations table is deliberately absent, and this
+# is what replaces it.
+python scripts/create_schema.py; echo "exit=$?"
+
+# Reading back what the model actually searched for, on your own machine only.
+MCP_LOG_REDACT_QUERY=false python scripts/run_mcp_server.py
 ```
 
-The API's interactive docs are at `http://127.0.0.1:8000/docs`. Paste the
-`SHOPAGENT_API_KEY` into **Authorize** once and every cart and order call
-carries it; `/health` needs no key. `MCP_LOG_REDACT_QUERY=false` puts the raw
-search query back in the catalog server's log, which is worth doing only on
-your own machine.
-
-`MCP_CATALOG_ENABLED=false` runs the same CLI without the catalog server. The
-Inspector takes the script path, never `-m shopagent.mcp_server.server`, because
-it parses `-m` as one of its own flags:
+The Inspector takes the script path, never `-m shopagent.mcp_server.server`,
+because it parses `-m` as one of its own flags:
 
 ```bash
 npx @modelcontextprotocol/inspector .venv/bin/python scripts/run_mcp_server.py
 ```
+
+The API's interactive docs are at `http://127.0.0.1:8000/docs`. Paste the
+`SHOPAGENT_API_KEY` into **Authorize** once and every cart and order call
+carries it; `/health`, the two checkout pages and `/webhooks/stripe` need no
+key, each for a different reason — see the authentication rule above.

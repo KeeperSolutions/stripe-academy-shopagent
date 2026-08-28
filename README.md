@@ -36,6 +36,9 @@ python scripts/seed_catalog.py
 python scripts/embed_catalog.py
 
 # 6. migrations (commerce tables only; create_all cannot alter an existing one)
+#    Two of them today: 0001 adds the D7 customer columns to `orders`, 0002
+#    creates `processed_events`. Both are idempotent, so the loop is safe to
+#    re-run and safe on a database that already has them.
 for f in migrations/*.sql; do
   docker compose exec -T db psql -U shopagent -d shopagent -f /dev/stdin < "$f"
 done
@@ -44,12 +47,16 @@ python scripts/create_schema.py   # exits 2 if a column or foreign key is missin
 # 7. verify
 docker compose exec db psql -U shopagent -d shopagent \
   -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
-pytest tests/ -v          # 610 tests; add -m network for the 4 that call the API
+pytest tests/ -v          # 732 tests; add -m network for the 4 that call the API
 ```
 
 Step 6 matters on any database that predates a schema change: `create_all`
 creates tables that do not exist and never alters one that does, so a database
-built before D7 would silently lack `orders.customer_email`. The migrations are
+built before D7 would silently lack `orders.customer_email` and one built
+before D8 would have every table except `processed_events`. On a genuinely
+fresh database step 5 has already built both, and the migrations are then
+no-ops that print `already exists, skipping` — which is what makes running them
+unconditionally the simpler instruction. The migrations are
 idempotent, so running all of them every time is safe, and re-running
 `create_schema.py` afterwards is what confirms it — it compares the models
 against the live database and exits 2 on any gap. See CLAUDE.md for why there
@@ -76,12 +83,22 @@ npx @modelcontextprotocol/inspector \
 npx @modelcontextprotocol/inspector --cli \
   .venv/bin/python scripts/run_mcp_server.py --method tools/list   # non-interactive
 
-# the commerce API (carts, orders, checkout)
+# the commerce API (carts, orders, checkout, cancel, refund)
 uvicorn shopagent.api.main:app --reload --port 8000      # docs on :8000/docs
 
 # Stripe, test mode only; needs STRIPE_SECRET_KEY in .env
 python scripts/sync_stripe_catalog.py --dry-run          # plan, write nothing
 python scripts/sync_stripe_catalog.py                    # Products + Prices
+
+# webhooks: run this in a second terminal alongside uvicorn, then put the
+# whsec_... it prints into .env as STRIPE_WEBHOOK_SECRET
+stripe listen --forward-to localhost:8000/webhooks/stripe
+stripe trigger checkout.session.completed                # a fixture delivery
+stripe events resend evt_...                             # the same event again
+
+# before and after driving the API by hand
+python scripts/manual_test_state.py snapshot
+python scripts/manual_test_state.py restore
 
 # catalog data
 python scripts/create_schema.py         # pgvector + create_all, idempotent
@@ -89,18 +106,42 @@ python scripts/seed_catalog.py          # 30 products; --reset to rebuild
 python scripts/embed_catalog.py         # vectors + HNSW index; --force to redo
 
 # tests
-pytest tests/ -v                        # 610, offline and database
+pytest tests/ -v                        # 732, offline and database
 pytest tests/ -m network                # the 4 that call the API and cost money
-pytest tests/ -m stripe                 # the 10 that call Stripe in test mode (free)
+pytest tests/ -m stripe                 # the 16 that call Stripe in test mode (free)
 ```
 
 Paying goes through a Stripe Checkout Session: `POST /orders/{id}/checkout`
 returns a URL, and the test card is `4242 4242 4242 4242` with any future date
-and any CVC. The order stays `pending` after a successful payment, on purpose —
-the success redirect is a URL anybody can open, so only D8's webhook may mark an
-order paid. `line_items` are built from the `order_items` snapshot rather than
+and any CVC. The order stays `pending` when the browser lands back on the
+success page — that redirect is a URL anybody can open — and moves to `paid`
+only when `POST /webhooks/stripe` receives a signed `checkout.session.completed`
+from Stripe. `line_items` are built from the `order_items` snapshot rather than
 from the Stripe Prices that `sync_stripe_catalog.py` writes; CLAUDE.md explains
 why those are two separate things.
+
+`POST /orders/{id}/cancel` is the other way an order ends, and the only one a
+person drives directly. It applies to a `pending` order — never a `paid` one,
+because once a charge settles the way back is a refund — releases the reserved
+stock, and expires the Checkout Session so the payment URL stops working. A
+second cancel is 409: `cancelled` is terminal, which is what stops the same
+reservation being handed back twice.
+
+Refunds work the same way round. `POST /orders/{id}/refund` asks Stripe for a
+full refund and answers **202**: the order is still `paid` when it returns, and
+`charge.refunded` is what moves it to `refunded` and releases the reserved
+stock. A partial refund — which only the Stripe dashboard can issue here —
+arrives as the same event and deliberately changes nothing, because there is no
+status between `paid` and `refunded` and releasing the whole reservation for
+part of the money would be worse than leaving it alone. It is logged at ERROR.
+
+**`stripe listen` cannot be pinned to an API version.** It renders events at
+the account's default version, or at Stripe's newest with `--latest`, and there
+is no `--stripe-version` flag — so neither necessarily matches the
+`STRIPE_API_VERSION` this repo pins. The mismatch is harmless (a signature is
+computed over bytes) and the webhook logs a warning naming both versions, which
+means that warning appears on every local delivery. Do not go looking for a
+flag to silence it.
 
 The API and the catalog reach the model over different protocols on purpose:
 products come through MCP, carts and orders over HTTP. `/docs` is the fastest way

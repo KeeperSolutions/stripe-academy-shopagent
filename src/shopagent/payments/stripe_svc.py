@@ -113,6 +113,24 @@ def retrieve_account() -> Any:
     return get_client().v1.accounts.retrieve_current()
 
 
+@lru_cache(maxsize=1)
+def configured_account_id() -> str:
+    """The Stripe account this process's key belongs to, fetched once.
+
+    Cached because the answer cannot change while the process runs: the key is
+    read at configuration time and an account id is not something Stripe
+    reassigns. One network call per process, and only if something asks — see
+    `api/services/events.py`, which asks only for events that carry an
+    `account` field.
+
+    `lru_cache` does not cache exceptions, which is the behaviour wanted here
+    rather than a detail to work around: a failed lookup is a transient Stripe
+    problem, and caching it would mean one bad moment at startup disables the
+    check for the life of the process.
+    """
+    return retrieve_account().id
+
+
 def in_test_mode() -> bool:
     """Whether this key is operating against Stripe's test data.
 
@@ -333,3 +351,89 @@ def delete_customer(customer_id: str) -> Any:
     `stripe`-marked tests leave nothing behind.
     """
     return get_client().v1.customers.delete(customer_id)
+
+
+# --- webhooks (D8 step 1) ------------------------------------------------
+
+
+# Re-exported so a caller can name the failure without importing the SDK. The
+# router has to tell "this was not signed by Stripe" (400) apart from every
+# other exception, and `except Exception` there would swallow bugs in our own
+# code and answer 400 to them — a response Stripe reads as "malformed", never
+# retries, and which therefore loses the delivery for good.
+SignatureVerificationError = stripe.SignatureVerificationError
+
+# Re-exported for the same reason: `events.py` has to tell "Stripe refused this
+# request" apart from "Stripe could not be reached", because the first is
+# permanent and the second is worth a retry — and `payments/stripe_svc.py` is
+# the only module allowed to import `stripe`.
+InvalidRequestError = stripe.InvalidRequestError
+
+
+# What Stripe allows between the timestamp it signed and the moment we verify.
+# Five minutes, and it is the SDK's own default rather than a number chosen
+# here — named so the tolerance is a value this repo can assert on instead of
+# one buried in a call. Its job is to stop a captured delivery being replayed
+# later: the signature stays valid forever, the timestamp inside it does not.
+#
+# Note what it does *not* do — `verify_header` compares `timestamp < now -
+# tolerance` and nothing else, so a timestamp in the future passes however far
+# ahead it is. That is Stripe's behaviour, not an oversight here, and it is
+# harmless for the same reason the rest works: forging a future timestamp still
+# needs the signing secret.
+WEBHOOK_TOLERANCE_SECONDS = stripe.Webhook.DEFAULT_TOLERANCE
+
+
+def construct_webhook_event(payload: bytes, sig_header: str, secret: str) -> Any:
+    """Verify a webhook's signature and return the event it carries.
+
+    One SDK call, wrapped for the reason every other function in this module
+    is: `stripe` is imported here and nowhere else, so the router that handles
+    deliveries can be exercised by replacing one name. It holds no decision —
+    what to do with an event, and which failure becomes which status code,
+    belongs to the caller.
+
+    `payload` must be the bytes that arrived. Verification recomputes an HMAC
+    over `timestamp + "." + body`, so a body that was parsed and re-serialised
+    is a different string — different whitespace, different key order — and
+    signs to a different digest. It would fail some of the time rather than
+    all of the time, which is worse than failing outright.
+
+    Raises `stripe.SignatureVerificationError` for a bad, stale or unparseable
+    signature header, and `ValueError` (`json.JSONDecodeError`) when the body
+    signed correctly but is not JSON.
+    """
+    return stripe.Webhook.construct_event(payload, sig_header, secret)
+
+
+# --- refunds (D8 step 4) -------------------------------------------------
+
+
+def create_refund(
+    payment_intent_id: str, *, idempotency_key: str | None = None
+) -> Any:
+    """Refund a PaymentIntent in full.
+
+    No `amount` parameter, and that absence is the interface. Stripe supports
+    partial refunds; this project has nowhere to put one — `orders.status` has
+    a `refunded` value and no notion of "partly refunded", and inventing one
+    from a route argument would produce orders in a state nothing else can
+    read. A partial refund issued from the dashboard still *arrives* here as a
+    `charge.refunded` event, and `api/services/events.py` refuses to act on it
+    and says so loudly. This is the same boundary drawn from the other side.
+
+    The idempotency key is what stops a double refund, and it is doing real
+    work rather than being defensive. `refund_order` locks the order row, but
+    the row does not change — the status stays `paid` until the webhook
+    arrives — so two requests seconds apart both read a refundable order and
+    both reach this call. A key derived from the order makes the second one
+    return Stripe's record of the first instead of moving money twice.
+
+    Twenty-four hours is the window Stripe honours, which is exactly the gap
+    that needs covering: after it, the webhook has long since moved the order
+    to `refunded` and the lifecycle refuses a second attempt outright.
+    """
+    return get_client().v1.refunds.create(
+        params={"payment_intent": payment_intent_id},
+        options={"idempotency_key": idempotency_key} if idempotency_key else None,
+    )

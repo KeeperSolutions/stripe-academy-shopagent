@@ -104,6 +104,11 @@ class Settings(BaseSettings):
     # would be the wrong failure. A missing key therefore surfaces at the
     # moment something needs it — see `payments/stripe_svc.py` — not at import.
     stripe_secret_key: OptionalStr = None
+    # The signing secret `stripe listen` prints, or the one a dashboard
+    # endpoint shows. Optional for the same reason the key above is: a shop
+    # that cannot receive webhooks is a shop with a gap in its payment flow,
+    # not a broken process — `POST /webhooks/stripe` answers 503 when this is
+    # absent, and every other route is unaffected.
     stripe_webhook_secret: OptionalStr = None
 
     @field_validator("stripe_secret_key")
@@ -130,6 +135,42 @@ class Settings(BaseSettings):
                 "STRIPE_SECRET_KEY is a live key. This project runs in test "
                 "mode only — a live key here charges real cards. Use the key "
                 "beginning sk_test_ from the Stripe dashboard's test mode."
+            )
+        return value
+
+    @field_validator("stripe_webhook_secret")
+    @classmethod
+    def _refuse_a_secret_that_is_not_a_signing_secret(cls, value: str | None) -> str | None:
+        """A webhook secret that is not one fails in the quietest way available.
+
+        Every signing secret Stripe issues begins `whsec_` — the one
+        `stripe listen` prints and the one a dashboard endpoint shows. The
+        mistake this catches is pasting the API key into the wrong line, which
+        is easy because both live in the same block of `.env` and both are
+        opaque strings.
+
+        Without the check the consequence is invisible from the server's side:
+        verification fails, every delivery is answered 400, Stripe retries and
+        eventually gives up, and no order is ever marked paid. Nothing logs an
+        error that names the cause, because from the endpoint's point of view
+        it merely received a stream of badly signed requests.
+
+        Refusing here is deliberately harsher than a missing secret, which
+        leaves the app running and answers 503 at the endpoint. Absent is a
+        state a developer chose — payments are one part of this system and the
+        cart works without them. Present-and-wrong is a typo, and the last
+        moment it is free is configuration time. Same reasoning as the live-key
+        check above, and the same prefix-not-network mechanism.
+        """
+        if value is None:
+            return None
+        if not value.startswith("whsec_"):
+            raise ValueError(
+                "STRIPE_WEBHOOK_SECRET does not look like a signing secret. "
+                "Stripe's begin with whsec_ — this is probably the API key, or "
+                "an endpoint id. Run `stripe listen --forward-to "
+                "localhost:8000/webhooks/stripe` and copy the whsec_... it "
+                "prints, or read it from the endpoint's page in the dashboard."
             )
         return value
 

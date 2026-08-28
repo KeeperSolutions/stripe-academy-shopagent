@@ -31,7 +31,9 @@ from the thing that catches the bug into the thing that never has to.
 
 from __future__ import annotations
 
+import logging
 import uuid
+from typing import Any
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -48,6 +50,8 @@ from shopagent.api.models import Cart, CartItem, CartStatus, Order, OrderItem
 from shopagent.api.services.cart import CartNotFound, variant_label
 from shopagent.catalog.models import Inventory, Price, Product, Variant
 from shopagent.payments import stripe_svc
+
+logger = logging.getLogger(__name__)
 from shopagent.payments.stripe_svc import MissingStripeKey
 from shopagent.config import get_settings
 
@@ -426,7 +430,11 @@ def _release_reservation(session: Session, order: Order) -> None:
 
 
 def apply_transition(
-    session: Session, order: Order, new_status: OrderStatus
+    session: Session,
+    order: Order,
+    new_status: OrderStatus,
+    *,
+    updates: dict[str, Any] | None = None,
 ) -> TransitionEffects:
     """Move an order's status and carry out whatever that implies.
 
@@ -441,6 +449,22 @@ def apply_transition(
 
     Raises `IllegalTransition` untouched: the router maps it to 409, and the
     lifecycle's own message already names both statuses.
+
+    `updates` are columns that belong to this move and to nothing else —
+    `stripe_payment_intent_id`, written when a checkout completes. They are
+    assigned to the **locked** row, after `transition()` has allowed the move
+    and before the commit, so they reach the database only if the status does.
+
+    That they are applied here rather than by the caller is the second
+    correction to the same mistake, both raised in review on PR #8. The first
+    version had the caller assign the column and then ask for the transition;
+    the second moved the assignment into `_move`, past its unlocked preflight,
+    which read as safe and was not. Any assignment made before this function
+    runs is dirty on the Session when the `SELECT ... FOR UPDATE` below
+    triggers an autoflush, so the UPDATE is already issued by the time
+    `transition()` refuses — and `expire()` afterwards drops the attribute
+    without undoing the statement, leaving the webhook router to commit it.
+    Only an assignment made after the locked check cannot outlive a refusal.
     """
     # Lock the row before reading the status that decides whether stock moves.
     # Without it two concurrent callers — a refund arriving twice from D8, say —
@@ -452,11 +476,36 @@ def apply_transition(
     # belongs here rather than in each caller: a caller that forgot the lock
     # would be exactly as invisible as the caller that forgot the release, and
     # that is what concentrating this function was meant to prevent.
-    locked = session.scalar(select(Order).where(Order.id == order.id).with_for_update())
+    # `populate_existing` is what makes the lock mean something. Without it the
+    # refresh is a default rather than a guarantee: this order is usually
+    # already in the Session's identity map — `_load_order` in
+    # `services/events.py` put it there — and an ORM select that returns an
+    # instance it already holds is not obliged to overwrite the attributes it
+    # loaded earlier. If it did not, a caller that waited behind a concurrent
+    # transition would then evaluate the status it read *before* the wait, and
+    # two refunds could each release the same reservation.
+    #
+    # Measured on SQLAlchemy 2.0.52, `with_for_update()` does refresh; asking
+    # explicitly costs nothing and turns that from an observation into part of
+    # the statement. Raised in review on PR #8, and
+    # `test_two_concurrent_transitions_release_the_reservation_once` is the
+    # check that would catch it changing.
+    locked = session.scalar(
+        select(Order)
+        .where(Order.id == order.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if locked is None:
         raise OrderNotFound(f"no order with id {order.id}")
 
     effects = transition(locked, new_status)
+
+    # After the check, never before it. This is the only point at which the
+    # move is certain, and an assignment made any earlier survives a refusal —
+    # see the docstring.
+    for column, value in (updates or {}).items():
+        setattr(locked, column, value)
 
     if effects.releases_reservation:
         _release_reservation(session, locked)
@@ -481,7 +530,7 @@ def cancel_order(session: Session, order_id: uuid.UUID) -> Order:
     open across a network round trip, which is what `attach_customer` avoids
     for the same reason.
     """
-    order = _lock_cart_free_order(session, order_id)
+    order = lock_order(session, order_id)
 
     # Refuse an illegal cancellation *before* touching Stripe. Expiring the
     # session of an order that is then refused would be a side effect with no
@@ -519,16 +568,129 @@ def cancel_order(session: Session, order_id: uuid.UUID) -> Order:
     return order
 
 
-def _lock_cart_free_order(session: Session, order_id: uuid.UUID) -> Order:
+def lock_order(session: Session, order_id: uuid.UUID) -> Order:
     """Load an order for update, without touching its cart.
 
     `FOR UPDATE` because the status is about to be read and then written, and
     two concurrent cancellations reading `pending` would both proceed — the
     second releasing stock that the first already gave back.
+
+    Public, and named for what it does rather than for who first needed it,
+    because `services/events.py` needs it too: a webhook that decides whether
+    to cancel by comparing a column has to read that column under the same
+    lock the transition will take, or the comparison is about a row somebody
+    else is free to change in between. Re-locking a row this transaction
+    already holds is free in Postgres, so taking it here and again inside
+    `apply_transition` costs nothing. Raised in review on PR #8.
+
+    `populate_existing` for the same reason `apply_transition` asks for it, and
+    here it is not a precaution: the caller in `services/events.py` has already
+    loaded this order, so it is in the Session's identity map, and without this
+    the select returns that instance with the attributes it was loaded with.
+    The point of the lock is to read a column *after* waiting, so a cached read
+    defeats it entirely — `test_a_second_checkout_started_during_the_stripe_call
+    _stops_the_expiry` fails without it, which is how this was found.
     """
     order = session.scalar(
-        select(Order).where(Order.id == order_id).with_for_update()
+        select(Order)
+        .where(Order.id == order_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if order is None:
         raise OrderNotFound(f"no order with id {order_id}")
     return order
+
+
+class OrderNotRefundable(OrderError):
+    """Raised when an order cannot be refunded in the state it is in.
+
+    Distinct from `IllegalTransition`, which the lifecycle raises about a
+    *status* move. This one also covers an order whose status permits a refund
+    but which has no PaymentIntent to refund against — a state the system is
+    not supposed to be able to reach.
+    """
+
+
+def refund_order(session: Session, order_id: uuid.UUID) -> Any:
+    """Ask Stripe to refund an order in full. Does not change its status.
+
+    **The status moves on `charge.refunded`, not here**, and it is the same
+    argument D7 made about the success redirect: a successful API call is not
+    the same event as money arriving back. A refund can be `pending` for days
+    on some payment methods, and it can fail after being accepted. Writing
+    `refunded` because the call returned would put the order in a terminal
+    state describing something that has not happened yet — and terminal means
+    there is no way to correct it.
+
+    So this issues the refund and returns Stripe's object. The webhook is what
+    moves the order, which also means a refund issued from the Stripe dashboard
+    lands in exactly the same place as one issued here.
+
+    Nothing is written to the database. There is deliberately no `refund_id`
+    column: it would be a second record of a fact Stripe already owns, it would
+    need a migration, and its only real job — stopping a double refund — is
+    done better by an idempotency key derived from the order id. See
+    `stripe_svc.create_refund`.
+
+    The row is still locked. It does not serialise the *Stripe* call in any
+    useful way, because the status does not change and a second caller would
+    read the same refundable order; what it does is make the status check and
+    the call atomic with respect to `apply_transition`, so a refund cannot be
+    issued against an order that a webhook is concurrently moving to
+    `refunded`.
+    """
+    order = lock_order(session, order_id)
+
+    # Checked before Stripe is touched, for the reason `cancel_order` gives:
+    # a refund issued against an order that is then refused would be money
+    # moved with no transaction to undo it.
+    check_transition(OrderStatus(order.status), OrderStatus.REFUNDED)
+
+    if not order.stripe_payment_intent_id and order.total_amount_cents == 0:
+        # Not a defect, and the branch below would have called it one. A
+        # zero-total order is schema-legal — `total_amount_cents >= 0` and
+        # `prices.amount_cents >= 0` — and Stripe settles such a checkout with
+        # `payment_status="no_payment_required"`, which
+        # `SETTLED_PAYMENT_STATUSES` deliberately accepts. The session then
+        # names no PaymentIntent, so the order is legitimately paid with
+        # nothing to refund. Raised in review on PR #8: this file allowed that
+        # order to exist and the next branch declared it impossible.
+        raise OrderNotRefundable(
+            f"order {order_id} was placed for {order.currency} 0 and nothing "
+            "was ever charged, so there is nothing to refund."
+        )
+
+    if not order.stripe_payment_intent_id:
+        # With a positive total this really is not a state a shopper can
+        # produce. An order becomes `paid` only through
+        # `checkout.session.completed` or its async twin, and both write the
+        # PaymentIntent id in the same transaction as the status — so a `paid`
+        # order that was charged for something and has no PaymentIntent means
+        # this project has a bug, or somebody edited the row.
+        #
+        # Logged at ERROR because of that, and answered 409 anyway: from the
+        # caller's side the order genuinely cannot be refunded, no retry
+        # changes it, and 500 would invite one while telling them nothing. The
+        # status code is for the client; the log line is for us.
+        logger.error(
+            "order %s is %s but has no stripe_payment_intent_id, which should "
+            "be impossible: checkout.session.completed writes that column in "
+            "the same transaction that sets the status. Refusing the refund",
+            order.id,
+            order.status,
+        )
+        raise OrderNotRefundable(
+            f"order {order_id} has no recorded payment to refund. Its status "
+            "says it was paid, so this is a defect in this server rather than "
+            "something to retry — the payment has to be refunded from the "
+            "Stripe dashboard."
+        )
+
+    return stripe_svc.create_refund(
+        order.stripe_payment_intent_id,
+        # Derived from the order, never random, by the rule D7 wrote down: a
+        # random key would make every retry a fresh refund, which is the exact
+        # failure the key exists to prevent.
+        idempotency_key=f"shopagent-refund-v1-{order.id}",
+    )

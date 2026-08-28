@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from shopagent.api.db import get_session
 from shopagent.api.lifecycle import IllegalTransition
 from shopagent.api.schemas import (
+    RefundResponse,
     CheckoutSessionResponse,
     CreateOrderRequest,
     OrderItemResponse,
@@ -36,6 +37,7 @@ from shopagent.api.services import orders as order_service
 from shopagent.payments import customers as customer_service
 from shopagent.api.services.cart import CartNotFound
 from shopagent.api.services.orders import (
+    OrderNotRefundable,
     CartAlreadyOrdered,
     CartEmpty,
     LineNotPriceable,
@@ -208,3 +210,65 @@ def cancel_order(
         ) from exc
 
     return _to_response(order_service.render_order(session, order_id))
+
+
+@router.post(
+    "/{order_id}/refund",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=RefundResponse,
+)
+def refund_order(
+    order_id: uuid.UUID, session: Session = Depends(get_session)
+) -> RefundResponse:
+    """Ask Stripe to refund a paid order. The order does not change here.
+
+    **202, not 200**, and the difference is the whole contract. 200 would say
+    the thing asked for is done; what is done is that Stripe accepted the
+    request. The order is still `paid` when this returns, and it stays `paid`
+    until `charge.refunded` arrives — which for a card is usually seconds and
+    for some payment methods is days. A caller that polls
+    `GET /orders/{id}` after a 200 and sees `paid` would reasonably conclude
+    the refund failed; after a 202 it is reading exactly what 202 promised.
+
+    The response names the unchanged `order_status` for the same reason. It is
+    the field that would otherwise be assumed.
+
+    409 covers two different sentences, deliberately. The lifecycle refuses a
+    refund from any status but `paid` and `fulfilled`, which is the ordinary
+    case — a pending order was never charged, a refunded one already went
+    back. The second is an order that *is* paid but has no recorded
+    PaymentIntent: impossible by design, logged at ERROR as a defect, and
+    still a 409 because from the caller's side the order simply cannot be
+    refunded and no retry will change that.
+    """
+    try:
+        refund = order_service.refund_order(session, order_id)
+    except OrderNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except IllegalTransition as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+    except OrderNotRefundable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+    except MissingStripeKey as exc:
+        # The capability is absent, the server is not broken — the same 503
+        # the checkout route answers, for the same reason.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+
+    order = order_service.render_order(session, order_id)
+
+    return RefundResponse(
+        order_id=order_id,
+        refund_id=refund.id,
+        refund_status=getattr(refund, "status", None),
+        amount_cents=getattr(refund, "amount", None),
+        currency=getattr(refund, "currency", None),
+        order_status=order.status,
+    )

@@ -139,3 +139,28 @@ class CheckoutSessionResponse(BaseModel):
     order_id: uuid.UUID
     checkout_session_id: str
     checkout_url: str
+
+
+class RefundResponse(BaseModel):
+    """What a refund request has set in motion — not what it has finished.
+
+    Every field here describes the *refund*, and `order_status` is included
+    precisely because it will still read `paid`. That is the point of the
+    response rather than an omission: the money has not moved yet, the order
+    has not changed, and a caller that reads this and assumes otherwise has
+    been misled by the shape of the payload. Naming the unchanged status is
+    what makes the 202 legible.
+
+    `refund_status` is Stripe's, and it is usually `succeeded` immediately for
+    a card — which is exactly why the order status sits next to it. Even a
+    succeeded refund does not move this order; `charge.refunded` does.
+    """
+
+    order_id: uuid.UUID
+    refund_id: str
+    refund_status: str | None
+    amount_cents: int | None
+    currency: str | None
+    # Reported as it stands *now*, which is the status the refund has not yet
+    # changed. `refunded` arrives by webhook.
+    order_status: OrderStatus

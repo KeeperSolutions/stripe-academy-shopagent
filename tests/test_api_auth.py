@@ -45,7 +45,22 @@ pytestmark = pytest.mark.db
 # a session id can do is read the status of a payment they would have had to
 # make. Adding a route here has to be this deliberate: the sweep below found
 # both of them on the day they were mounted.
-PUBLIC_PATHS = {"/health", "/checkout/success", "/checkout/cancel"}
+#
+# `/webhooks/stripe` is public for a different reason and the difference is the
+# point. Stripe has no `X-API-Key` to send: it signs the request body with a
+# shared secret and puts the digest in `Stripe-Signature`, so the signature is
+# the credential, and behind `require_api_key` every genuine delivery would be
+# refused 401 while nothing extra was let in. Unlike the checkout pages this
+# route *does* write from step 2 onwards, so its safety rests on verification
+# running before anything else in the handler rather than on being read-only —
+# which is what makes the refusals in `tests/test_webhooks.py` load-bearing
+# here rather than merely thorough.
+PUBLIC_PATHS = {
+    "/health",
+    "/checkout/success",
+    "/checkout/cancel",
+    "/webhooks/stripe",
+}
 
 # Any UUID will do — the sweep asserts the request is refused before a handler
 # ever looks at it, so the value only has to parse.
@@ -260,6 +275,29 @@ def test_the_public_checkout_pages_only_read():
                 f"{route.path} accepts {sorted(route.methods)} while mounted "
                 "without authentication"
             )
+
+
+def test_the_webhook_endpoint_accepts_only_post():
+    """The same shape of check the public checkout pages get, inverted.
+
+    Those two are safe because they only read; this one is safe because it
+    verifies a signature, and both claims are worth pinning to the route table
+    rather than to a docstring. A `GET /webhooks/stripe` added for convenience
+    — to eyeball the last event, say — would be an unauthenticated read of
+    payment data, and it would arrive without anyone revisiting the decision to
+    mount this router in the open.
+    """
+    methods = {
+        method
+        for route in walk_api_routes(app.routes)
+        if route.path == "/webhooks/stripe"
+        for method in route.methods - {"HEAD", "OPTIONS"}
+    }
+
+    assert methods == {"POST"}, (
+        f"/webhooks/stripe accepts {sorted(methods)} while mounted without "
+        "authentication; only the signed POST from Stripe belongs here"
+    )
 
 
 def test_the_route_walk_sees_everything_openapi_does():
