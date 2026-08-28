@@ -967,270 +967,443 @@ for days it is not a window at all. This is the concrete number behind
 choosing 202, and behind naming the unchanged `order_status` in the response
 body.
 
+**What review found, and the one thing it got wrong.** Eight comments on
+PR #8; seven were real. The two worth recording are both cases where the code
+and its own docstring disagreed and the docstring won the argument in my head.
+
+`handle_checkout_completed` assigned `stripe_payment_intent_id` and then called
+`_move`, with a comment saying "`_move` checks the transition first, so this
+cannot be stranded". The check is inside `_move`; the assignment was outside
+it. A refusal returned `False` without undoing anything and the router's
+`commit()` wrote the column anyway — so a second `checkout.session.completed`
+for an order already `paid` would overwrite the PaymentIntent the refund
+endpoint spends with one from a session that may never have been charged. The
+comment described the design I meant rather than the code I wrote, and I read
+it back as evidence.
+
+The same shape one branch further down: on a lost race `_move` rolled the
+session back and logged "Stripe's retry will find the settled state" — but the
+handler returned normally and the router answered 200, which is exactly the
+instruction not to retry. The rollback also discarded the `processed_events`
+claim, so the delivery ended up recorded nowhere *and* acknowledged. Two
+sentences that were each individually sensible and jointly impossible.
+
+**`checkout.session.completed` does not mean the money arrived**, which I had
+assumed without checking — the one substantive gap that was not a
+self-contradiction. Delayed-notification payment methods produce that event
+with `payment_status="unpaid"` and settle later through
+`async_payment_succeeded`. Nothing in this project restricts
+`payment_method_types`, so the set of methods is a dashboard setting the code
+does not control; the handler was marking orders paid on the strength of an
+event name.
+
+**A guard's coverage is a property of the path it sits on.** `config.py`
+refuses live API keys, and I had been treating that as "live events cannot
+reach this code" — including in the reasoning for storing `livemode` on
+`processed_events`, where I had already noticed the webhook secret is a
+separate credential and then failed to draw the conclusion. A live signing
+secret verifies exactly like a test one, so real customer events would have
+moved this database's orders. `handle_event` now stops before dispatch on
+`livemode`.
+
+**The wrong one is worth keeping too.** Review argued that
+`apply_transition`'s `SELECT ... FOR UPDATE` returns an identity-mapped `Order`
+without refreshing it, so a caller waiting behind a concurrent transition would
+read a stale status and release a reservation twice. Measured on SQLAlchemy
+2.0.52 with two threads on one order: the loser reads the settled status and is
+refused. The mechanism described is real SQLAlchemy behaviour for ordinary
+selects, just not for this one.
+
+But the objection landed on something true anyway. That layer had only ever
+been asserted by reading emitted SQL for the string `FOR UPDATE`, which would
+pass identically if the behaviour changed — the same class of test D7 called
+out for comparing a variable to itself. It is now two connections and one
+order, and `populate_existing=True` is requested explicitly so the refresh is
+part of the statement rather than a default that happened to hold.
+
+**A cleanup script that restores by truncation destroys what it was protecting.**
+`manual_test_state.py` recorded counts, so `restore` deleted every commerce row
+— including rows that existed before the snapshot. For `processed_events` that
+is worse than data loss: deleting an old claim lets a redelivery of that event
+be processed a second time, which is precisely the failure the table exists to
+prevent. It now stores primary keys and deletes only the difference. The script
+written to stop me restoring to a remembered constant was itself restoring to a
+remembered constant.
+
 ## Known gaps
 
-**A partial refund has no representation in this system.** `orders.status` has
-`paid` and `refunded` and nothing between, so a partially refunded order stays
-`paid` and the only record is an ERROR line. That is the right refusal today —
-inventing a status a week early would be a guess, and `refunded` is terminal so
-the wrong half of the guess is unrecoverable — but it means money can move in a
-way the database will never reflect. The fix is not a status: it is a
-`refunds` table recording each refund against an order, with the order's status
-derived from the sum. That is a real schema change and belongs to whatever day
-actually needs partial refunds.
+Every entry carries the day it was written. **Open** entries are grouped by
+area; **Closed** ones keep their original text and gain a paragraph saying what
+closed them, because the reasoning that turned out to be wrong is usually worth
+more than the reasoning that held.
 
-**Nothing retries from our side once Stripe gives up.** Stripe redelivers for
-three days and then stops. If this server is down for longer, or answers 500
-for longer, those events are gone and the orders they described stay in
-whatever status they had — a paid order stuck at `pending`, with its stock
+The grouping arrived on D8, after three entries went stale unnoticed — one of
+them claiming a protection did not exist while it did. A flat list of thirty
+paragraphs means "is this still true" can only be answered by reading all of
+them, and D9 and D10 will double it.
+
+---
+
+### Open — inventory and orders
+
+**`quantity` is never decremented, because there is no fulfilment flow.** *(D6,
+half closed on D7 — see below.)* `place_order` adds to `inventory.reserved`,
+and units leave `quantity` only when goods physically move. `fulfilled` is a
+status nothing transitions into automatically, so there is no moment at which
+decrementing would be correct, and available stock is `quantity - reserved`
+everywhere as a result.
+
+That is the half that is still open, and it is a fulfilment design this project
+does not have rather than a missing line of code. Deciding when units leave
+`quantity` means deciding what shipping means here, which nothing yet requires.
+
+*The other half — that `cancelled` and `refunded` did not release a
+reservation — was closed on D7 and verified end to end on D8. See "Reservations
+were never released" under Closed.*
+
+**A cart line with no active price passes in the cart and fails at the order.**
+*(D6.)* Deliberate on both sides — a cart that silently drops an item is worse
+than one showing an item it cannot price, and a line missing from an order is
+goods that ship and are never charged for — but the consequence is a shopper
+who can hold a cart that cannot be bought, and only finds out at checkout.
+Nothing warns them earlier. A flag on the cart response would be the obvious
+improvement and was not added, because inventing a field the plan does not
+describe is how a response shape stops being reviewable.
+
+**The advisory stock check can tell two shoppers the same units are free.**
+*(D6.)* `services/cart.py` reads `quantity - reserved` with no lock and writes
+nothing, by design: a cart is a statement of intent. The authoritative check
+under `FOR UPDATE` is in `place_order`. The gap is a user-experience one rather
+than a correctness one — two people can both fill a cart and only one can buy —
+which is the right trade for a basket and would be the wrong trade anywhere
+money moves.
+
+**`orders.cart_id` is UNIQUE, so a cancelled order's cart cannot be reordered.**
+*(D6, revisited on D8 and kept.)* The constraint closes a real race — two
+concurrent `POST /orders` on one cart — and costs nothing while `ordered` is
+terminal for a cart. But after a `cancelled` or `refunded` order, the cart that
+produced it is permanently unusable: the only path is a new cart with the same
+lines re-added.
+
+D6 promised to revisit this "when a cancellation actually happens". They now
+happen without a person involved, through `checkout.session.expired`, so the
+promise is due — and the answer is to keep the constraint.
+
+Two reasons. Reusing the cart would mean reopening it, which means
+`ordered -> open` on a cart whose order may have charged and refunded money;
+the cart status table would have to grow the same "which way back is legal"
+problem the order lifecycle exists to solve, for a resource that is a
+scratchpad. And the concrete cost is small in a way that is easy to measure:
+the shopper re-adds lines they already chose, against a catalog that may have
+changed price since — which is the more honest starting point anyway.
+
+What would change the answer is a *user* who owns carts across sessions,
+because then "my basket vanished" becomes a real complaint rather than a
+re-click. D9 introduces long-term memory, and if it grows a notion of a user's
+saved basket, the right fix is a "copy this order into a new cart" operation
+rather than dropping the constraint.
+
+---
+
+### Open — Stripe and payments
+
+**A partial refund has no representation in this system.** *(D8.)*
+`orders.status` has `paid` and `refunded` and nothing between, so a partially
+refunded order stays `paid` and the only record is an ERROR line. That is the
+right refusal today — inventing a status a week early would be a guess, and
+`refunded` is terminal so the wrong half of the guess is unrecoverable — but it
+means money can move in a way the database will never reflect. The fix is not a
+status: it is a `refunds` table recording each refund against an order, with the
+order's status derived from the sum. That is a real schema change and belongs to
+whatever day actually needs partial refunds.
+
+**Nothing reconciles a charge against an order total.** *(D7, still open after
+D8.)* `amount_total` on the session was asserted equal to
+`orders.total_amount_cents` by a test, but no running code checks it, and the
+balance transaction settles in a different currency again — the $284.97 charge
+D7 measured settled as `amount=24469, fee=1285, net=23184`.
+
+D7 wrote that "whoever adds refunds on D8 will need that reconciliation to be
+real rather than a test fixture". D8 added refunds and did not add it, which is
+worth stating plainly rather than leaving as a prediction. The refund path made
+it more pointed rather than less: `create_refund` sends no `amount`, so it
+refunds whatever Stripe thinks the charge was, and nothing compares that against
+what this database thinks the order cost. A test proves the two agree at
+creation time; nothing proves it at refund time, and a dashboard price edit
+between the two would go unnoticed.
+
+Concretely, what is missing is a check inside `handle_charge_refunded` and
+`handle_checkout_completed` comparing the event's `amount` against
+`orders.total_amount_cents`, logging at ERROR when they differ. It is small.
+It was not written because D8 had no failing case to point at, which is exactly
+the reasoning that leaves a gap open for a second day.
+
+**Nothing retries from our side once Stripe gives up.** *(D8.)* Stripe
+redelivers for three days and then stops. If this server is down for longer, or
+answers 500 for longer, those events are gone and the orders they described stay
+in whatever status they had — a paid order stuck at `pending`, with its stock
 reserved. `events.list()` makes a reconciliation sweep straightforward (fetch
 recent events, skip the ones in `processed_events`, replay the rest through
 `handle_event`), and the idempotency work is already done, which is what would
 make such a sweep safe to run at any time. It is not built.
 
+**Nothing bounds the growth of `processed_events`.** *(D8.)* One row per
+delivery, for ever, with no pruning. Harmless at this scale and a real question
+at any other: rows older than Stripe's three-day retry window can no longer
+prevent anything, because no delivery that old will arrive again. A periodic
+delete on `processed_at` is the whole fix, and it is not written.
+
 **`stripe listen` cannot be pinned to an API version, so the mismatch warning
-fires on every local delivery.** The CLI offers the account's default version
-or `--latest` and nothing between; measured on this account, the default is
-`2026-06-24.dahlia` and `--latest` is `2026-08-26.dahlia`, while
+fires on every local delivery.** *(D8.)* The CLI offers the account's default
+version or `--latest` and nothing between; measured on this account, the default
+is `2026-06-24.dahlia` and `--latest` is `2026-08-26.dahlia`, while
 `STRIPE_API_VERSION` pins `2026-07-29.dahlia`. There is no `--stripe-version`
 flag, which an earlier draft of the warning text wrongly advertised. So the
 warning is correct and permanently noisy in development, and a warning people
-learn to scroll past is one that will not be read on the day it means
-something. The honest fixes are to upgrade the account's default to match the
-pin, or to downgrade the warning to INFO for the specific local case — neither
-was done, because both trade a real signal for quiet.
+learn to scroll past is one that will not be read on the day it means something.
+The honest fixes are to upgrade the account's default to match the pin, or to
+downgrade the warning to INFO for the specific local case — neither was done,
+because both trade a real signal for quiet.
 
-**Nothing bounds the growth of `processed_events`.** One row per delivery, for
-ever, with no pruning. Harmless at this scale and a real question at any other:
-rows older than Stripe's three-day retry window can no longer prevent anything,
-because no delivery that old will arrive again. A periodic delete on
-`processed_at` is the whole fix, and it is not written.
-
-**The webhook endpoint trusts that it is reachable only by Stripe *for
-authenticity*, not for load.** Signature verification means nothing unsigned is
-acted on, but every request still costs a body read and an HMAC before it is
-refused. There is no rate limit and no request size cap, so an unauthenticated
-caller can make this endpoint do work. D6 named the same gap for the API as a
-whole; this route makes it slightly more pointed by being the one address that
-must stay open to the internet.
-
-**The CLI does not stream while tools are in play.** `chat_with_tools` is a
-blocking call; `stream_chat` still exists and is still tested, but nothing
-drives it now. Streaming a tool call means accumulating deltas per `index`: the
-function name arrives in one chunk, the arguments in fragments spread over the
-next several, and the `id` only once. Reassembling that is bookkeeping that
-would have buried the chaining D2 exists to demonstrate. Worth revisiting once
-the loop itself is settled.
-
-**Function calling currently runs without reasoning, and that is unresolved.**
-`reasoning_effort='none'` is the price of using function tools on Chat
-Completions with `gpt-5.6-luna`. For D2 it costs nothing visible: two
-independent tools, and the model still chained them correctly. D9 is the
-worry — five commerce tools with real interdependencies (search → check stock →
-add to cart → view cart → checkout), where picking the next call *is* the
-reasoning. Whether a non-reasoning model holds that chain together is untested.
-Options if it does not: move to the Responses API, which supports tools with
-reasoning but keeps conversation state server-side and would hide the loop this
-project exists to show, or switch to a model without the restriction. Neither
-is free, and the decision is deferred rather than made.
-
-**A prompt instruction is not a guardrail.** The system prompt tells the model
-never to do arithmetic in its head. Asked for *"the sine of 30 degrees multiplied
-by 4"* and *"5 factorial"*, it made **zero tool calls** and answered `2` and
-`120` from memory. Both were correct, which is the uncomfortable part — nothing
-in the output marked them as unverified. The calculator genuinely cannot express
-either operation, so the model was choosing between a useless refusal and a
-right answer and chose well; the failure is that it chose *silently*. Two
-tempting fixes are both wrong. Sharpening the wording would make these two
-examples comply and teach nothing, since the instruction being ignored is
-already explicit. Teaching the calculator `sin(...)` means allowing `ast.Call`,
-which is the single rule keeping every injection vector out. The answer belongs
-in `agent/guardrails.py` on D9 — validate the output in code instead of asking
-the model to behave. It is the same shape as the price rule waiting there: an
-amount that appears in an answer without appearing in the context has to be
-blocked, not discouraged. Cheap to learn on a sine; expensive to learn on a
-checkout total.
-
-**Prompt caching never engaged.** The system prompt and both tool schemas repeat
-on every call, which is exactly the shape caching rewards, yet `cached_tokens`
-was `0` in every call measured. The prompt peaked at 975 tokens and OpenAI's
-cache has a 1,024-token minimum, so nothing qualified — the mechanism works and
-is tested, it simply has nothing to bite on yet. That should change on D3–D5,
-when the catalogue tools push the schemas past the threshold; the accounting is
-already in `llm/usage.py`.
-
-**Tool schemas stay non-strict.** `llm/structured.py` has the transform, and
-`response_format` uses it, but `tools/registry.py` still sends raw Pydantic
-output with `strict` unset. Under strict every tool argument would become
-required, so a Pydantic default would stop meaning "the model may omit this" —
-a change to the tool contract rather than a formatting fix. Revisit on D5/D9,
-when MCP supplies the schemas anyway.
-
-**Price validation lives in the MCP wrapper, not in `catalog/search.py`.** A
-negative bound or a minimum above a maximum is rejected in
-`mcp_server/server.py`, because D4 is where the plan puts edge cases and because
-changing `search_products` would change the contract D3 tests. The cost is that
-the rule is not where the function is: a caller reaching
-`catalog.search_products` directly — which is what D9 does behind its own
-tools — still gets a silent empty list for `max_price_cents=-500`. Either the
-validation moves down into `catalog/`, or D9 repeats it in its own wrapper. The
-first is tidier and is a change to D3's tested surface, so it is a decision
-rather than a chore.
-
-**The `limit` clamp is silent.** `search.py` clamps to 1-50, so a model asking
-for 100 gets at most 50 and is told nothing about it. The parameter description
-now says the clamp exists and points at `count` as the authority on how many came
-back, which is a docstring rather than a signal in the response — a model that
-ignores the description learns nothing from the result either. Making it explicit
-needs a third field in the envelope, which was deliberately not added while the
-shape is this new.
-
-**The upper half of that clamp has never actually fired.** The catalog holds 30
-products, so `limit=100` returns everything that matched and never reaches the
-cap of 50 — the clamp is verified by reading `max(1, min(int(limit), MAX_LIMIT))`
-and by the lower bound, where `limit=0` and `limit=-5` both return one result.
-The 50 ceiling is asserted in a test as a range rather than observed, and will
-stay that way until the catalog outgrows it.
-
-**The MCP middleware logs `query`, which stops being safe on D6.** Every tool
-call is logged with its arguments, and that is deliberate: `query` is the one
-argument that shows what the model understood the shopper to want, so redacting
-it would gut the log precisely where D5 needs it. It is safe today only because
-the text is a developer's own — typed into the Inspector or a test. D6 brings
-real carts and real customers, and the same field becomes something a stranger
-wrote. Before this server sees production traffic, `query` needs redaction, a
-hash, or a config flag; the ids, prices and timings can stay. Raised by review
-on PR #4 and deferred on purpose rather than missed.
-
-**Closed on D6.** `redact_arguments()` replaces `query` with an HMAC digest
-keyed by a per-process salt, and leaves every other argument alone.
-`MCP_LOG_REDACT_QUERY` turns it off, and defaults to on. Why a digest rather
-than a blanket `<redacted>` is in CLAUDE.md; what remains open is that the salt
-is per-process, so two runs of the server cannot be correlated with each other.
-That is deliberate — the question the log answers is about one conversation —
-but worth knowing before anyone tries to trace a shopper across a restart.
-
-**`DEFAULT_COMMAND` cannot be changed after import.** `MCPToolClient.__init__`
-takes `command: str = DEFAULT_COMMAND`, and a default argument is bound when the
-function is defined, not when it is called. Reassigning the module attribute
-afterwards does nothing — which cost a verification run on D5, where the CLI was
-supposed to be pointed at a broken interpreter and cheerfully started the real
-server instead. Harmless today, because nothing needs to change it. The day the
-server command comes from configuration, it has to be read inside the call.
-
-**The model miscounted its own summary.** Asked "do you have those in size 42?"
-it called `check_stock` on four variants, got four correct answers, and opened
-with "Yes, all three are available" above four rows — three products, four
-variants. No price, size or stock figure was invented; every number traced to a
-tool result. The failure is in summarising, not in retrieving, which makes it the
-kind of thing a guardrail can catch: D9 already owes a rule that an amount
-appearing in an answer must appear in the context, and a count is the same shape
-of claim.
-
-**`ping` is offered to the model.** It is a diagnostic tool with no business
-meaning, and it sits in the model's tool list alongside the four that matter.
-Filtering it out would mean matching on a tool name in the client, which is the
-one thing D5 exists to avoid — the adapter registers whatever the server lists.
-It was never called across any of the demo scenarios. If a future server exposes
-enough diagnostics to crowd the list, the fix belongs on the server (not
-advertising them) rather than in a name check here.
-
-**There is no fulfilment flow, so `reserved` only ever goes up.** `place_order`
-adds to `inventory.reserved` and nothing subtracts from it except a rolled-back
-transaction. `fulfilled` is a status nothing transitions into automatically,
-and `cancelled` and `refunded` do not release stock either — so a catalog run
-long enough will reserve itself down to zero available with no orders shipping.
-Correct for a training project with no warehouse behind it, and wrong the
-moment anything real depends on the number. Releasing on `cancelled`/`refunded`
-is the small half of the fix; the large half is deciding when units leave
-`quantity`, which is a fulfilment design this project does not have.
-
-**A cart line with no active price passes in the cart and fails at the order.**
-Deliberate on both sides — a cart that silently drops an item is worse than one
-showing an item it cannot price, and a line missing from an order is goods that
-ship and are never charged for — but the consequence is a shopper who can hold
-a cart that cannot be bought, and only finds out at checkout. Nothing warns
-them earlier. A flag on the cart response would be the obvious improvement and
-was not added, because inventing a field the plan does not describe is how a
-response shape stops being reviewable.
-
-**The advisory stock check can tell two shoppers the same units are free.**
-`services/cart.py` reads `quantity - reserved` with no lock and writes nothing,
-by design: a cart is a statement of intent. The authoritative check under
-`FOR UPDATE` is in `place_order`. The gap is a user-experience one rather than
-a correctness one — two people can both fill a cart and only one can buy —
-which is the right trade for a basket and would be the wrong trade anywhere
-money moves.
-
-**`orders.cart_id` is UNIQUE, so a cancelled order's cart cannot be reordered.**
-The constraint closes a real race — two concurrent `POST /orders` on one cart —
-and costs nothing while `ordered` is terminal for a cart. But `cancelled` and
-`refunded` are real order statuses, and after either, the cart that produced
-the order is permanently unusable: the only path is a new cart with the same
-lines re-added. Acceptable now, and a decision to revisit on D8 when a
-cancellation actually happens.
-
-**There is no readiness endpoint.** `/health` deliberately does not touch the
-database, because a liveness probe that queries reports the database's latency
-as the process's liveness. That leaves "can this process actually serve a cart"
-unanswered by any endpoint — a separate `/ready` that does hit Postgres is the
-missing half, and it was left out rather than guessed at.
-
-**CORS is `allow_origins=["*"]`.** Nothing here is reached by a browser today —
-the client is the agent process, and the credential is a header that
-same-origin rules were never protecting. The setting is a placeholder that has
-to become a list of origins before any front end exists, and the combination
-with `allow_credentials=True` is one browsers refuse anyway, which is the
-reminder built into it.
-
-**The commerce API has no rate limiting and no request logging.** Both are
-outside D6's scope and both are load-bearing once the key is anything other
-than a developer's own. Worth naming here so that "the API is done" does not
-read as "the API is deployable".
-
-**`checkout.session.expired` does not release a reservation.** *(Closed on
-D8.)* D7 released stock on `cancelled` and `refunded`, and Stripe expires an
-unpaid session after 24 hours — but nothing listened for that. The order stayed
-`pending` for ever with its units reserved, which was the same leak D6 had,
-moved one step later.
-
-D8 closed it with a webhook handler rather than the periodic sweep this entry
-offered as the alternative, and the handler turned out to need two guards that
-were not obvious when the gap was written down. The event is not trusted about
-payment — Stripe can expire a session whose payment is in flight — and the
-event's session must be the one the order currently points at, or an order on
-its second checkout is cancelled by the first session's expiry. Verified end to
-end: an expired unpaid session moved a `pending` order to `cancelled` and
-returned exactly the units it held. See "Day 8 — findings".
-
-**Checkout Sessions cannot be deleted, only expired.** Stripe keeps them
+**Checkout Sessions cannot be deleted, only expired.** *(D7.)* Stripe keeps them
 permanently, so `expire` is the whole of what cleanup can mean and the test
 account accumulates sessions on every `pytest -m stripe` run. Harmless, but it
 means "I cleaned up after the test" is not literally true and should not be
 believed of any Stripe object without checking: Products and Prices archive,
 Sessions expire, and only Customers actually delete.
 
-**The catalog sync has no path for removing what it wrote.** Reseeding the
-catalog produces new local rows with no `stripe_product_id`, so the next sync
-creates a second set of Stripe Products while the first set stays active and
-orphaned. Archiving the old ones would need a record of which Stripe objects
+**The catalog sync has no path for removing what it wrote.** *(D7.)* Reseeding
+the catalog produces new local rows with no `stripe_product_id`, so the next
+sync creates a second set of Stripe Products while the first set stays active
+and orphaned. Archiving the old ones would need a record of which Stripe objects
 belonged to a catalog generation, which does not exist. Tolerable because
 nothing is charged from them; visible as clutter in the dashboard.
 
-**Price drift is reported and never repaired.** Deliberate, for the reasons in
-the findings above, but it does mean the Stripe catalog silently stops matching
-the local one after any price change, and only a run of the sync says so.
+**Price drift is reported and never repaired.** *(D7.)* Deliberate, for the
+reasons in the D7 findings, but it does mean the Stripe catalog silently stops
+matching the local one after any price change, and only a run of the sync says
+so.
 
-**The checkout pages are unauthenticated, and that is load-bearing.**
-`GET /checkout/success` and `GET /checkout/cancel` are mounted without
-`require_api_key`, because Stripe redirects a browser to them and a browser
-carries no key. It is acceptable only while they read and never write — a test
-asserts both accept `GET` alone. Anyone adding a write there removes the reason
-it was safe. The success page also deliberately does not mark the order paid,
-and says so on the page: a redirect is a URL anybody can open.
+---
 
-**Nothing reconciles a charge against an order total.** `amount_total` on the
-session was asserted equal to `orders.total_amount_cents` by a test, but no
-running code checks it, and the balance transaction settles in a different
-currency again. Whoever adds refunds on D8 will need that reconciliation to be
-real rather than a test fixture.
+### Open — the agent loop and tools
+
+**Function calling currently runs without reasoning, and that is unresolved.**
+*(D2, and D9 is where it is decided.)* `reasoning_effort='none'` is the price of
+using function tools on Chat Completions with `gpt-5.6-luna`. For D2 it cost
+nothing visible: two independent tools, and the model still chained them
+correctly. D9 is the worry — five commerce tools with real interdependencies
+(search → check stock → add to cart → view cart → checkout), where picking the
+next call *is* the reasoning. Whether a non-reasoning model holds that chain
+together is untested. Options if it does not: move to the Responses API, which
+supports tools with reasoning but keeps conversation state server-side and would
+hide the loop this project exists to show, or switch to a model without the
+restriction. Neither is free, and the decision is deferred rather than made.
+
+**A prompt instruction is not a guardrail.** *(D2, and D9 owes the fix.)* The
+system prompt tells the model never to do arithmetic in its head. Asked for
+*"the sine of 30 degrees multiplied by 4"* and *"5 factorial"*, it made **zero
+tool calls** and answered `2` and `120` from memory. Both were correct, which is
+the uncomfortable part — nothing in the output marked them as unverified. The
+calculator genuinely cannot express either operation, so the model was choosing
+between a useless refusal and a right answer and chose well; the failure is that
+it chose *silently*. Two tempting fixes are both wrong. Sharpening the wording
+would make these two examples comply and teach nothing, since the instruction
+being ignored is already explicit. Teaching the calculator `sin(...)` means
+allowing `ast.Call`, which is the single rule keeping every injection vector out.
+The answer belongs in `agent/guardrails.py` on D9 — validate the output in code
+instead of asking the model to behave. It is the same shape as the price rule
+waiting there: an amount that appears in an answer without appearing in the
+context has to be blocked, not discouraged. Cheap to learn on a sine; expensive
+to learn on a checkout total.
+
+**The model miscounted its own summary.** *(D5, and D9 owes the fix.)* Asked "do
+you have those in size 42?" it called `check_stock` on four variants, got four
+correct answers, and opened with "Yes, all three are available" above four rows —
+three products, four variants. No price, size or stock figure was invented; every
+number traced to a tool result. The failure is in summarising, not in retrieving,
+which makes it the kind of thing a guardrail can catch: D9 already owes a rule
+that an amount appearing in an answer must appear in the context, and a count is
+the same shape of claim.
+
+**The CLI does not stream while tools are in play.** *(D2.)* `chat_with_tools`
+is a blocking call; `stream_chat` still exists and is still tested, but nothing
+drives it now. Streaming a tool call means accumulating deltas per `index`: the
+function name arrives in one chunk, the arguments in fragments spread over the
+next several, and the `id` only once. Reassembling that is bookkeeping that would
+have buried the chaining D2 exists to demonstrate. Worth revisiting once the loop
+itself is settled.
+
+**Tool schemas stay non-strict for the local tools.** *(D2, narrowed on D5.)*
+`llm/structured.py` has the transform and `response_format` uses it, but
+`tools/registry.py` still sends raw Pydantic output with `strict` unset. Under
+strict every tool argument would become required, so a Pydantic default would
+stop meaning "the model may omit this" — a change to the tool contract rather
+than a formatting fix.
+
+D5 came and went without it, and narrowed the question rather than answering it:
+the catalog tools are behind MCP now and publish their own schemas, so strict
+there would mean rewriting a contract this side does not own. What is left is the
+two local tools in `tools/basic.py`, plus whatever D9 adds in `tools/commerce.py`.
+Revisit on D9, when there are commerce tools to weigh it against.
+
+**Price validation lives in the MCP wrapper, not in `catalog/search.py`.** *(D4,
+and D9 has to choose.)* A negative bound or a minimum above a maximum is rejected
+in `mcp_server/server.py`, because D4 is where the plan puts edge cases and
+because changing `search_products` would change the contract D3 tests. The cost
+is that the rule is not where the function is: a caller reaching
+`catalog.search_products` directly — which is what D9 does behind its own tools —
+still gets a silent empty list for `max_price_cents=-500`. Either the validation
+moves down into `catalog/`, or D9 repeats it in its own wrapper. The first is
+tidier and is a change to D3's tested surface, so it is a decision rather than a
+chore.
+
+**The `limit` clamp is silent.** *(D3.)* `search.py` clamps to 1-50, so a model
+asking for 100 gets at most 50 and is told nothing about it. The parameter
+description now says the clamp exists and points at `count` as the authority on
+how many came back, which is a docstring rather than a signal in the response — a
+model that ignores the description learns nothing from the result either. Making
+it explicit needs a third field in the envelope, which was deliberately not added
+while the shape is this new.
+
+**The upper half of that clamp has never actually fired.** *(D3.)* The catalog
+holds 30 products, so `limit=100` returns everything that matched and never
+reaches the cap of 50 — the clamp is verified by reading
+`max(1, min(int(limit), MAX_LIMIT))` and by the lower bound, where `limit=0` and
+`limit=-5` both return one result. The 50 ceiling is asserted in a test as a
+range rather than observed, and will stay that way until the catalog outgrows it.
+
+**`DEFAULT_COMMAND` cannot be changed after import.** *(D5.)*
+`MCPToolClient.__init__` takes `command: str = DEFAULT_COMMAND`, and a default
+argument is bound when the function is defined, not when it is called.
+Reassigning the module attribute afterwards does nothing — which cost a
+verification run on D5, where the CLI was supposed to be pointed at a broken
+interpreter and cheerfully started the real server instead. Harmless today,
+because nothing needs to change it. The day the server command comes from
+configuration, it has to be read inside the call.
+
+**`ping` is offered to the model.** *(D5.)* It is a diagnostic tool with no
+business meaning, and it sits in the model's tool list alongside the four that
+matter. Filtering it out would mean matching on a tool name in the client, which
+is the one thing D5 exists to avoid — the adapter registers whatever the server
+lists. It was never called across any of the demo scenarios. If a future server
+exposes enough diagnostics to crowd the list, the fix belongs on the server (not
+advertising them) rather than in a name check here.
+
+---
+
+### Open — deployment and operations
+
+**There is no readiness endpoint.** *(D6.)* `/health` deliberately does not touch
+the database, because a liveness probe that queries reports the database's
+latency as the process's liveness. That leaves "can this process actually serve a
+cart" unanswered by any endpoint — a separate `/ready` that does hit Postgres is
+the missing half, and it was left out rather than guessed at.
+
+**CORS is `allow_origins=["*"]`.** *(D6.)* Nothing here is reached by a browser
+today — the client is the agent process, and the credential is a header that
+same-origin rules were never protecting. The setting is a placeholder that has to
+become a list of origins before any front end exists.
+
+**The commerce API has no rate limiting and no request logging.** *(D6.)* Both
+are outside D6's scope and both are load-bearing once the key is anything other
+than a developer's own. Worth naming here so that "the API is done" does not read
+as "the API is deployable".
+
+**The webhook endpoint trusts that it is reachable only by Stripe *for
+authenticity*, not for load.** *(D8.)* Signature verification means nothing
+unsigned is acted on, but every request still costs a body read and an HMAC
+before it is refused. There is no rate limit and no request size cap, so an
+unauthenticated caller can make this endpoint do work. The entry above names the
+same gap for the API as a whole; this route makes it more pointed by being the
+one address that must stay open to the internet.
+
+**Three routes are unauthenticated, and each for a different reason.** *(D7,
+extended on D8.)* `GET /checkout/success` and `GET /checkout/cancel` are public
+because Stripe redirects a *browser* to them and a browser carries no key — safe
+only while they read and never write, which a test asserts by checking both
+accept `GET` alone. `POST /webhooks/stripe` is public because Stripe has no key
+to send and the signature is the credential — and unlike the pages, it does
+write, so its safety rests on verification running before anything else rather
+than on being read-only. `PUBLIC_PATHS` in `tests/test_api_auth.py` records all
+three, and the sweep fails on a fourth nobody decided on.
+
+The success page also deliberately does not mark the order paid, and says so on
+the page: a redirect is a URL anybody can open.
+
+---
+
+### Closed
+
+**Reservations were never released.** *(D6 → closed D7, verified D8.)* The
+original entry read: "`place_order` adds to `inventory.reserved` and nothing
+subtracts from it except a rolled-back transaction. `fulfilled` is a status
+nothing transitions into automatically, and `cancelled` and `refunded` do not
+release stock either — so a catalog run long enough will reserve itself down to
+zero available with no orders shipping."
+
+D7 built the release: `lifecycle.RELEASES_RESERVATION` holds `cancelled` and
+`refunded`, `_release_reservation` runs under the same `SELECT ... FOR UPDATE`
+ordered by `variant_id` that `_reserve` uses, and `apply_transition` is the only
+place it can be reached from. Releasing twice is prevented by the transition
+table rather than by a check inside the release — both statuses are terminal, so
+a second attempt is refused before any stock moves.
+
+D8 verified it end to end three ways: an expired unpaid session cancelled an
+order and returned exactly the units it held, a full refund did the same, and a
+concurrent pair of transitions on one order released once rather than twice.
+
+**This entry was wrong for two days and nobody noticed**, which is the reason
+Known gaps now carries days and a Closed section. It claimed a protection did not
+exist while it did — the direction of error that costs the most, because someone
+reading it would go and build a release that already existed, or worse, distrust
+the number and work around it.
+
+*What remains open is the other half — `quantity` is never decremented. See
+"`quantity` is never decremented" under Open.*
+
+**`checkout.session.expired` did not release a reservation.** *(D7 → closed
+D8.)* D7 released stock on `cancelled` and `refunded`, and Stripe expires an
+unpaid session after 24 hours — but nothing listened for that. The order stayed
+`pending` for ever with its units reserved, which was the same leak D6 had, moved
+one step later.
+
+D8 closed it with a webhook handler rather than the periodic sweep this entry
+offered as the alternative, and the handler turned out to need two guards that
+were not obvious when the gap was written down. The event is not trusted about
+payment — Stripe can expire a session whose payment is in flight — and the
+event's session must be the one the order currently points at, or an order on its
+second checkout is cancelled by the first session's expiry. Verified end to end:
+an expired unpaid session moved a `pending` order to `cancelled` and returned
+exactly the units it held. See "Day 8 — findings".
+
+**The MCP middleware logs `query`, which stops being safe on D6.** *(D5 → closed
+D6.)* Every tool call is logged with its arguments, and that is deliberate:
+`query` is the one argument that shows what the model understood the shopper to
+want, so redacting it would gut the log precisely where D5 needs it. It was safe
+then only because the text was a developer's own — typed into the Inspector or a
+test. D6 brought real carts and real customers, and the same field became
+something a stranger wrote.
+
+D6 closed it: `redact_arguments()` replaces `query` with an HMAC digest keyed by
+a per-process salt, and leaves every other argument alone.
+`MCP_LOG_REDACT_QUERY` turns it off, and defaults to on. Why a digest rather than
+a blanket `<redacted>` is in CLAUDE.md; what remains is that the salt is
+per-process, so two runs of the server cannot be correlated with each other. That
+is deliberate — the question the log answers is about one conversation — but
+worth knowing before anyone tries to trace a shopper across a restart.
+
+**Prompt caching never engaged.** *(D2 → closed D5.)* The system prompt and both
+tool schemas repeat on every call, which is exactly the shape caching rewards,
+yet `cached_tokens` was `0` in every call measured. The prompt peaked at 975
+tokens and OpenAI's cache has a 1,024-token minimum, so nothing qualified — the
+mechanism worked and was tested, it simply had nothing to bite on.
+
+D5 crossed the threshold. Six MCP tool schemas took the prompt to **2,254
+tokens**, and the prefix is hit almost whole: 2,251 of 2,254 on one call, 3,549
+of 3,552 on the next. Across the three demo scenarios that is **$0.007417 of
+uncached input billed as $0.002486 — 66% saved**, and 76% once the cache is warm.
+Cold and warm are worth separating, because the first call of a genuinely cold
+session still reports `cached_tokens: 0` and pays full rate for the whole prefix.
+The accounting was already in `llm/usage.py`; nothing had to change to collect
+this. See "Day 5 — findings".

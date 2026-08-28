@@ -31,13 +31,16 @@ tracked.
 | `api/deps.py` | D6 | `X-API-Key` authentication |
 | `api/models.py` | D6 | carts and orders, on the catalog's `Base` |
 | `api/lifecycle.py` | D6 | `OrderStatus` and the transitions between them |
-| `api/schemas.py` | D6, D8 | request and response bodies; where names change |
-| `api/routers/` | D6, D8 | HTTP only — parse, call a service, map an error |
-| `api/services/` | D6, D8 | cart and order logic; imports no FastAPI |
+| `api/schemas.py` | D6→D8 | request and response bodies; where names change |
+| `api/routers/cart.py` | D6 | the cart endpoints |
+| `api/routers/orders.py` | D6→D8 | orders, checkout, cancel, refund |
+| `api/services/cart.py` | D6 | cart rules; the advisory stock check |
+| `api/services/orders.py` | D6→D8 | `place_order`, `apply_transition`, cancel, refund |
 | `payments/stripe_svc.py` | D7 | the Stripe SDK layer; the only importer of `stripe` |
 | `payments/catalog_sync.py` | D7 | mirrors the catalog into Stripe; nothing bills from it |
 | `payments/checkout.py` | D7 | Checkout Sessions built from the order snapshot |
 | `payments/customers.py` | D7 | attaching a buyer to an order |
+| `api/routers/checkout_pages.py` | D7 | the two pages Stripe redirects a browser back to |
 | `api/routers/webhooks.py` | D8 | `POST /webhooks/stripe` — verify, claim, dispatch |
 | `api/services/events.py` | D8 | idempotency and what each event type means |
 | `agent/` | D9 | memory, guardrails |
@@ -303,11 +306,12 @@ produced both came back with `metadata: {}`. So the checkout also passes
 confirmed the identifier then reaches the PaymentIntent *and* its Charge.
 
 The distinction matters when reading this code: **nothing propagates
-automatically, and the explicit copy is why all three objects carry it.** D8 may
-therefore subscribe to `checkout.session.completed`,
-`payment_intent.succeeded` or `charge.succeeded` and attribute any of them —
-but only for as long as that parameter keeps being sent, which is what the
-offline test on the outgoing payload exists to guard. No PaymentIntent exists
+automatically, and the explicit copy is why all three objects carry it.** D8
+took that up — `services/events.py::order_id_from` reads `order_id` the same
+way off a Session, a PaymentIntent and a Charge, and `charge.refunded` carries
+nothing else to attribute a refund by. It works only for as long as that
+parameter keeps being sent, which is what the offline test on the outgoing
+payload exists to guard. No PaymentIntent exists
 until a shopper starts paying, so nothing on an unpaid session can prove the
 copy arrived.
 
@@ -485,6 +489,58 @@ numbers cannot be quietly redefined, whereas a flag can be deprecated into
 absence and `getattr` on an absent flag would silently mean "never full". When
 the two disagree, nothing moves.
 
+**`checkout.session.completed` does not mean the money arrived.** For
+delayed-notification payment methods Stripe sends it with
+`payment_status="unpaid"` and settles later through
+`checkout.session.async_payment_succeeded`, or fails through
+`checkout.session.async_payment_failed`. Nothing in `payments/checkout.py`
+restricts `payment_method_types`, so which methods are offered is a dashboard
+setting this code does not control — reading `payment_status` removes the
+assumption instead of documenting it. The allow-list is `paid` and
+`no_payment_required`, the same shape the expiry guard uses and for the same
+reason. Both async events are handled, because a guard without them would
+strand such an order at `pending` for ever: `completed` has already been and
+gone by the time the funds confirm.
+
+**A live-mode event is recorded and never dispatched.** `config.py` refuses an
+`sk_live_` key, which reads like "live events cannot reach this code" and does
+not cover this path at all: `STRIPE_WEBHOOK_SECRET` is a separate credential
+and a live endpoint's signing secret begins `whsec_` exactly like a test one,
+so it verifies just as well. `handle_event` therefore stops on
+`event.livemode`, logs at ERROR and returns — 200, because the delivery is
+genuine and the configuration is what has to change. A guard's coverage is a
+property of the path it sits on, not of the sentence describing it.
+
+**A column that belongs to a transition is written by `_move`, never by the
+caller before it.** `handle_checkout_completed` records
+`stripe_payment_intent_id`, and the obvious shape — assign it, then call
+`_move`, which checks the transition first — is wrong: the assignment has
+already happened, a refusal returns without undoing it, and the router's
+`commit()` writes it to an order whose status never changed. The damaging case
+is concrete: a second `checkout.session.completed` for an order already `paid`
+would overwrite the PaymentIntent the refund endpoint spends with one from a
+session that may never have been charged. Columns travel through `_move`'s
+`updates` and are applied after the transition is cleared. Raised in review on
+PR #8.
+
+For the same reason the lost-race branch inside `_move` expires the instance
+rather than rolling the session back. A rollback there discarded this event's
+`processed_events` claim while the handler still returned normally and the
+router still answered 200 — the delivery recorded nowhere and Stripe told to
+stop, which are the two things that must never both be true.
+
+**`apply_transition` asks for `populate_existing` under its lock.** The order
+is usually already in the Session's identity map, and an ORM select that
+returns an instance it already holds is not obliged to overwrite attributes
+loaded earlier. If it did not, a caller that waited behind a concurrent
+transition would evaluate the status from *before* the wait and two refunds
+could each release the same reservation. SQLAlchemy 2.0.52 does refresh under
+`with_for_update()`; asking explicitly turns that from an observation into part
+of the statement, and
+`test_two_concurrent_transitions_release_the_reservation_once` is what would
+catch it changing — two connections and one order, rather than a test that
+reads the emitted SQL for `FOR UPDATE`.
+
 **`payment_intent.succeeded` deliberately changes nothing.** One payment
 produces it *and* `checkout.session.completed`, in an order nobody controls.
 If both drove the transition, whichever lost would be refused by the
@@ -640,32 +696,46 @@ carries usage alongside an empty `choices` list.
 
 ## Commands
 
+**The runnable command list lives in `README.md`, and deliberately only there.**
+This file used to carry its own copy, which is a second record of the same fact
+— the failure mode this document argues against everywhere else, and it had
+already drifted: `stripe listen`, `manual_test_state.py` and the cancel and
+refund endpoints were in one list and not the other, so neither could be
+trusted without checking the other. A reader who follows a stale command finds
+out slowly.
+
+What belongs here instead is the handful of invocations that exist to explain a
+*rule* rather than to get work done, because those are arguments and not
+operations:
+
 ```bash
-docker compose up -d              # Postgres 16 + pgvector
-pip install -r requirements.txt
-python scripts/create_schema.py   # pgvector + create_all, idempotent
-python scripts/seed_catalog.py    # 30 products; --reset to rebuild
-python scripts/embed_catalog.py   # vectors + HNSW index; --force to redo
-pytest tests/ -v                  # offline and database tests
-pytest tests/ -m network          # the four that call the API and cost money
-python -m shopagent.llm.loop      # the CLI agent (local tools + MCP catalog)
-python scripts/run_mcp_server.py  # the catalog MCP server alone, on stdio
-uvicorn shopagent.api.main:app --reload --port 8000   # the commerce API
-python scripts/sync_stripe_catalog.py --dry-run       # plan the Stripe catalog sync
-python scripts/sync_stripe_catalog.py                 # create what is missing
-pytest tests/ -m stripe           # the Stripe test-mode tests; needs a key
+# The catalog's off switch. False runs the same CLI with the two local tools
+# and no MCP server, which is what makes "the product answers come from MCP"
+# demonstrable rather than asserted.
+MCP_CATALOG_ENABLED=false python -m shopagent.llm.loop
+
+# Applying a migration. The path matters: `-f /dev/stdin` from the repository
+# root, because the file is not inside the container.
+docker compose exec -T db psql -U shopagent -d shopagent \
+  -f /dev/stdin < migrations/0002_d8_processed_events.sql
+
+# The check that says whether it worked. Exit 2 on any missing column or
+# mismatched foreign key — a migrations table is deliberately absent, and this
+# is what replaces it.
+python scripts/create_schema.py; echo "exit=$?"
+
+# Reading back what the model actually searched for, on your own machine only.
+MCP_LOG_REDACT_QUERY=false python scripts/run_mcp_server.py
 ```
 
-The API's interactive docs are at `http://127.0.0.1:8000/docs`. Paste the
-`SHOPAGENT_API_KEY` into **Authorize** once and every cart and order call
-carries it; `/health` needs no key. `MCP_LOG_REDACT_QUERY=false` puts the raw
-search query back in the catalog server's log, which is worth doing only on
-your own machine.
-
-`MCP_CATALOG_ENABLED=false` runs the same CLI without the catalog server. The
-Inspector takes the script path, never `-m shopagent.mcp_server.server`, because
-it parses `-m` as one of its own flags:
+The Inspector takes the script path, never `-m shopagent.mcp_server.server`,
+because it parses `-m` as one of its own flags:
 
 ```bash
 npx @modelcontextprotocol/inspector .venv/bin/python scripts/run_mcp_server.py
 ```
+
+The API's interactive docs are at `http://127.0.0.1:8000/docs`. Paste the
+`SHOPAGENT_API_KEY` into **Authorize** once and every cart and order call
+carries it; `/health`, the two checkout pages and `/webhooks/stripe` need no
+key, each for a different reason — see the authentication rule above.

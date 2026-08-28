@@ -643,12 +643,22 @@ def test_a_whitespace_signing_secret_reads_as_absent(api_client, monkeypatch):
     assert post(api_client, payload, sign(payload)).status_code == 503
 
 
-def test_the_secret_is_read_per_request_not_at_import(client, monkeypatch):
-    """Configuration is a runtime lookup, so a rotated secret needs no restart.
+def test_the_secret_is_looked_up_per_request_rather_than_captured_at_import(
+    client, monkeypatch
+):
+    """The router calls `get_settings()` on each delivery, not once at import.
 
-    Also the property the fixtures above rely on: if the secret were captured
-    at import, patching `get_settings` would do nothing and every test in this
-    file would be verifying against whatever is in the developer's own `.env`.
+    Written first as "a rotated secret needs no restart", which review on PR #8
+    correctly called out as a claim this test cannot make: `get_settings` is
+    `@lru_cache`d, so editing `.env` really does require a restart, and
+    replacing the getter with a fresh lambda steps around the very cache that
+    makes that true.
+
+    What it does establish is narrower and still worth pinning — the module
+    reads through `get_settings` per request rather than binding the secret to
+    a module-level constant. That is what makes every other test in this file
+    able to choose a secret, and it is the property that would silently break
+    if somebody hoisted the lookup to import time.
     """
     payload = event_body()
     assert post(client, payload, sign(payload)).status_code == 200
@@ -656,6 +666,24 @@ def test_the_secret_is_read_per_request_not_at_import(client, monkeypatch):
     use_secret(monkeypatch, "whsec_rotated_to_something_else")
 
     assert post(client, payload, sign(payload)).status_code == 400
+
+
+def test_get_settings_is_cached_so_env_changes_need_a_restart():
+    """The other half of the correction: state the real behaviour, once.
+
+    Recorded as a test rather than a comment because it is a live operational
+    fact — rotating `STRIPE_WEBHOOK_SECRET` in `.env` does nothing until the
+    process restarts — and because the test above must not be read as
+    promising otherwise.
+    """
+    from shopagent.config import get_settings
+
+    assert hasattr(get_settings, "cache_clear"), (
+        "get_settings is no longer cached; the note about restarts in "
+        "test_the_secret_is_looked_up_per_request_rather_than_captured_at_import "
+        "and in README needs revisiting"
+    )
+    assert get_settings() is get_settings()
 
 
 # --- the structural guard ------------------------------------------------

@@ -35,15 +35,21 @@ def configure_logging(level: int = logging.INFO) -> None:
 
     Attached to the `shopagent` logger rather than through `basicConfig`,
     which configures the *root* logger and would therefore also start printing
-    every library's records through this format. Guarded on `handlers`, so
-    importing the app twice does not double every line, and so a process that
-    has already configured logging deliberately — a test, or a deployment with
-    its own dictConfig — keeps what it set up. `propagate` is left alone:
+    every library's records through this format. `propagate` is left alone:
     `caplog` works by attaching to the root logger, and severing propagation
     here would leave every logging assertion in the suite passing vacuously.
+
+    Guarded with `hasHandlers()` rather than by inspecting `.handlers`, and
+    the difference is a real deployment. `.handlers` is this logger's own list
+    and says nothing about ancestors, so a process that configured logging on
+    the *root* logger — which is what a `dictConfig` normally does — would
+    look unconfigured here, get a second handler added, and then emit every
+    `shopagent.*` record twice, since propagation is still on.
+    `hasHandlers()` walks up the chain and answers the question actually being
+    asked: is there already somewhere for these records to go.
     """
     package_logger = logging.getLogger("shopagent")
-    if package_logger.handlers:
+    if package_logger.hasHandlers():
         return
 
     handler = logging.StreamHandler()

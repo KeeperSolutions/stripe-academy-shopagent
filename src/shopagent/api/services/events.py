@@ -302,20 +302,39 @@ def _load_order(session: Session, event: Any) -> Order | None:
 # --- handlers ------------------------------------------------------------
 
 
-def _move(session: Session, order: Order, target: OrderStatus, event: Any) -> bool:
+def _move(
+    session: Session,
+    order: Order,
+    target: OrderStatus,
+    event: Any,
+    *,
+    updates: dict[str, Any] | None = None,
+) -> bool:
     """Move an order, or explain in the log why it stayed put. Never raises.
 
     Returns whether the order moved.
 
+    `updates` are columns to write **as part of the same move** — today only
+    `stripe_payment_intent_id`, from `checkout.session.completed`. They are
+    applied after the transition has been cleared and before it is performed,
+    so they commit with the status or not at all.
+
+    That is a correction rather than a refinement. The first version had the
+    caller assign the column and then call this function, on the reasoning
+    that the check inside would refuse first. It does not: the assignment had
+    already happened, `_move` returning `False` leaves the attribute dirty in
+    the session, and the router's `commit()` then writes it to an order whose
+    status never changed. Raised in review on PR #8, and the damaging case is
+    concrete — a second `checkout.session.completed` for an order already
+    `paid` would overwrite the PaymentIntent the refund endpoint spends, with
+    the one from a session that may never have been charged.
+
     **Checked before anything is written, then applied under a lock.** The
     check is not the authority — `apply_transition` locks the row and consults
     the transition table again, which is what makes it safe against a
-    concurrent mover. What the early check buys is that a caller can set a
-    column *after* it and know the write will not be stranded by a refusal:
-    `checkout.session.completed` records `stripe_payment_intent_id` on the way
-    through, and an order the lifecycle then refused to move must not be left
-    holding it. The same shape `cancel_order` uses before it expires a Stripe
-    session, and for the same reason.
+    concurrent mover. What the early check buys is that nothing is written at
+    all on the ordinary refusal. The same shape `cancel_order` uses before it
+    expires a Stripe session, and for the same reason.
 
     **An `IllegalTransition` is a 200, not a 500, and the log level says which
     kind it was.** Two very different things reach this branch:
@@ -360,21 +379,34 @@ def _move(session: Session, order: Order, target: OrderStatus, event: Any) -> bo
             )
         return False
 
+    for column, value in (updates or {}).items():
+        setattr(order, column, value)
+
     try:
         apply_transition(session, order, target)
     except IllegalTransition as exc:
         # Lost a race between the check above and the lock inside
-        # `apply_transition`. Rolled back rather than left pending, because
-        # whatever the caller wrote in between — `stripe_payment_intent_id` —
-        # belongs to a transition that did not happen. That also discards this
-        # event's `processed_events` row, which is the right trade: the retry
-        # will find the order already in its new state and take the INFO branch
-        # above, whereas a stranded column would be silent and permanent.
-        session.rollback()
+        # `apply_transition`: another delivery moved this order in between.
+        #
+        # `session.expunge` rather than `session.rollback`, and that changed in
+        # review. Rolling back discarded this event's `processed_events` claim
+        # while the caller still returned normally and the router still
+        # answered 200 — so the delivery was recorded nowhere and Stripe was
+        # told to stop, which is precisely the pair of things that must never
+        # both be true. The old log line even promised a retry that a 200
+        # forbids.
+        #
+        # What has to be undone is only the attribute assignment above, since
+        # the transition it belonged to did not happen. Expiring the instance
+        # drops those pending values and reloads from the row, leaving the
+        # claim intact to commit. Nothing needs retrying: the order is already
+        # where this event wanted to take it, or somewhere the lifecycle
+        # considers further along.
+        session.expire(order)
         logger.warning(
             "stripe event %s: order %s changed status while this event was "
-            "being handled, so %s was refused under the lock (%s). Stripe's "
-            "retry will find the settled state",
+            "being handled, so %s was refused under the lock (%s). Nothing "
+            "further is needed — the order has already settled",
             event_id,
             order.id,
             target.value,
@@ -388,36 +420,31 @@ def _move(session: Session, order: Order, target: OrderStatus, event: Any) -> bo
     return True
 
 
-def handle_checkout_completed(session: Session, event: Any) -> None:
-    """A shopper finished paying. This is the event that marks an order paid.
+# What `checkout.session.completed` may report and still mean "the money is
+# there". An allow-list rather than `!= "unpaid"`, the same shape the expiry
+# guard uses: `payment_status` has three values and a fourth would otherwise
+# default to "paid", which is the wrong way for this to fail.
+SETTLED_PAYMENT_STATUSES = frozenset({"paid", "no_payment_required"})
 
-    Also the only place `orders.stripe_payment_intent_id` is filled. The column
-    has existed since D6 and nothing wrote to it; step 4's refund needs a
-    PaymentIntent to refund against, and the session is where it first appears.
 
-    `session.payment_intent` is a **string**, not an expanded object — checked
-    against a real `checkout.session.completed` from this account rather than
-    assumed, because D7 collected four SDK shapes that were not what they
-    looked like. Read defensively anyway: it is null on a session that was
-    completed without a payment, which a zero-amount checkout produces.
+def _payment_intent_updates(event: Any, checkout_session: Any) -> dict[str, Any]:
+    """`stripe_payment_intent_id`, if the session names one as a string.
+
+    Checked against a real `checkout.session.completed` from this account
+    rather than assumed: `payment_intent` is a **string**, not an expanded
+    object. It is null on a session completed without a payment, which a
+    zero-amount checkout produces, so this can legitimately return nothing.
     """
-    order = _load_order(session, event)
-    if order is None:
-        return
-
-    checkout_session = getattr(getattr(event, "data", None), "object", None)
     payment_intent = getattr(checkout_session, "payment_intent", None)
 
     if isinstance(payment_intent, str) and payment_intent:
-        # Set before the transition so both land in one commit. `_move` checks
-        # the transition first, so this cannot be stranded on an order the
-        # lifecycle then refuses to move.
-        order.stripe_payment_intent_id = payment_intent
-    elif payment_intent is not None:
+        return {"stripe_payment_intent_id": payment_intent}
+
+    if payment_intent is not None:
         # Not a string means the object was expanded, which nothing here asks
-        # for. Worth a line rather than a silent `str()`: it would mean the
-        # session was retrieved with `expand`, and step 4 would be reading a
-        # column holding a repr.
+        # for. Worth a line rather than a silent `str()`: the column is a
+        # VARCHAR the refund endpoint spends, and a repr in it would fail on
+        # a value that looks almost right.
         logger.warning(
             "stripe event %s: session.payment_intent is %s rather than a "
             "string; stripe_payment_intent_id was left unset",
@@ -425,7 +452,108 @@ def handle_checkout_completed(session: Session, event: Any) -> None:
             type(payment_intent).__name__,
         )
 
-    _move(session, order, OrderStatus.PAID, event)
+    return {}
+
+
+def handle_checkout_completed(session: Session, event: Any) -> None:
+    """A shopper finished checkout. Mark the order paid — if the money is there.
+
+    **`completed` does not mean paid.** For delayed-notification payment
+    methods this event arrives with `payment_status="unpaid"` and settles later
+    through `checkout.session.async_payment_succeeded`, or fails through
+    `checkout.session.async_payment_failed`. The first version of this handler
+    ignored the field and moved the order regardless, which would mark an order
+    paid against a payment that had not happened and might never — raised in
+    review on PR #8.
+
+    Nothing in `payments/checkout.py` restricts `payment_method_types`, so
+    which methods are offered is a dashboard setting this code does not
+    control and should not assume. Reading the field costs nothing and removes
+    the assumption entirely.
+
+    Also the only place `orders.stripe_payment_intent_id` is filled. The column
+    has existed since D6 and nothing wrote to it; the refund endpoint needs a
+    PaymentIntent to refund against, and the session is where it first appears.
+    It is passed through `_move` rather than assigned here, so it cannot be
+    written to an order whose transition was then refused.
+    """
+    order = _load_order(session, event)
+    if order is None:
+        return
+
+    event_id = getattr(event, "id", "<unknown>")
+    checkout_session = getattr(getattr(event, "data", None), "object", None)
+    payment_status = getattr(checkout_session, "payment_status", None)
+
+    if payment_status not in SETTLED_PAYMENT_STATUSES:
+        # Not a failure and not permanent: the shopper completed a checkout
+        # whose payment settles asynchronously. The order stays `pending` and
+        # `async_payment_succeeded` moves it when the money actually arrives.
+        logger.info(
+            "stripe event %s: checkout completed for order %s with "
+            "payment_status=%r, so the payment has not settled. The order "
+            "stays %s until checkout.session.async_payment_succeeded",
+            event_id,
+            order.id,
+            payment_status,
+            order.status,
+        )
+        return
+
+    _move(
+        session,
+        order,
+        OrderStatus.PAID,
+        event,
+        updates=_payment_intent_updates(event, checkout_session),
+    )
+
+
+def handle_async_payment_succeeded(session: Session, event: Any) -> None:
+    """A delayed payment finally settled. This is the other way to become paid.
+
+    The pair to the `payment_status` guard above: without this handler an order
+    paid by a delayed-notification method would sit at `pending` for ever,
+    because `checkout.session.completed` has already been and gone and nothing
+    else would ever move it.
+
+    Stripe sends this only once the funds are confirmed, so unlike `completed`
+    there is no payment state left to check — but the PaymentIntent is written
+    here too, since `completed` deliberately wrote nothing for this order.
+    """
+    order = _load_order(session, event)
+    if order is None:
+        return
+
+    checkout_session = getattr(getattr(event, "data", None), "object", None)
+
+    _move(
+        session,
+        order,
+        OrderStatus.PAID,
+        event,
+        updates=_payment_intent_updates(event, checkout_session),
+    )
+
+
+def handle_async_payment_failed(session: Session, event: Any) -> None:
+    """A delayed payment did not settle. Recorded, and nothing else.
+
+    The order stays `pending` for the same reason a declined card leaves it
+    there: the session is still open until it expires, and `cancelled` is
+    terminal. Expiry is what ends an unpaid order.
+    """
+    order = _load_order(session, event)
+    if order is None:
+        return
+
+    logger.warning(
+        "stripe event %s: the delayed payment for order %s failed; the order "
+        "stays %s until its checkout session expires",
+        getattr(event, "id", "<unknown>"),
+        order.id,
+        order.status,
+    )
 
 
 def handle_checkout_expired(session: Session, event: Any) -> None:
@@ -658,6 +786,8 @@ def handle_charge_refunded(session: Session, event: Any) -> None:
 
 HANDLERS = {
     "checkout.session.completed": handle_checkout_completed,
+    "checkout.session.async_payment_succeeded": handle_async_payment_succeeded,
+    "checkout.session.async_payment_failed": handle_async_payment_failed,
     "checkout.session.expired": handle_checkout_expired,
     "payment_intent.payment_failed": handle_payment_failed,
     "payment_intent.succeeded": handle_payment_succeeded,
@@ -684,6 +814,28 @@ def handle_event(session: Session, event: Any) -> None:
     retry rather than a duplicate.
     """
     warn_on_account_mismatch(event)
+
+    if getattr(event, "livemode", False):
+        # Recorded (the caller already claimed it) but never dispatched. This
+        # project is test-mode only — `config.py` refuses an `sk_live_` key —
+        # but that check does not cover this path: `STRIPE_WEBHOOK_SECRET` is a
+        # separate credential and the `whsec_` prefix is identical for test and
+        # live endpoints, so a live signing secret pasted into `.env` verifies
+        # perfectly and real customer events would start mutating this
+        # database's orders and inventory.
+        #
+        # 200 rather than an error, because the delivery is genuine and no
+        # retry improves it; the configuration is what has to change. ERROR
+        # rather than WARNING because nothing about this is routine.
+        logger.error(
+            "stripe event %s (%s) is a LIVE-MODE event. This server is test "
+            "mode only, so it was recorded and NOT acted on. Check "
+            "STRIPE_WEBHOOK_SECRET — a live endpoint's signing secret starts "
+            "with whsec_ exactly like a test one and verifies just as well",
+            getattr(event, "id", "<unknown>"),
+            getattr(event, "type", None),
+        )
+        return
 
     event_type = getattr(event, "type", None)
     handler = HANDLERS.get(event_type)

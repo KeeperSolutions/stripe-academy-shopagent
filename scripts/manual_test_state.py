@@ -17,7 +17,8 @@ value first.
     ... place orders, pay, replay webhooks ...
     python scripts/manual_test_state.py restore    # after
 
-`restore` deletes commerce rows created since the snapshot and puts every
+`restore` deletes commerce rows created *since* the snapshot — matched by
+primary key, so anything that was already there is left alone — and puts every
 `inventory.reserved` back to the number it held. It **never** touches the
 catalog: no reseed, no re-embed, nothing that spends money or rebuilds a
 vector. If the catalog is what got damaged, this says so and stops, because
@@ -51,6 +52,17 @@ SNAPSHOT_PATH = REPO_ROOT / ".manual-test-state.json"
 COMMERCE_TABLES = ["order_items", "orders", "cart_items", "carts", "processed_events"]
 
 
+# The primary key of each commerce table, so restore can delete by difference
+# rather than by truncation.
+PRIMARY_KEYS = {
+    "order_items": "id",
+    "orders": "id",
+    "cart_items": "id",
+    "carts": "id",
+    "processed_events": "event_id",
+}
+
+
 def read_state(connection) -> dict:
     """What the database holds right now, in the terms restore needs."""
     reserved = {
@@ -59,10 +71,21 @@ def read_state(connection) -> dict:
             text("SELECT variant_id, reserved FROM inventory ORDER BY variant_id")
         )
     }
-    counts = {
-        table: connection.execute(text(f"SELECT count(*) FROM {table}")).scalar()
+    # Ids rather than counts, and that changed in review on PR #8. Counts are
+    # enough to *report* but not to undo: restoring from them means deleting
+    # every row, which destroys anything that was already there before the run.
+    # For `processed_events` that is worse than losing data — deleting an old
+    # claim lets a redelivery of that event be processed a second time.
+    rows = {
+        table: sorted(
+            str(row[0])
+            for row in connection.execute(
+                text(f"SELECT {PRIMARY_KEYS[table]} FROM {table}")
+            )
+        )
         for table in COMMERCE_TABLES
     }
+    counts = {table: len(ids) for table, ids in rows.items()}
     embedded = connection.execute(
         text("SELECT count(*) FROM products WHERE embedding IS NOT NULL")
     ).scalar()
@@ -70,6 +93,7 @@ def read_state(connection) -> dict:
 
     return {
         "reserved": reserved,
+        "rows": rows,
         "counts": counts,
         "products": products,
         "embedded": embedded,
@@ -121,10 +145,30 @@ def restore() -> int:
         )
         return 2
 
+    if "rows" not in before:
+        print(
+            f"{SNAPSHOT_PATH.name} was written by an older version of this "
+            "script and records only counts, which cannot say which rows are "
+            "new. Take a fresh snapshot before the next manual run; nothing "
+            "has been changed.",
+            file=sys.stderr,
+        )
+        return 2
+
     with engine.begin() as connection:
         deleted = {}
         for table in COMMERCE_TABLES:
-            result = connection.execute(text(f"DELETE FROM {table}"))
+            key = PRIMARY_KEYS[table]
+            existing = before["rows"].get(table, [])
+            if existing:
+                # Delete only what appeared during the run. Rows present at
+                # snapshot time are somebody else's and are left alone.
+                result = connection.execute(
+                    text(f"DELETE FROM {table} WHERE {key}::text <> ALL(:keep)"),
+                    {"keep": existing},
+                )
+            else:
+                result = connection.execute(text(f"DELETE FROM {table}"))
             deleted[table] = result.rowcount
 
         # Back to the recorded number, not to zero. `reserved` is seeded
@@ -143,7 +187,9 @@ def restore() -> int:
 
     print("restored")
     for table, count in deleted.items():
-        print(f"  {table:16} deleted {count}")
+        kept = len(before["rows"].get(table, []))
+        suffix = f", kept {kept} from the snapshot" if kept else ""
+        print(f"  {table:16} deleted {count}{suffix}")
     print(f"  inventory        {changed} variant(s) put back to their snapshot value")
 
     with engine.connect() as connection:

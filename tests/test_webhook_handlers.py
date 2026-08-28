@@ -21,7 +21,8 @@ import time
 import uuid
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.orm import Session
 
 from shopagent.api.lifecycle import OrderStatus
 from shopagent.api.models import Order, ProcessedEvent
@@ -580,6 +581,8 @@ def test_the_handled_types_are_the_ones_that_were_decided_on():
     """
     assert set(event_service.HANDLERS) == {
         "checkout.session.completed",
+        "checkout.session.async_payment_succeeded",
+        "checkout.session.async_payment_failed",
         "checkout.session.expired",
         "payment_intent.payment_failed",
         "payment_intent.succeeded",
@@ -677,7 +680,7 @@ def test_a_failure_in_a_handler_leaves_the_order_and_the_claim_untouched(
     attach_session(session, order_id)
     before = stock(session, variant.id)
 
-    def explode(session_, order, target, event_):
+    def explode(session_, order, target, event_, **kwargs):
         raise RuntimeError("the database went away mid-transition")
 
     monkeypatch.setattr(event_service, "_move", explode)
@@ -702,7 +705,7 @@ def test_the_retry_after_a_handler_failure_is_processed_normally(
     order_id = make_order(client, variant, quantity=2)
     attach_session(session, order_id)
 
-    def explode(session_, order, target, event_):
+    def explode(session_, order, target, event_, **kwargs):
         raise RuntimeError("transient")
 
     monkeypatch.setattr(event_service, "_move", explode)
@@ -1072,7 +1075,7 @@ def test_a_failure_while_handling_a_refund_leaves_the_order_and_the_claim(
     session.expire_all()
     before = stock(session, variant.id)
 
-    def explode(session_, order, target, event_):
+    def explode(session_, order, target, event_, **kwargs):
         raise RuntimeError("the database went away mid-release")
 
     monkeypatch.setattr(event_service, "_move", explode)
@@ -1340,3 +1343,279 @@ def test_a_real_charge_carries_the_order_id_in_its_metadata():
         "payment_intent_data copy in payments/checkout.py has stopped working "
         "and no refund can be attributed to an order"
     )
+
+
+# --- what review on PR #8 found ------------------------------------------
+
+
+def test_a_live_mode_event_is_recorded_but_never_acted_on(client, session, caplog):
+    """`config.py` refuses a live API key; it does not police this path.
+
+    `STRIPE_WEBHOOK_SECRET` is a separate credential and a live endpoint's
+    signing secret begins `whsec_` exactly like a test one, so it verifies just
+    as well. Without this guard a live secret pasted into `.env` would let real
+    customer events move this database's orders and release its stock.
+
+    Recorded and answered 200: the delivery is genuine and no retry improves
+    it — the configuration is what has to change.
+    """
+    caplog.set_level(logging.INFO, logger="shopagent.api.services.events")
+    variant, order_id = paid_order(client, session, sku="RV-LIVE", quantity=2)
+    session.expire_all()
+    before = stock(session, variant.id)
+
+    body = refunded_event(order_id, amount=3000, amount_refunded=3000,
+                          event_id="evt_live_mode")
+    body["livemode"] = True
+
+    response = deliver(client, body)
+
+    assert response.status_code == 200
+    session.expire_all()
+    assert session.get(Order, order_id).status == OrderStatus.PAID
+    assert stock(session, variant.id) == before
+    # Recorded, so a redelivery is not processed either.
+    assert session.get(ProcessedEvent, "evt_live_mode") is not None
+    assert any(
+        "LIVE-MODE" in r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.ERROR
+    )
+
+
+def test_an_unsettled_checkout_does_not_mark_the_order_paid(client, session, caplog):
+    """`completed` does not mean paid for delayed-notification methods.
+
+    Stripe sends this event with `payment_status="unpaid"` for those, and
+    settles later through `async_payment_succeeded`. The first version of the
+    handler ignored the field, which would mark an order paid against a payment
+    that had not happened — found in review on PR #8.
+    """
+    caplog.set_level(logging.INFO, logger="shopagent.api.services.events")
+    variant = make_variant(session, sku="RV-UNPAID", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id)
+
+    body = completed_event(order_id)
+    body["data"]["object"]["payment_status"] = "unpaid"
+    response = deliver(client, body)
+
+    assert response.status_code == 200
+    session.expire_all()
+    order = session.get(Order, order_id)
+    assert order.status == OrderStatus.PENDING
+    assert order.stripe_payment_intent_id is None
+    assert any("has not settled" in r.getMessage() for r in caplog.records)
+
+
+def test_a_no_payment_required_checkout_still_marks_the_order_paid(client, session):
+    """The allow-list's second member, so it is not just `== "paid"`.
+
+    A zero-amount checkout completes with `no_payment_required`, and that
+    order is as paid as it will ever be.
+    """
+    variant = make_variant(session, sku="RV-FREE", quantity=30)
+    order_id = make_order(client, variant, quantity=1)
+    attach_session(session, order_id)
+
+    body = completed_event(order_id)
+    body["data"]["object"]["payment_status"] = "no_payment_required"
+
+    assert deliver(client, body).status_code == 200
+    session.expire_all()
+    assert session.get(Order, order_id).status == OrderStatus.PAID
+
+
+def test_a_delayed_payment_that_settles_later_marks_the_order_paid(client, session):
+    """Without this the guard above would strand such orders at `pending`.
+
+    `checkout.session.completed` has already been and gone by then, so nothing
+    else would ever move the order.
+    """
+    variant = make_variant(session, sku="RV-ASYNC-OK", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id)
+
+    unsettled = completed_event(order_id)
+    unsettled["data"]["object"]["payment_status"] = "unpaid"
+    deliver(client, unsettled)
+
+    settled = event(
+        "checkout.session.async_payment_succeeded",
+        {
+            "id": "cs_test_handler",
+            "object": "checkout.session",
+            "payment_status": "paid",
+            "payment_intent": "pi_settled_late",
+            "metadata": {"order_id": str(order_id)},
+        },
+    )
+    assert deliver(client, settled).status_code == 200
+
+    session.expire_all()
+    order = session.get(Order, order_id)
+    assert order.status == OrderStatus.PAID
+    assert order.stripe_payment_intent_id == "pi_settled_late"
+
+
+def test_a_delayed_payment_that_fails_leaves_the_order_pending(client, session, caplog):
+    caplog.set_level(logging.INFO, logger="shopagent.api.services.events")
+    variant = make_variant(session, sku="RV-ASYNC-FAIL", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id)
+    before = stock(session, variant.id)
+
+    failed = event(
+        "checkout.session.async_payment_failed",
+        {
+            "id": "cs_test_handler",
+            "object": "checkout.session",
+            "payment_status": "unpaid",
+            "metadata": {"order_id": str(order_id)},
+        },
+    )
+    assert deliver(client, failed).status_code == 200
+
+    session.expire_all()
+    assert session.get(Order, order_id).status == OrderStatus.PENDING
+    assert stock(session, variant.id) == before
+    assert any("delayed payment" in r.getMessage() for r in caplog.records)
+
+
+def test_a_refused_transition_never_writes_the_payment_intent(client, session):
+    """The bug review found: the column was assigned before the check.
+
+    A second `checkout.session.completed` for an order already `paid` would
+    overwrite the PaymentIntent the refund endpoint spends — with the one from
+    a session that may never have been charged. The write now travels through
+    `_move` and happens only after the transition is cleared.
+    """
+    variant = make_variant(session, sku="RV-PI-GUARD", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id)
+
+    deliver(client, completed_event(order_id, payment_intent="pi_the_real_one"))
+    session.expire_all()
+    assert session.get(Order, order_id).stripe_payment_intent_id == "pi_the_real_one"
+
+    # A second completed event, under a fresh id so `processed_events` lets it
+    # through, naming a different PaymentIntent.
+    deliver(
+        client,
+        completed_event(
+            order_id, payment_intent="pi_a_later_session", event_id="evt_second_completed"
+        ),
+    )
+
+    session.expire_all()
+    order = session.get(Order, order_id)
+    assert order.status == OrderStatus.PAID
+    assert order.stripe_payment_intent_id == "pi_the_real_one", (
+        "a refused transition overwrote the PaymentIntent; the refund endpoint "
+        "would now refund a session that was never charged"
+    )
+
+
+def test_a_cancelled_order_receiving_a_completed_event_keeps_no_payment_intent(
+    client, session, monkeypatch
+):
+    """The same guard from the other direction, where nothing was set before."""
+    stripe_says(monkeypatch, "unpaid", status="open")
+    variant = make_variant(session, sku="RV-PI-CANCELLED", quantity=30)
+    order_id = make_order(client, variant, quantity=2)
+    attach_session(session, order_id)
+    client.post(f"/orders/{order_id}/cancel")
+
+    deliver(client, completed_event(order_id, payment_intent="pi_too_late"))
+
+    session.expire_all()
+    order = session.get(Order, order_id)
+    assert order.status == OrderStatus.CANCELLED
+    assert order.stripe_payment_intent_id is None
+
+
+def test_two_concurrent_transitions_release_the_reservation_once(engine):
+    """The third idempotency layer, with two real sessions instead of a claim.
+
+    Review on PR #8 argued this was broken: `_load_order` puts the `Order` in
+    the identity map, and an ORM `SELECT ... FOR UPDATE` was said to return
+    that instance without refreshing, so a request waiting behind another
+    transition would evaluate a stale status and release the reservation twice.
+
+    Measured against SQLAlchemy 2.0.52 that is not what happens — the second
+    session reads the settled status and the lifecycle refuses it. But the
+    layer had only ever been asserted by reading SQL for `FOR UPDATE`, which
+    would pass just as happily if the behaviour changed, so the claim is now
+    made the only way it can be: two connections, one order, both told to move
+    it, exactly one succeeding. `apply_transition` also asks for
+    `populate_existing` now, so this does not rest on a default staying put.
+
+    Everything here is committed rather than run inside the `session` fixture's
+    transaction, because two connections cannot share one — a variant created
+    in that transaction is invisible to the other thread. It uses a seeded
+    variant and puts `reserved` back by hand.
+    """
+    import threading
+
+    from shopagent.api.lifecycle import IllegalTransition
+    from shopagent.api.services.cart import add_item, create_cart
+    from shopagent.api.services.orders import apply_transition, place_order
+
+    with Session(engine) as setup:
+        variant_id, quantity, reserved_before = setup.execute(
+            select(Inventory.variant_id, Inventory.quantity, Inventory.reserved)
+            .where(Inventory.quantity - Inventory.reserved >= 3)
+            .order_by(Inventory.variant_id)
+            .limit(1)
+        ).one()
+        cart = create_cart(setup)
+        add_item(setup, cart.id, variant_id, 3)
+        order = place_order(setup, cart.id)
+        order_id, cart_id = order.id, cart.id
+        apply_transition(setup, order, OrderStatus.PAID)
+
+    outcomes: dict[str, str] = {}
+
+    def move(name: str) -> None:
+        with Session(engine) as own:
+            loaded = own.get(Order, order_id)  # both cache `paid` first
+            try:
+                apply_transition(own, loaded, OrderStatus.REFUNDED)
+                outcomes[name] = "applied"
+            except IllegalTransition:
+                outcomes[name] = "refused"
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                outcomes[name] = f"{type(exc).__name__}: {exc}"
+
+    threads = [threading.Thread(target=move, args=(name,)) for name in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    try:
+        assert sorted(outcomes.values()) == ["applied", "refused"], outcomes
+
+        with Session(engine) as check:
+            assert check.get(Order, order_id).status == OrderStatus.REFUNDED
+            after = check.execute(
+                select(Inventory.quantity, Inventory.reserved).where(
+                    Inventory.variant_id == variant_id
+                )
+            ).one()
+        # Released once, not twice: back where it started rather than three
+        # units below it.
+        assert (int(after[0]), int(after[1])) == (int(quantity), int(reserved_before))
+    finally:
+        with Session(engine) as cleanup:
+            cleanup.execute(text("DELETE FROM order_items WHERE order_id = :o"),
+                            {"o": order_id})
+            cleanup.execute(text("DELETE FROM orders WHERE id = :o"), {"o": order_id})
+            cleanup.execute(text("DELETE FROM cart_items WHERE cart_id = :c"),
+                            {"c": cart_id})
+            cleanup.execute(text("DELETE FROM carts WHERE id = :c"), {"c": cart_id})
+            cleanup.execute(
+                text("UPDATE inventory SET reserved = :r WHERE variant_id = :v"),
+                {"r": int(reserved_before), "v": int(variant_id)},
+            )
+            cleanup.commit()

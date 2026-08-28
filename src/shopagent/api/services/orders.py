@@ -456,7 +456,26 @@ def apply_transition(
     # belongs here rather than in each caller: a caller that forgot the lock
     # would be exactly as invisible as the caller that forgot the release, and
     # that is what concentrating this function was meant to prevent.
-    locked = session.scalar(select(Order).where(Order.id == order.id).with_for_update())
+    # `populate_existing` is what makes the lock mean something. Without it the
+    # refresh is a default rather than a guarantee: this order is usually
+    # already in the Session's identity map — `_load_order` in
+    # `services/events.py` put it there — and an ORM select that returns an
+    # instance it already holds is not obliged to overwrite the attributes it
+    # loaded earlier. If it did not, a caller that waited behind a concurrent
+    # transition would then evaluate the status it read *before* the wait, and
+    # two refunds could each release the same reservation.
+    #
+    # Measured on SQLAlchemy 2.0.52, `with_for_update()` does refresh; asking
+    # explicitly costs nothing and turns that from an observation into part of
+    # the statement. Raised in review on PR #8, and
+    # `test_two_concurrent_transitions_release_the_reservation_once` is the
+    # check that would catch it changing.
+    locked = session.scalar(
+        select(Order)
+        .where(Order.id == order.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if locked is None:
         raise OrderNotFound(f"no order with id {order.id}")
 
