@@ -48,7 +48,7 @@ def cart_body(items=()):
     return {
         "cart_id": CART_ID,
         "status": "open",
-        "currency": "usd",
+        "currency": "eur",
         "items": list(items),
         "total_cents": sum(item["line_total_cents"] for item in items),
     }
@@ -240,7 +240,7 @@ def order_body(status="pending"):
         "order_id": ORDER_ID,
         "cart_id": CART_ID,
         "status": status,
-        "currency": "usd",
+        "currency": "eur",
         "items": [{k: v for k, v in one_line().items() if k != "item_id"}],
         "total_cents": 9499,
         "created_at": "2026-08-28T12:00:00Z",

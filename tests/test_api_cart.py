@@ -19,8 +19,19 @@ import pytest
 from sqlalchemy import event, select
 from sqlalchemy.engine import Engine
 
+from shopagent.config import get_settings
 from shopagent.api.models import Cart, CartItem, CartStatus
 from shopagent.catalog.models import Inventory, Price, Product, Variant
+
+
+# The shop's currency, read rather than written. A test that creates a price
+# row in a literal currency and then asks a service to find it is testing its
+# own literal: the service filters on `settings.currency`, so the two have to
+# agree by construction, and the day they stopped agreeing is the day 125 of
+# them failed at once. What a specific currency *is* still gets pinned, in the
+# tests that are actually about that — `format_amount`, and the two that prove
+# a foreign currency is treated as foreign.
+CURRENCY = get_settings().currency
 
 pytestmark = pytest.mark.db
 
@@ -48,7 +59,7 @@ def make_variant(
                 size="42",
                 color="blue",
                 sku=sku,
-                prices=[Price(currency="usd", amount_cents=amount_cents, active=active)],
+                prices=[Price(currency=CURRENCY, amount_cents=amount_cents, active=active)],
                 inventory=Inventory(quantity=quantity, reserved=reserved),
             )
         ],
@@ -81,7 +92,7 @@ def test_creating_a_cart_is_201_and_returns_an_empty_priced_cart(authed_client):
     body = response.json()
     assert uuid.UUID(body["cart_id"])
     assert body["status"] == "open"
-    assert body["currency"] == "usd"
+    assert body["currency"] == CURRENCY
     assert body["items"] == []
     assert body["total_cents"] == 0
 
@@ -242,7 +253,7 @@ def test_an_inactive_price_is_not_counted(authed_client, session):
     """
     variant = make_variant(session, sku="CART-ACTIVE", amount_cents=1000)
     session.add(
-        Price(variant_id=variant.id, currency="usd", amount_cents=9999, active=False)
+        Price(variant_id=variant.id, currency=CURRENCY, amount_cents=9999, active=False)
     )
     session.commit()
 

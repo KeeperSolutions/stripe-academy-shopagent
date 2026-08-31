@@ -25,6 +25,7 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from shopagent.config import get_settings
 from shopagent.api.lifecycle import OrderStatus
 from shopagent.api.models import Order, ProcessedEvent
 from shopagent.api.routers import webhooks
@@ -32,6 +33,16 @@ from shopagent.api.services import events as event_service
 from shopagent.catalog.models import Inventory, Price, Product, Variant
 from shopagent.config import Settings
 from shopagent.payments import stripe_svc
+
+
+# The shop's currency, read rather than written. A test that creates a price
+# row in a literal currency and then asks a service to find it is testing its
+# own literal: the service filters on `settings.currency`, so the two have to
+# agree by construction, and the day they stopped agreeing is the day 125 of
+# them failed at once. What a specific currency *is* still gets pinned, in the
+# tests that are actually about that — `format_amount`, and the two that prove
+# a foreign currency is treated as foreign.
+CURRENCY = get_settings().currency
 
 pytestmark = pytest.mark.db
 
@@ -169,7 +180,7 @@ def make_variant(session, *, sku: str, quantity: int = 20, reserved: int = 0) ->
                 size="42",
                 color="blue",
                 sku=sku,
-                prices=[Price(currency="usd", amount_cents=1500, active=True)],
+                prices=[Price(currency=CURRENCY, amount_cents=1500, active=True)],
                 inventory=Inventory(quantity=quantity, reserved=reserved),
             )
         ],
@@ -302,7 +313,7 @@ def test_the_error_for_a_cancelled_order_names_the_money(
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1
     assert str(order_id) in errors[0]
-    assert "3000 usd" in errors[0]
+    assert f"3000 {CURRENCY}" in errors[0]
 
 
 def test_two_different_events_both_asking_for_paid_leave_one_transition(client, session):
@@ -938,7 +949,7 @@ def refunded_event(
             "amount": amount,
             "amount_refunded": amount_refunded,
             "refunded": refunded,
-            "currency": "usd",
+            "currency": CURRENCY,
             "payment_intent": payment_intent,
             "metadata": {"order_id": str(order_id)},
         },
@@ -1157,7 +1168,7 @@ class FakeRefund:
     id = "re_test_handler"
     status = "succeeded"
     amount = 4500
-    currency = "usd"
+    currency = CURRENCY
 
 
 def stripe_refunds(monkeypatch, calls: list | None = None):

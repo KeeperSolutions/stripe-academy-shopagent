@@ -1336,12 +1336,30 @@ means "I cleaned up after the test" is not literally true and should not be
 believed of any Stripe object without checking: Products and Prices archive,
 Sessions expire, and only Customers actually delete.
 
-**The catalog sync has no path for removing what it wrote.** *(D7.)* Reseeding
-the catalog produces new local rows with no `stripe_product_id`, so the next
-sync creates a second set of Stripe Products while the first set stays active
-and orphaned. Archiving the old ones would need a record of which Stripe objects
-belonged to a catalog generation, which does not exist. Tolerable because
-nothing is charged from them; visible as clutter in the dashboard.
+**The catalog sync has no path for removing what it wrote.** *(D7, fired on
+D9.)* Reseeding the catalog produces new local rows with no
+`stripe_product_id`, so the next sync creates a second set of Stripe Products
+while the first set stays active and orphaned. Archiving the old ones would
+need a record of which Stripe objects belonged to a catalog generation, which
+does not exist. Tolerable because nothing is charged from them; visible as
+clutter in the dashboard.
+
+D9 moved the shop from USD to EUR, which meant a reseed, which meant this
+happening for real rather than in principle. Measured across the test account
+before and after the sync: **99 Products became 129**, and 31 of the 98
+distinct names now belong to more than one object. Prices went from 98 to 158
+— the 60 new ones in `eur`, alongside **93 in `usd` of which 62 are still
+active**, priced against variant ids that no longer exist in this database.
+
+Nothing about the entry's reasoning changed, and neither did the decision. A
+Stripe Price is immutable, so repricing means a new object; archiving the old
+ones means knowing which generation they came from, and the only thing tying a
+Stripe object to a local row is a `stripe_product_id` the reseed threw away.
+What the numbers add is scale: this is not one stale generation but four, and
+the count grows by 30 Products and 60 Prices every time the catalog is rebuilt.
+The cheap fix, if it is ever wanted, is metadata on the Stripe object naming
+the generation that wrote it — which the sync could set today and nothing
+would have to remember afterwards.
 
 **Price drift is reported and never repaired.** *(D7.)* Deliberate, for the
 reasons in the D7 findings, but it does mean the Stripe catalog silently stops

@@ -25,7 +25,20 @@ copy of a contract, aging quietly.
 
 from __future__ import annotations
 
+from shopagent.config import get_settings
 from shopagent.llm.client import Message
+from shopagent.money import format_amount
+
+# The currency the shop sells in, and one amount rendered the way every other
+# surface renders it. The example is *generated* rather than typed: this
+# sentence used to say `$94.99` while the checkout page said `42.00 USD`, which
+# is one amount in two formats seen by one shopper a click apart. Calling the
+# formatter here means the assistant cannot drift from the page even in
+# principle — `test_the_prompt_and_the_checkout_page_share_one_formatter`
+# asserts it is that function and not a copy of it.
+_CURRENCY = get_settings().currency
+_EXAMPLE_MINOR_UNITS = 9499
+_EXAMPLE = format_amount(_EXAMPLE_MINOR_UNITS, _CURRENCY)
 
 # Who it is, and the two rules D1 and D2 measured the need for. `never do
 # arithmetic in your head` is from D2, where the model answered "5 factorial"
@@ -94,15 +107,17 @@ COMMERCE_PROMPT = (
 
 # Money. The exception to `never do arithmetic in your head` is stated in the
 # same breath as the ban, because every amount in this system arrives as an
-# integer number of minor units and somebody has to turn 9499 into $94.99. A
+# integer number of minor units and somebody has to turn 9499 into a
+# readable amount. A
 # base rule the model must break in order to answer at all is a rule it stops
 # reading, so the one permitted conversion is named and everything else is
 # refused — totals especially, which the tools compute from the database on
 # every read for exactly this reason.
 MONEY_PROMPT = (
     " Amounts are whole numbers of minor units — cents — in the currency named "
-    "beside them, so 9499 in usd is $94.99. Show amounts to the customer in "
-    "that form, and treat that conversion as the only arithmetic you may do. "
+    f"beside them, so {_EXAMPLE_MINOR_UNITS} in {_CURRENCY} is {_EXAMPLE}. "
+    "Show amounts to the customer in that form, and treat that conversion as "
+    "the only arithmetic you may do. "
     "Never add, subtract or compare amounts to produce a new one: a line "
     "total, a cart total and an order total each arrive from a tool, and a "
     "figure you worked out yourself is one the shop cannot honour. Every "

@@ -90,7 +90,14 @@ class Settings(BaseSettings):
     app_base_url: str = "http://localhost:8000"
 
     # --- Commerce (D6-D7) ---
-    currency: str = "usd"
+    # The shop's currency, ISO-4217 and lowercase, which is the form Stripe
+    # sends and expects. Every price in the catalog is seeded in it and every
+    # cart, order and Checkout Session is denominated in it.
+    #
+    # Not the currency this project's *costs* are in: OpenAI bills in USD and
+    # `llm/usage.py` reports dollars, which is a real exchange rate away from
+    # this and deliberately unrelated. Two currencies, one of them invented.
+    currency: str = "eur"
     # Where Stripe sends the shopper after Checkout. Left as None so the
     # fallbacks below can derive them from `app_base_url` — one place to change
     # when the app moves, instead of three that drift apart. Set them

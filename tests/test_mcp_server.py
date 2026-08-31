@@ -40,6 +40,8 @@ from rich.logging import RichHandler
 from sqlalchemy import text
 
 import shopagent.mcp_server.server as server_module
+from shopagent.config import get_settings
+from shopagent.money import SYMBOLS
 from shopagent.mcp_server.server import (
     SERVER_NAME,
     configure_stderr_logging,
@@ -219,16 +221,23 @@ def test_search_products_takes_no_required_arguments():
 
 @pytest.mark.parametrize("field", ["max_price_cents", "min_price_cents"])
 def test_price_parameters_say_the_unit_is_cents(field):
-    """The likeliest expensive mistake a model can make here is dollars.
+    """The likeliest expensive mistake a model can make here is major units.
 
-    `$100` is `10000`, and a model that passes `100` silently searches for
-    something under a dollar and reports an empty shop. The schema has to say
+    `€100` is `10000`, and a model that passes `100` silently searches for
+    something under one euro and reports an empty shop. The schema has to say
     so in the one place the model reads.
+
+    The contrast is asserted through the shop's own currency symbol rather
+    than the word "dollar", which is what this said until D9 — and it kept
+    passing for a week after the shop moved to EUR, because a description
+    teaching dollars still contains the word. A check derived from `CURRENCY`
+    cannot go stale that way.
     """
+    symbol = SYMBOLS[get_settings().currency]
     description = schema_of("search_products")["properties"][field]["description"]
 
     assert "cent" in description.lower()
-    assert "dollar" in description.lower()
+    assert symbol in description
 
 
 def test_the_cents_example_is_spelled_out_for_the_upper_bound():

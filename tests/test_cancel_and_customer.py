@@ -14,11 +14,22 @@ import uuid
 
 import pytest
 
+from shopagent.config import get_settings
 from shopagent.api.lifecycle import IllegalTransition, OrderStatus
 from shopagent.api.models import Order
 from shopagent.api.services import orders as order_service
 from shopagent.catalog.models import Inventory, Price, Product, Variant
 from shopagent.payments import customers, stripe_svc
+
+
+# The shop's currency, read rather than written. A test that creates a price
+# row in a literal currency and then asks a service to find it is testing its
+# own literal: the service filters on `settings.currency`, so the two have to
+# agree by construction, and the day they stopped agreeing is the day 125 of
+# them failed at once. What a specific currency *is* still gets pinned, in the
+# tests that are actually about that — `format_amount`, and the two that prove
+# a foreign currency is treated as foreign.
+CURRENCY = get_settings().currency
 
 pytestmark = pytest.mark.db
 
@@ -35,7 +46,7 @@ def make_variant(session, *, sku: str, amount_cents: int = 1000, quantity: int =
         variants=[
             Variant(
                 size="42", color="blue", sku=sku,
-                prices=[Price(currency="usd", amount_cents=amount_cents, active=True)],
+                prices=[Price(currency=CURRENCY, amount_cents=amount_cents, active=True)],
                 inventory=Inventory(quantity=quantity, reserved=reserved),
             )
         ],
@@ -247,7 +258,7 @@ def test_a_known_email_reuses_the_stored_customer_id(authed_client, session, mon
         cart_id=uuid.UUID(authed_client.post("/cart").json()["cart_id"]),
         status=OrderStatus.PENDING,
         total_amount_cents=0,
-        currency="usd",
+        currency=CURRENCY,
         customer_email="repeat@example.com",
         stripe_customer_id="cus_already_known",
     )

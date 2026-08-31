@@ -278,7 +278,7 @@ def _reject_impossible_price_range(min_price_cents: int | None, max_price_cents:
         if value is not None and value < 0:
             raise ValueError(
                 f"{field} was {value}, but a price cannot be negative. Prices are "
-                f"in cents, so $100 is 10000 and $49.99 is 4999. Re-send with a "
+                f"in cents, so €100 is 10000 and €49.99 is 4999. Re-send with a "
                 f"value of 0 or more, or leave {field} out to search without that "
                 f"bound."
             )
@@ -353,7 +353,7 @@ def search_products(
         int | None,
         Field(
             description=(
-                "Upper price bound in CENTS, not dollars. $100 is 10000, $49.99 "
+                "Upper price bound in CENTS, not euros. €100 is 10000, €49.99 "
                 "is 4999. Passing 100 here means one dollar and will match "
                 "nothing. Must be 0 or more. Applies to the variant price, so a "
                 "product is returned when at least one of its variants is within "
@@ -365,7 +365,7 @@ def search_products(
         int | None,
         Field(
             description=(
-                "Lower price bound in CENTS, not dollars. $50 is 5000. Must be 0 "
+                "Lower price bound in CENTS, not euros. €50 is 5000. Must be 0 "
                 "or more, and not greater than max_price_cents. Use it only when "
                 'the shopper asked for a floor; it is not needed to express "cheap".'
             )

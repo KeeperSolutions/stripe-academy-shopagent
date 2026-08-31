@@ -51,7 +51,7 @@ class ProductQuery(BaseModel):
             "The words to search the catalogue with. The search matches on this "
             "list, so an empty list finds nothing. Include the product noun "
             "itself, even when that same word also fills the category field: "
-            "'blue jacket under $80' is ['jacket'], not []. When the text "
+            "'blue jacket under €80' is ['jacket'], not []. When the text "
             "describes what is wanted without naming a product, use the "
             "describing words: 'something warm for winter' is "
             "['warm', 'winter']. Leave out prices, sizes and colours, which "
@@ -72,7 +72,7 @@ class ProductQuery(BaseModel):
         ge=0,
         description=(
             "Upper price bound as a whole number of CENTS, never dollars and "
-            "never a decimal: '$100' is 10000, '$49.99' is 4999. Null if the "
+            "never a decimal: '€100' is 10000, '€49.99' is 4999. Null if the "
             "user set no upper bound."
         ),
     )
@@ -139,8 +139,8 @@ SYSTEM_PROMPT = (
     "state is null — never guess a category, colour or size, and never use 0 "
     "for a price that was not mentioned, because 0 means free. "
     "Prices are whole numbers of CENTS, never dollars and never decimals: "
-    "'under $100' is max_price_cents 10000, '$49.99' is 4999, "
-    "'at least $20' is min_price_cents 2000."
+    "'under €100' is max_price_cents 10000, '€49.99' is 4999, "
+    "'at least €20' is min_price_cents 2000."
 )
 
 

@@ -25,6 +25,7 @@ import html
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 
+from shopagent.money import format_amount
 from shopagent.payments import stripe_svc
 from shopagent.payments.stripe_svc import MissingStripeKey
 
@@ -42,38 +43,6 @@ _PAGE = """<!doctype html>
 <h1>{heading}</h1>
 {body}
 """
-
-
-# Currencies whose smallest unit *is* the unit: no decimal part exists, so
-# dividing by 100 would invent one. Not exhaustive — these are the ones a
-# shop like this plausibly meets. Anything unlisted is treated as two decimals,
-# which is right for every currency this project actually sells in.
-ZERO_DECIMAL_CURRENCIES = frozenset(
-    {"bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg", "rwf",
-     "ugx", "vnd", "vuv", "xaf", "xof", "xpf"}
-)
-
-
-def format_amount(minor_units: int | None, currency: str | None) -> str:
-    """Render a Stripe amount for a person to read.
-
-    Stripe speaks minor units and so does this project, all the way from
-    `price_cents` through `amount_total` — which is deliberate and is why there
-    is no rounding anywhere in the money path. A page is where that stops being
-    right: `4200 USD` reads as four thousand dollars, and the shopper who just
-    paid $42 has no way to tell which one happened.
-
-    So the conversion lives here, at the boundary, and nowhere else — the same
-    place the `amount_cents` to `price_cents` rename happens for the same
-    reason.
-    """
-    if minor_units is None:
-        return "—"
-
-    code = (currency or "").lower()
-    if code in ZERO_DECIMAL_CURRENCIES:
-        return f"{minor_units:,} {code.upper()}"
-    return f"{minor_units / 100:,.2f} {code.upper()}"
 
 
 def _render(title: str, heading: str, body: str) -> HTMLResponse:
