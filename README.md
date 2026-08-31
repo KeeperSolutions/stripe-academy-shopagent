@@ -6,6 +6,93 @@ natural language: the catalog is exposed over **MCP**, cart and orders over a
 **REST API**, and payment runs through **Stripe** with a webhook flipping the order
 status to `paid`.
 
+## Architecture
+
+```
+                       a person at a terminal
+                                 │
+   "add the second one" ─────────┤   the payment page, printed
+                                 │   verbatim from the tool result —
+                                 ▼   the model never sees the URL
+   ┌────────────────────────────────────────────────────────────────┐
+   │ llm/loop.py :: run_tool_loop                                   │
+   │ a while, a message list, a dispatch. Byte-stable since D2      │
+   │ (161bdc1c…9d00): nothing below sits inside it, all of it wraps │
+   └───────┬─────────────────────────────────────┬──────────────────┘
+           │ the conversation                    │ one tool call
+           ▼                                     ▼
+   ┌─────────────────────────┐   ┌──────────────────────────────────┐
+   │ GuardedClient   D9·D10  │   │ GuardedRegistry      D9 → D10    │
+   │ no amount in an answer  │   │ create_checkout is parked, not   │
+   │ that no tool produced:  │   │ run. The total a person approves │
+   │ one corrective retry,   │   │ is read from view_cart and       │
+   │ then a fallback naming  │   │ formatted here — never taken     │
+   │ the figure it could     │   │ from the model's prose. One      │
+   │ not trace.              │   │ approval, good for one turn.     │
+   ├─────────────────────────┤   ├──────────────────────────────────┤
+   │ TracedClient      D10   │   │ RememberingRegistry        D9    │
+   │ inside the guard, so    │   │ last_search, seen variant ids,   │
+   │ a corrected turn is     │   │ seen amounts, cart_id, order_id, │
+   │ billed twice and        │   │ checkout_url — state the model   │
+   │ traced twice.           │   │ is never handed.                 │
+   └───────┬─────────────────┘   ├──────────────────────────────────┤
+           │                     │ TracedRegistry            D10    │
+           ▼                     │ watches; it does not decide.     │
+   OpenAI, Chat Completions      └───────────────┬──────────────────┘
+   (the loop stays here, not                     │
+    on somebody's server)                        │
+                    ┌────────────────────────────┴─────┐
+                    │ MCP, stdio                       │ HTTP + X-API-Key
+                    ▼ a subprocess                     ▼ another service
+   ┌───────────────────────────────────┐  ┌─────────────────────────────────┐
+   │ mcp_client/ ──▶ mcp_server/       │  │ tools/commerce.py ──▶ tools/    │
+   │ registers whatever the server     │  │ http.py ──▶ api/ (FastAPI)      │
+   │ lists; naming a tool here is      │  │ carts, orders, checkout, cancel,│
+   │ forbidden, and it is a thin       │  │ refund. The rules live in       │
+   │ wrapper only — the search         │  │ api/services/, which imports no │
+   │ lives one layer down, in          │  │ FastAPI — so a webhook and an   │
+   │ catalog/.                         │  │ agent tool reach them too.      │
+   └────────────────┬──────────────────┘  └────────────┬────────────────────┘
+                    │                                  │
+                    └────────────────┬─────────────────┘
+                                     ▼
+                      Postgres 16 + pgvector
+                      catalog — seed-built, disposable
+                      carts · orders · processed_events — real data
+                                     ▲
+                                     │ only a signed webhook may write `paid`
+                    Stripe ──────────┘ api/routers/webhooks.py → lifecycle.py
+```
+
+**Two protocols, on purpose.** The catalog reaches the model through **MCP**
+because it is somebody else's data in the shape this project wanted to learn:
+a server publishes tools, the client registers whatever it is given, and
+nothing on this side may match on a tool name. That constraint is the point —
+swap the server and the agent gains its tools without a line changing here.
+The catalog is also read-only and idempotent, so the worst a bad call costs is
+a wasted round trip.
+
+Cart and checkout reach it over **HTTP**, because they *write*, and because
+the writes have to be reachable by callers that are not an agent at all.
+`place_order` locks inventory under `SELECT ... FOR UPDATE`; only a signed
+webhook may move an order to `paid`; a person with `curl` and the API key can
+do everything the model can. Putting those behind MCP would have made this
+project's own agent the only client of its own shop, and would have hidden the
+protections that bind everyone rather than just the model.
+
+**The gate and the guardrails bind the model, not the shop**, and the diagram
+places them accordingly: they sit between `run_tool_loop` and the tools, above
+both protocols. They exist because a model can be talked into spending money —
+not because HTTP is dangerous. Nothing in `agent/` is a substitute for the
+inventory lock, the lifecycle table or the webhook signature, which sit below
+and apply to every caller.
+
+**`run_tool_loop` is in none of it.** Its source hashes to `161bdc1c…9d00` on
+`main` and on every branch since D2. D5 changed where tools come from, D9
+changed what the model is told and what it may say, D10 added tracing — each
+of them by wrapping, and the hash is how that claim is checked rather than
+asserted.
+
 ## Prerequisites
 
 - Python 3.11+
@@ -33,10 +120,44 @@ cp .env.example .env     # .env is never committed; fill in your keys locally
 #                           redirects a browser to.
 #   SHOPPER_ID              who the CLI shops as, and the key of the profile it
 #                           remembers between conversations. Blank means no
-#                           long-term memory, which is not an error.
+#                           long-term memory, which is not an error. It is a
+#                           label, not a credential: it authenticates nobody,
+#                           and it is redacted before a trace leaves the
+#                           process.
 #   CURRENCY                the shop's currency, `eur` by default. Changing it
 #                           after seeding means a reseed: `prices` rows carry
 #                           the currency they were written with.
+#
+# Four that D10 added, all optional:
+#   LANGFUSE_PUBLIC_KEY     a project on https://cloud.langfuse.com, or your
+#   LANGFUSE_SECRET_KEY     own instance via LANGFUSE_HOST. Leave them blank
+#   LANGFUSE_HOST           and the agent runs untraced and says so once in
+#                           its banner — observability is one part of this
+#                           system, not a precondition for the rest.
+#   TRACE_REDACT_TEXT       `true` by default. Every field a person wrote —
+#                           the customer's messages, the model's answers, the
+#                           system prompt with the profile name in it, the
+#                           `query` argument, SHOPPER_ID — is replaced with a
+#                           salted digest before the trace leaves this
+#                           process. What still travels is this shop's own
+#                           data and this process's own measurements: tool
+#                           names and their other arguments, tool results,
+#                           amounts, order ids, product names, tokens, cost,
+#                           latency and which guardrail refused what.
+#                           Set it false on your own machine when you need to
+#                           read a trace as a conversation; the default must
+#                           not be the setting somebody has to remember.
+#
+# Three more, with defaults chosen rather than inherited:
+#   OPENAI_CONNECT_TIMEOUT_SECONDS  10
+#   OPENAI_READ_TIMEOUT_SECONDS     90
+#   OPENAI_MAX_RETRIES              2   worst case (10+90) x 3 = 300 seconds.
+#                                       The SDK's own default is read=600s
+#                                       with two retries, which turns a
+#                                       dropped connection into a
+#                                       thirty-minute silence. Measured: a
+#                                       D10 eval pass sat there for ten
+#                                       minutes.
 
 # 4. database (Postgres 16 + pgvector)
 docker compose up -d
@@ -60,7 +181,7 @@ python scripts/create_schema.py   # exits 2 if a column or foreign key is missin
 # 7. verify
 docker compose exec db psql -U shopagent -d shopagent \
   -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
-pytest tests/ -v          # 932 tests; add -m network for the ones that cost money
+pytest tests/ -v          # 1049 pass; add -m network for the ones that cost money
 ```
 
 Step 6 matters on any database that predates a schema change: `create_all`
@@ -134,12 +255,32 @@ python scripts/create_schema.py         # pgvector + create_all, idempotent
 python scripts/seed_catalog.py          # 30 products; --reset to rebuild
 python scripts/embed_catalog.py         # vectors + HNSW index; --force to redo
 
+# evals — what this shop is claimed to do, settled by a run
+python scripts/run_evals.py --list      # free: every scenario and its claims
+python scripts/run_evals.py             # costs money: ~$0.012 for all ten
+python scripts/run_evals.py --only the_happy_path_reaches_a_payment_page
+                                        # the report is also written to
+                                        # notes/eval-report.txt, because D9
+                                        # paid twice for a run it read with
+                                        # `tail`
+
 # tests
-pytest tests/ -v                        # 932, offline and database
+pytest tests/ -v                        # 1092 collected: 1049 pass, 20 skip,
+                                        # 23 deselected because they cost money
 pytest tests/ -m network                # the 4 embedding tests and the 3 chain runs;
                                         # these cost money and need uvicorn running
 pytest tests/ -m stripe                 # the 16 that call Stripe in test mode (free)
+pytest tests/ -m db                     # the 429 that need Postgres; they skip
+                                        # with a reason when it is unreachable
 ```
+
+The eval run needs `uvicorn` and Postgres up, the same as the agent, and
+`STRIPE_WEBHOOK_SECRET` for the one scenario that pays. It drives the CLI's own
+entry point — `build_tool_setup` then `run_tool_loop` — so the gate, the memory,
+the guardrails, the traced wrappers and the MCP catalog are the ones a customer
+gets rather than a copy assembled for the test. Each scenario undoes itself **by
+id**, never by truncating a table, and a paid order is *refunded* rather than
+deleted, because `paid -> cancelled` is not in the transition table.
 
 Paying goes through a Stripe Checkout Session: `POST /orders/{id}/checkout`
 returns a URL, and the test card is `4242 4242 4242 4242` with any future date
@@ -187,6 +328,84 @@ of six and says the catalogue is unavailable.
 
 Pass the server path, not `-m shopagent.mcp_server.server`, to the Inspector: it
 parses `-m` as one of its own flags and the module never starts.
+
+## Eval results
+
+One full pass on 2026-08-31, `gpt-5.6-luna`: **8 of 10 scenarios passed**, 68
+model calls, **$0.011674**. The two that failed did not fail for the same kind
+of reason, and the number on its own would suggest they did.
+
+| Scenario | Result | Calls | Cost |
+|---|---|---|---|
+| `a_price_limit_becomes_a_filter` | PASS | 2 | $0.000298 |
+| `a_semantic_query_finds_what_shares_no_words_with_it` | PASS | 2 | $0.000337 |
+| `the_second_one_means_the_second_row` | **FAIL** | 6 | $0.001075 |
+| `a_size_the_shop_does_not_stock_is_refused` | PASS | 4 | $0.000577 |
+| `a_checkout_is_put_to_a_person_before_it_happens` | PASS | 11 | $0.001827 |
+| `no_amount_reaches_the_customer_that_no_tool_produced` | PASS | 6 | $0.001719 |
+| `the_happy_path_reaches_a_payment_page` | PASS | 11 | $0.001587 |
+| `an_ambiguous_request_is_answered_with_a_question` | **FAIL** | 2 | $0.000484 |
+| `removing_a_line_changes_the_total` | PASS | 11 | $0.001854 |
+| `an_order_reads_paid_only_after_the_webhook` | PASS | 13 | $0.001914 |
+
+**`the_second_one_means_the_second_row` — model variance.** The scenario asks
+for "the second one" after a search and a size check, and asserts that
+`add_to_cart` runs with the id in row two. The model called `search_products`
+and `check_stock`, resolved the ordinal **correctly** — it named Summit Peak
+Pro, which was the second row — and then declined to act, asking the customer
+to choose between two products instead. The reason it gave for declining
+("its variant wasn't the second result in the stock check") describes no
+guardrail in this codebase; nothing refused it, and there were zero
+unknown-variant refusals in the whole pass. D9 measured the same phrase working
+twice. So the claim is unchanged and the run is what moved.
+
+**`an_ambiguous_request_is_answered_with_a_question` — the claim is wrong, not
+the shop.** Asked for "something for my trip", the model listed options and
+ended "Tell me your trip type, preferred item, and budget." It bought nothing
+and guessed nothing: `tools_not_called: [add_to_cart, create_checkout]` passed.
+What failed is `answer_matches: "\?"` — the scenario operationalised "asks for
+clarification" as "contains a question mark", and a request for clarification
+in the imperative carries none. That is a test asserting the presence of a
+character rather than the correctness of a behaviour, the same class of defect
+D9 recorded when `"dollar" in description` went on passing in a euro shop.
+
+**Neither was tuned away, and that is the point of writing them down.** The
+prompt, the tool descriptions, the guardrails and the code were not touched to
+make a scenario green, and neither expectation was widened to accept what
+happened. A suite that is edited until it passes measures the editing. The
+second failure names a real repair — the expectation needs to describe asking
+rather than punctuation — and it is filed as an open gap rather than patched in
+the same breath as the run that found it.
+
+**The amount guardrail has still never fired against a real model**, five days
+running. Scenario 6 asks for arithmetic and passed, but not by the model
+declining: it worked out that three pairs at €94.99 come to €284.97, *called
+`add_to_cart` with quantity 3 first*, and quoted the €284.97 that came back in
+the tool result. The figure was traceable because the shop had produced it, so
+there was nothing to catch. The rule holds exactly as written and the branch
+behind it remains unexercised outside offline tests.
+
+## What is not finished
+
+The full list, with the reasoning behind each, is in
+[JOURNAL.md](JOURNAL.md#known-gaps). The ones worth knowing before using any of
+this:
+
+- **Two eval scenarios fail**, for the two different reasons above. The suite
+  is red on purpose rather than green by adjustment.
+- **The amount guardrail's fallback has never run against a real model.** It is
+  proven to do the right thing when handed a bad answer; it is not proven that
+  a real model produces one.
+- **The rule about amounts cannot tell "read from a tool" from "computed, then
+  confirmed by a tool".** Scenario 6 shows the second case passing, correctly by
+  the letter and by accident in spirit — the order of operations decides.
+- **The suite's database guard cannot tell an eval leftover from a real Stripe
+  delivery.** `stripe listen` writes `processed_events` rows on its own while it
+  runs. The message says so; the guard cannot distinguish them.
+- **No demo video.** Deliberately deferred rather than dropped: the web
+  interface arrives on D11, and a recording of the CLI would be a week stale on
+  the day after it was made. It gets made against the interface people will
+  actually see.
 
 Findings, decisions and open questions from each day are in
 [JOURNAL.md](JOURNAL.md).

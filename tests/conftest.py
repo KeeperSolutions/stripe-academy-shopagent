@@ -40,7 +40,7 @@ CLEAN_UP_COMMAND = "python scripts/manual_test_state.py restore"
 
 
 def pytest_collection_modifyitems(config, items):
-    """Stop before the first test if a manual run is still in the database.
+    """Stop before the first test if the database still holds commerce rows.
 
     Five times now, a leftover order has turned ~29 tests red for a reason with
     nothing to do with what changed: `test_api_orders` and
@@ -69,6 +69,15 @@ def pytest_collection_modifyitems(config, items):
     those four modules here, and that list goes stale the first time somebody
     writes a fifth. The cost of being broad is one command; the cost of being
     stale is this paragraph again.
+
+    **A row is not proof that somebody drove the API by hand.** `stripe listen`
+    forwards deliveries for as long as it runs, so an event from an earlier
+    session — a Checkout Session expiring half an hour later, a refund settling
+    — lands in `processed_events` while nobody is doing anything at all. That
+    happened on D10: the guard fired after an eval pass whose own rows had all
+    been cleaned up, on one genuine `checkout.session.expired`. The message
+    says so, because the first encounter otherwise reads as the guard being
+    broken rather than as it working.
     """
     if not any(item.get_closest_marker("db") for item in items):
         # Nothing collected touches Postgres — do not even connect. This is
@@ -96,9 +105,13 @@ def pytest_collection_modifyitems(config, items):
 
     counts = ", ".join(f"{count} {table}" for table, count in dirty.items())
     pytest.exit(
-        f"\nThe database still holds a manual run: {counts}.\n"
+        f"\nThe database still holds rows these tests assume are not there: {counts}.\n"
         f"This is not a regression — around 29 db tests assert these tables are "
         f"empty and would fail for that reason alone.\n"
+        f"Usually a manual run through /docs or the CLI. It can also be a real "
+        f"Stripe delivery: `stripe listen` keeps forwarding for as long as it "
+        f"runs, so a session expiring or a refund settling from an earlier "
+        f"session records an event here with nobody at the keyboard.\n"
         f"Clean up with:  {CLEAN_UP_COMMAND}\n"
         f"(That deletes rows created since the last snapshot. Anything older "
         f"has to go by hand, and an order holds stock: decrement "

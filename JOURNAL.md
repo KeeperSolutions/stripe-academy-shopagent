@@ -1253,6 +1253,18 @@ prompt. The tool list stayed at ten. What `last_search` is actually for is the
 case nobody has hit yet: the message list is the first thing a trimmed context
 loses, and it is exactly what an ordinal reads.
 
+*Amended on D10, after a third measurement.* "Measured twice, both correct" was
+accurate about resolving and was read as a claim about behaviour, which it is
+not. In the D10 eval pass the model resolved the ordinal **correctly** — it
+named Summit Peak Pro, which was row two of the list it had printed — and then
+declined to call `add_to_cart` at all, asking the customer to choose between
+two products and giving a reason no guardrail had produced. So the entry's
+finding stands as written: ordinal *resolution* needs no mechanism, and three
+measurements now agree on that. What is new is that resolving and acting are
+separable, and the entry did not distinguish them because nothing had yet made
+them come apart. See the D10 findings and `the_second_one_means_the_second_row`
+under Open.
+
 **`Price.currency` was a second place where the shop's currency was decided.**
 Moving from USD to EUR should have been one line in `config.py`, because
 `catalog/seed.py` already read `get_settings().currency`. It was not:
@@ -1336,6 +1348,221 @@ rather than from the redirect. The order went `pending -> paid` in the database
 and `inventory.reserved` rose by one and stayed, which is correct: units leave
 `quantity` when they ship, and nothing ships here.
 
+## Day 10 — findings
+
+**The knowledge was already in this repository, and it was not applied.** Step 2
+established that Langfuse keeps one resource manager per public key,
+*process-wide* — established it concretely, by watching tests interfere with one
+another, and acted on it by giving every test fixture its own key. Step 3 then
+wrote an eval runner that builds a tracer per scenario and shuts it down per
+scenario, and two paid passes hung.
+
+Nothing was missing. The fact lived in the repository as the fix to one test
+problem rather than as a property of the library, so when the same property
+mattered somewhere else there was nothing to consult. That is a different
+failure from not knowing, and the remedy is different too: not "read more
+carefully" but "write the fact down as a fact about the library". The comment in
+`run_all` says it that way now, with the measurement attached, which is the form
+that would have been usable from the other end of the codebase.
+
+**A falsification that does not reproduce the mechanism is worse than none,
+because it manufactures confidence in a wrong diagnosis.** After the first pass
+hung, the hypothesis was Langfuse — the correct one. The probe written to check
+it called `start_observation` in a loop, did not hang, and was read as having
+disproved it. So the search moved on, and found a real defect in the OpenAI
+client that had nothing to do with this hang.
+
+The probe never called `flush()` on a tracer whose resource manager had already
+been shut down, which is the only sequence that blocks. It exercised a
+neighbouring operation and answered a question nobody had asked, and its
+negative result was treated as evidence about a question it never touched. A
+probe that does not reproduce the mechanism can only ever return "no", and "no"
+from such a probe is indistinguishable from "no" from a good one.
+
+**What settled it was a stack, not a hypothesis.** The second pass hung in the
+same scenario, with `faulthandler.dump_traceback_later(repeat=True)` armed:
+
+```
+obs/tracing.py:166        in conversation   ->  self.flush()
+langfuse/_client/resource_manager.py:608  ->  self._score_ingestion_queue.join()
+queue.py                  in join          ->  waiting
+```
+
+Arming the dump costs three
+lines and it is the difference between a diagnosis and a guess; the threshold is
+derived from the OpenAI timeout settings rather than typed as a number, so a
+dump cannot fire on a scenario that is merely slow.
+
+**A two-cycle probe lied three times in one evening, and the condition is the
+third cycle.** Twice while chasing the timeout and once while writing the
+reproduction, a test that built and shut down two tracers passed and was
+reported as passing. Instrumenting the queue is what showed why:
+
+```
+cycle 1   shutdown  the consumer threads stop.  unfinished_tasks == 0
+cycle 2   shutdown  a stop sentinel per consumer is enqueued with nobody
+                    left to take it.            unfinished_tasks == 1
+cycle 3   flush     queue.join() waits for a task_done() that cannot come
+```
+
+That is not a detail. It is the explanation for the shape of both hangs: they
+were in **scenario three**, both times, rather than anywhere random, and a
+two-cycle probe is structurally incapable of seeing it.
+
+**A test that tests the library instead of our own code passes after the fix
+too.** The first working reproduction drove three tracer cycles and asserted the
+hang. It failed against the old runner, which was the requirement — and it would
+have gone on failing after the fix, because what it measures is Langfuse's
+behaviour, and Langfuse did not change. A regression test that cannot go green
+is not a regression test; it is an alarm wired to the wrong door.
+
+It became two. A *measurement* of the library, which asserts the precondition
+(`unfinished_tasks > 0` with the consumers dead) in milliseconds, with no timer
+and no thread to leave hanging. And a *guard* on our own code, which asserts the
+shape that avoids it — one tracer, built once, handed to every scenario, shut
+down once at the end — and which fails outright against the old runner because
+`run_all` had no tracer to hand anybody. The measurement is the one that fails
+the day Langfuse fixes this, which is exactly when somebody should read the
+comment.
+
+**The OpenAI SDK's default read timeout is 600 seconds, and it was found by
+following a wrong hypothesis.** `OpenAI(api_key=...)` ships `read=600s` with two
+retries, so a connection the peer has dropped stalls a turn for up to thirty
+minutes with nothing printed. It is a real defect, it affects the CLI as much as
+the eval runner, and it is worth the fix — and it is not what was hanging the
+evals. It was found because the probe above sent the search in the wrong
+direction, which is the honest account of it: a wrong diagnosis that happened to
+walk past something true.
+
+The replacement is `connect=10`, `read=90`, `max_retries=2`, through
+`get_settings()` like everything else. **Worst case (10 + 90) × 3 = 300
+seconds**, written in the comment because nobody derives it from three separate
+fields, and because it is the number a person at a terminal actually waits. 90
+seconds is roughly forty times the slowest completion measured in this project.
+A timeout must produce a sentence rather than a silence, so the CLI prints
+`[error] APITimeoutError: Request timed out.` and returns the prompt.
+
+**The model confabulates the reason it cannot act, not only the answer.**
+Scenario 3 asks for "the second one" after a search and a size check. The model
+resolved the ordinal **correctly** — it named Summit Peak Pro, which was row two
+— and then declined to add it:
+
+> I can't add it because its variant wasn't the second result in the stock
+> check.
+
+No guardrail said that. There were zero unknown-variant refusals in the entire
+pass, and nothing in this codebase produces that sentence. The invention was not
+a price or an id, which is what the amount rule and the variant check are built
+for; it was a *reason*, offered in place of an action, and it is fluent enough
+to survive a reading. A guardrail can check a figure against the tool results
+that produced it. There is nothing to check a justification against.
+
+**Arithmetic the model makes true before it says it passes the amount rule,
+correctly by the letter.** Scenario 6 asks what three pairs come to. The model
+worked out 3 × €94.99 = €284.97, **called `add_to_cart` with quantity 3 first**,
+and then quoted the €284.97 that came back in `total_cents`. The rule is "no
+amount in an answer that no tool produced", and by the time the answer existed a
+tool had produced it. The scenario passed and the guardrail had nothing to
+catch.
+
+That is the rule working as written, and it is also the discovery that the rule
+cannot distinguish *read from a tool* from *computed, then confirmed by a tool*.
+The order of operations decides, and the second order is the one that would let
+a wrong figure through if the tool had happened to agree for a different reason.
+Recorded as a gap rather than patched, because the difference is not visible in
+the text of the answer at all.
+
+**A test asserting the presence of a character is not asserting a behaviour.**
+Scenario 8 claims that an ambiguous request is answered with a question, and
+`answer_matches: "\?"` is how that was written down. The model listed options
+and ended "Tell me your trip type, preferred item, and budget." — a request for
+clarification in the imperative, carrying no question mark. It bought nothing
+and guessed nothing; the half of the scenario that checks tool calls passed.
+
+This is the same class of defect D9 recorded for `"dollar" in description`, and
+it is instructive that it recurred in the file written to avoid exactly that:
+`scenarios.yaml` says in its own header that the criterion is tool calls and
+database state, and then operationalises the one text claim as a substring. The
+claim has not been widened to accept what happened, because that is the move
+that turns an eval suite into a record of its own edits. It is filed as an open
+gap with the repair named.
+
+**One redaction switch, not one per field, because the field the rule started
+from was not the leaky one.** `MCP_LOG_REDACT_QUERY` digests the `query`
+argument in a log that stays on this disk, and D10 had to send the same
+arguments *plus* the profile name, the amounts, the order id and the whole
+conversation to a third party over the network. The stricter rule was on the
+weaker path.
+
+Deciding `query` on its own turned out to be impossible in the direction that
+matters: the customer's message is what produced the query, the model's answer
+quotes it back, and the system prompt carries `display_name` — measured rather
+than feared, in the step 1 live run, where the model opened its answer with the
+customer's first name. Redacting the argument while sending the sentence it came
+from is theatre. So there is one rule and one switch over every field a person
+wrote, `TRACE_REDACT_TEXT`, defaulting to on, and the cost is stated rather than
+hidden: with it on, a trace cannot answer "what did the customer say". It
+answers what the plan asked of it — cost, tools and their order, which guardrail
+fired, where the time went.
+
+**The leak was in the replay, and only the wire showed it.** Every unit test
+agreed the `query` argument was digested. A live trace carried **eighteen
+plaintext copies** of `trail running shoes`, beside a `search_products` span
+that showed the digest correctly. Tool-call `arguments` are replayed verbatim
+into the input of every later generation in the conversation, and
+`redact_messages` looked at `content` and never at `tool_calls`.
+
+Two things made it invisible. The fixtures built assistant messages with
+`content` and no `tool_calls`, so no test could have seen it — the D8 lesson
+about `refunded_event` and `payment_intent`, repeated in a different file. And a
+comment in the code had already reasoned the case away, which is worse than
+silence: it is a note telling the next reader that somebody checked. Reading the
+actual trace is what found it, and a second live run is what confirmed it
+closed.
+
+**`TracedClient` goes inside `GuardedClient`, and the order changes the
+number.** The amount guardrail can send a second, corrected request, and that
+request is really billed. Wrapped the other way round, a trace would record one
+call where two happened and report half the cost of every corrected turn. The
+same reasoning made `TracedRegistry` a forwarding wrapper rather than a fourth
+`ToolRegistry` subclass: the other three subclass because each *changes what
+dispatch does*, and this one only watches.
+
+**`run_tool_loop` is still byte-identical to D2.** Its source hashes to
+`161bdc1c…9d00` on `main` and on this branch. Instrumentation is the easiest
+thing in this project to justify putting inside that `while`, and D10 is
+therefore the day that claim was worth testing rather than repeating: a
+non-blocking confirmation protocol, a tracing layer on every model call and
+every tool call, and an eval runner that drives the loop from outside — none of
+them touched it.
+
+**A scenario can pass every assertion and measure nothing.** The gate scenario's
+first run ended at `say: place the order`, and the model answered by asking for
+confirmation *itself* rather than calling `create_checkout`. No purchase was
+attempted, so the gate never decided, so nothing about the gate was tested — and
+every expectation about tool calls was satisfied. The fix was a second turn that
+carries the conversation past the model's own question, harmless in the branch
+where it does not ask. **The claim did not move; the conversation was made able
+to test it.** Widening the expectation to accept both outcomes would have been
+the other thing, and is what a threshold looks like before anybody calls it one.
+
+**The collection guard fired three times in three days, and the third time it
+was right about something it was not built for.** It exists to stop the suite
+when a manual run has left orders behind. On the third occasion every eval row
+had been cleaned up correctly and the row that tripped it was a genuine Stripe
+delivery — a `checkout.session.expired` for a session opened in an earlier CLI
+session, forwarded by a `stripe listen` that had been running the whole time.
+The guard was working; the message was wrong, because it named a cause that was
+not the cause. It says both now. A guard that is right for a reason its own
+message does not admit reads as a broken guard the first time somebody meets it.
+
+**The pass costs $0.0117 and 68 model calls, and it found two defects the unit
+suite did not.** Both the missing OpenAI timeout and the tracer lifetime are in
+code that 1,049 tests already cover. What those tests had never done is run it
+end to end, ten times, in one process — which is the only condition under which
+either defect is visible. That is the argument for the suite, and it is worth
+stating as a measurement rather than as a hope about evals in general.
+
 ## Known gaps
 
 Every entry carries the day it was written. **Open** entries are grouped by
@@ -1366,25 +1593,40 @@ is a proof. The honest statement is that the surface is narrowed to one short
 labelled string and then defended in depth, not that it is closed. Closing it
 means dropping the name, which is a worse shop.
 
-**The amount fallback has never fired against a real model.** *(D9.)* The
-retry-then-fallback path is tested offline with a scripted client, and in every
-live run this week the model quoted only figures that came from tool results —
-so the branch that produces the fallback text has never run in a real
-conversation. That is a good sign about the model and a bad one about the
-evidence: what is proven is that the code does the right thing when handed a
+**The amount fallback has never fired against a real model.** *(D9, still open
+after D10.)* The retry-then-fallback path is tested offline with a scripted
+client, and in every live run this week the model quoted only figures that came
+from tool results — so the branch that produces the fallback text has never run
+in a real conversation. That is a good sign about the model and a bad one about
+the evidence: what is proven is that the code does the right thing when handed a
 bad answer, not that it does the right thing when a real model produces one.
 Making it fire on purpose would mean provoking an invented amount, which is not
 something that can be ordered up.
 
-**`190 euros`, written as a word, is not caught.** *(D9.)* The amount
-validation matches a number carrying the currency symbol or its ISO code, and
-any number written with exactly two decimals. A bare integer next to the
-currency's *name* falls through all three. Catching it needs a word per
-currency, and `money.py` deliberately keeps one symbol rather than a table of
-every currency's spelling — the same refusal that makes an unknown currency
-render as `284.97 USD` instead of guessing a symbol. The prompt teaches the
-symbol form and every measured run has used it, which is a reason the gap is
-narrow rather than a reason it is closed.
+D10 built a scenario for exactly this and it changed nothing about the entry —
+five days now. `no_amount_reaches_the_customer_that_no_tool_produced` asks for
+arithmetic and asserts the property that holds either way, deliberately, because
+"the guardrail blocked it" is not a claim a run reliably produces and faking it
+with a scripted client would be a unit test of the guardrail wearing an eval's
+clothes. It passed, and the branch stayed unexercised. What the run added is the
+*reason* it passed, which is the next entry.
+
+**The amount rule cannot tell "read from a tool" from "computed, then confirmed
+by a tool".** *(D10.)* Scenario 6 asked what three pairs come to. The model
+worked out 3 × €94.99 = €284.97, called `add_to_cart` with quantity 3 **first**,
+and quoted the €284.97 that came back in `total_cents`. Every figure in the
+answer was one a tool had produced, so the rule was satisfied exactly as
+written, and the arithmetic that preceded it is invisible to the check.
+
+Nothing went wrong here — the tool agreed because the model was right. The gap
+is that agreement is what is verified, and agreement can happen for the wrong
+reason: a model that computes a figure, then makes a call whose result happens
+to contain it, passes the same way. Distinguishing the two means knowing whether
+an amount was *derived from* a tool result or merely *equal to* one, which the
+final text cannot show and which no ordering of the message list settles either,
+since the call genuinely came first. Recorded rather than patched, because the
+plausible fixes — forbidding arithmetic outright, or checking the model's
+intermediate narration — are both worse than the thing they would catch.
 
 **A bare integer is never validated as an amount, on purpose.** *(D9.)* `42` is
 a size, `3` is a stock count, `2` is a quantity and `86263` is a variant id, and
@@ -1703,6 +1945,74 @@ configuration, it has to be read inside the call.
 
 ---
 
+### Open — evaluation and observability
+
+**Two eval scenarios fail, for two different reasons, and neither was tuned
+away.** *(D10.)* The pass is 8 of 10 and stays that way on purpose. Editing a
+prompt, a tool description or an expectation until a run goes green produces a
+suite that measures the editing, so the failures are recorded here instead:
+
+`the_second_one_means_the_second_row` — **model variance.** The model resolved
+the ordinal correctly, named the right product, then declined to call
+`add_to_cart`, giving a reason no guardrail in this codebase produced. D9
+measured the same phrase working twice. Nothing here refused it; the run is what
+moved. There is no code change that would be honest, and there is no threshold
+that would be either — see the note in `scenarios.yaml` about why the vocabulary
+cannot express "n of m runs".
+
+`an_ambiguous_request_is_answered_with_a_question` — **the claim is wrong.** The
+shop behaved correctly: it listed options, asked for clarification and bought
+nothing, and `tools_not_called: [add_to_cart, create_checkout]` passed. What
+failed is `answer_matches: "\?"`, which operationalises "asks for clarification"
+as "contains a question mark"; the model asked in the imperative. The repair is
+named and not yet made — the expectation has to describe asking rather than
+punctuation, and doing that in the same breath as the run that found it is the
+move this whole section exists to avoid. It is the `"dollar" in description`
+defect from D9, recurring in the file written to avoid it.
+
+**A trace cannot answer "what did the customer say", by default.** *(D10.)*
+`TRACE_REDACT_TEXT` is on unless somebody turns it off, so the customer's
+messages, the model's answers, the system prompt and the `query` argument leave
+this process as salted digests. That is the stated bargain and not an oversight
+— the same one `MCP_LOG_REDACT_QUERY` makes, on a path that reaches a third
+party rather than a local disk. What a trace still answers is cost, which tools
+ran in what order, which guardrail fired and where the time went. Reading a
+trace as a conversation means `TRACE_REDACT_TEXT=false` on your own machine, and
+that is a deliberate act rather than a default.
+
+**A tool result passes into a trace uncensored, and only a sentence stops that
+becoming wrong.** *(D10.)* Tool results are this shop's own data — a catalogue
+row, a price, a stock count — and they are most of what makes a trace readable.
+`view_cart` and `check_order_status` are not only that: they carry the order id,
+the amounts and what this customer chose, and all three pass today on the
+argument that none is a personal detail. That argument is about the fields those
+tools return *now*. Nothing in `redact_messages` looks at a `tool` message at
+all, so a field added later — an email on an order, a delivery address on a cart
+— would travel silently. A filter would have to know which fields are which and
+this project has no such list, so the control is a rule written in `CLAUDE.md`:
+adding a customer's own data to a commerce response is a change that has to
+reach `obs/redaction.py` in the same commit. A rule is weaker than a guard and
+is what there is.
+
+**The eval suite needs three processes and real money, like the chain test it
+generalises.** *(D10.)* `python scripts/run_evals.py` needs Postgres, a running
+`uvicorn`, the MCP server, an OpenAI key and — for the scenario that pays — a
+Stripe webhook secret. It costs about $0.012 a pass. It is closer to
+reproducible than `tests/test_agent_chain.py` was, because it undoes itself by
+id and reports what it could not undo, but it is still not something CI could
+run without an account and a budget, and two scenarios' results depend on a
+model that is free to answer differently tomorrow.
+
+**No demo video, deferred rather than dropped.** *(D10.)* The plan's Definition
+of Done asks for one and D10 did not make it, deliberately: the web interface
+arrives on D11, and a recording of the CLI would be stale the day after it was
+made. Recording it against the interface people will actually use costs one
+extra day and produces an artefact worth keeping. The decision is a delay with a
+date, not a quiet omission — which is why it is written here rather than left
+out of the list.
+
+---
+
 ### Open — deployment and operations
 
 **There is no readiness endpoint.** *(D6.)* `/health` deliberately does not touch
@@ -1754,7 +2064,19 @@ counts the two tables before the first test and, when either is dirty, stops the
 run with one sentence naming the counts, saying it is not a regression, and
 giving the cleanup command. Thirty seconds of confusion became one line.
 
-Three things about that are worth stating, because each was a live choice.
+**And it does not know why a row is there.** *(D10.)* On its third firing in
+three days, every eval row had been cleaned up correctly and the row that
+stopped the run was a genuine Stripe delivery: a `checkout.session.expired` for
+a session opened in an earlier CLI session, forwarded by a `stripe listen` that
+had been running the whole time. The guard was right and its message was not —
+it named a manual run as the cause. The message names both now, which is a
+repair to the *report* and not to the gap: nothing distinguishes a row this
+suite made from one Stripe delivered, and nothing could without recording who
+wrote it. Anybody running `stripe listen` alongside the suite should expect this
+and read the second sentence.
+
+Three things about the original choice are worth stating, because each was a
+live one.
 It stops rather than skipping: a skip reports success in green, and D9 already
 measured what that costs when `452 passed, 380 skipped` was technically correct
 and unreadable. It stops rather than failing one test and skipping the rest,
@@ -1781,6 +2103,33 @@ the page: a redirect is a URL anybody can open.
 ---
 
 ### Closed
+
+**`190 euros`, written as a word, was not caught.** *(D9 → closed on D9, found
+stale on D10.)* The original entry read: "The amount validation matches a number
+carrying the currency symbol or its ISO code, and any number written with
+exactly two decimals. A bare integer next to the currency's *name* falls through
+all three. Catching it needs a word per currency, and `money.py` deliberately
+keeps one symbol rather than a table of every currency's spelling — the same
+refusal that makes an unknown currency render as `284.97 USD` instead of
+guessing a symbol. The prompt teaches the symbol form and every measured run has
+used it, which is a reason the gap is narrow rather than a reason it is closed."
+
+It was closed the same day, in the review round on PR #9, and the entry was not
+updated. `money.WORDS` holds one entry — `"eur": ("euro", "euros")` — the
+guardrail reads it, and `tests/test_guardrails.py` asserts that "That will be 94
+euros." is caught while "That is 189.98 euros." is not, because the second is
+already a supported amount. The reasoning the entry gave against a table of
+spellings still holds and is why there is one entry rather than a currency list:
+the shop has one currency, and an unknown one still renders as `284.97 USD`
+rather than guessing.
+
+**This is the second time an entry claimed a protection did not exist while it
+did**, which is the direction of error this section's grouping note was written
+about after the first. Both times the code moved in a review round and the
+journal did not. The pattern is specific enough to name: a gap closed by a
+review comment rather than by the day's own work is the one that goes stale,
+because the day's write-up is finished by then. Found on D10 only because
+something else sent a reader back to this section.
 
 **`ping` was offered to the model.** *(D5 → closed D9.)* The original entry
 read: "It is a diagnostic tool with no business meaning, and it sits in the
