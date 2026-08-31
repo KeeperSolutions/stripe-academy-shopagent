@@ -60,7 +60,7 @@ from shopagent.evals.spec import Scenario, load_scenarios
 from shopagent.llm.client import LLMClient
 from shopagent.llm.loop import build_tool_setup, run_tool_loop
 from shopagent.llm.usage import UsageTracker
-from shopagent.obs.tracing import build_tracer
+from shopagent.obs.tracing import Tracer, build_tracer
 from shopagent.payments.stripe_svc import STRIPE_API_VERSION
 
 # How long a scenario's HTTP calls may take. Generous: these run against a
@@ -147,16 +147,42 @@ def run_all(names: list[str] | None = None) -> list[Result]:
                 f"known: {', '.join(sorted(known))}"
             )
         scenarios = [scenario for scenario in scenarios if scenario.name in names]
+    # **One tracer for the whole run, shut down once.** Langfuse keeps one
+    # resource manager per public key, *process-wide*, so a tracer is not a
+    # per-unit-of-work object however much it looks like one.
+    #
+    # This file used to build and shut one down per scenario. What that does is
+    # measured rather than reasoned about: the first `shutdown()` stops the
+    # score-ingestion consumer threads; the second one enqueues a stop sentinel
+    # per consumer onto a queue nothing is left to drain, leaving
+    # `unfinished_tasks == 1`; and the third scenario's `flush()` — which is
+    # `queue.join()` — waits for a `task_done()` that will never come. Two eval
+    # passes hung there, in scenario three both times, and the second one's
+    # `faulthandler` dump named the line.
+    #
+    # `flush()` per scenario stays: that is what makes a trace visible while the
+    # run is still going, and it is safe as long as the consumers are alive.
+    # `tests/test_evals.py::test_the_run_builds_one_tracer_and_hands_it_to_every_scenario`
+    # is what fails if anybody reaches for `shutdown()` here again, and
+    # `tests/test_tracing.py::test_a_second_shutdown_strands_the_queue_a_later_flush_waits_on`
+    # is the Langfuse measurement that guard rests on.
+    tracer = build_tracer()
     try:
-        return [run_one(scenario) for scenario in scenarios]
+        return [run_one(scenario, tracer) for scenario in scenarios]
     finally:
+        tracer.shutdown()
         # Cancelled on the way out so a report written after a slow run is not
         # followed by a stack dump of a process that is merely finishing.
         faulthandler.cancel_dump_traceback_later()
 
 
-def run_one(scenario: Scenario) -> Result:
-    """Drive one scenario end to end, then undo it."""
+def run_one(scenario: Scenario, tracer: Tracer) -> Result:
+    """Drive one scenario end to end, then undo it.
+
+    The tracer is passed in rather than built here, and required rather than
+    defaulted: see `run_all` for what building one per scenario costs. A caller
+    with nothing to trace passes an inert `Tracer()`.
+    """
     result = Result(scenario=scenario)
 
     missing = _unmet(scenario)
@@ -167,7 +193,6 @@ def run_one(scenario: Scenario) -> Result:
     tracker = UsageTracker()
     observed = checks.Observed()
     setup = None
-    tracer = build_tracer()
 
     try:
         with ExitStack() as stack:
@@ -191,8 +216,8 @@ def run_one(scenario: Scenario) -> Result:
     except Exception as exc:  # noqa: BLE001 - one broken scenario must not end the run
         result.error = f"{type(exc).__name__}: {exc}"
     finally:
+        # Flushed, never shut down. See `run_all`.
         tracer.flush()
-        tracer.shutdown()
         result.cost_usd = tracker.total_cost_usd
         result.calls = len(tracker.calls)
         if setup is not None:

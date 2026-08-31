@@ -630,3 +630,73 @@ def test_a_default_langfuse_client_would_use_that_exporter():
     assert span_processor.OTLPSpanExporter is not None
     source = span_processor.__file__
     assert source.endswith("span_processor.py")
+
+
+# --- one process, several tracers (D10, step 4) ---------------------------
+#
+# Langfuse keeps **one resource manager per public key, process-wide**. This
+# file already knew that — `Capture` gives every instance a unique key because
+# two clients sharing one would each read the other's spans — but it was
+# written down as the workaround to that problem rather than as a property of
+# the library, and the eval runner then built and shut down a tracer per
+# scenario in one process.
+#
+# What that does is not subtle once seen: `shutdown()` stops the shared
+# `BatchSpanProcessor`, and the next tracer is handed the same dead manager.
+# Its worker thread is gone, so `flush()` — which is `queue.join()`, waiting
+# for `task_done()` on everything queued — never returns. Two eval passes hung
+# there, in the same scenario both times, and the second one's `faulthandler`
+# dump named the line.
+
+
+def test_a_second_shutdown_strands_the_queue_a_later_flush_waits_on(monkeypatch):
+    """Why a tracer is not a per-unit-of-work object. The evidence, measured.
+
+    This asserts a property of Langfuse rather than of this project, which is
+    unusual and deliberate: it is the *reason* `evals/runner.py` builds one
+    tracer for a whole run, and a reason nobody can check is one that gets
+    undone. If Langfuse ever fixes this, this test fails and whoever is here
+    gets sent to the comment.
+
+    The mechanism, watched cycle by cycle rather than guessed at:
+
+        cycle 1  shutdown -> the score-ingestion consumer thread stops
+        cycle 2  shutdown -> a stop sentinel per consumer goes onto the queue,
+                             and no consumer is left to take it, so
+                             unfinished_tasks becomes 1
+        cycle 3  flush    -> `_score_ingestion_queue.join()` waits for a
+                             `task_done()` that will never come
+
+    Two eval passes hung on that third flush, in scenario three both times.
+    Two earlier attempts to reproduce it used *two* cycles and passed, which is
+    how the wrong diagnosis got reported twice — the stranded queue only
+    appears on the second shutdown.
+
+    No alarm and no hang here: the precondition is what is asserted, in
+    milliseconds, rather than the twenty seconds it takes to observe the block.
+    """
+    from langfuse._client.resource_manager import LangfuseResourceManager
+
+    key = f"pk-lf-shared-{next(_CAPTURES)}"
+    monkeypatch.setattr(
+        "shopagent.obs.tracing.get_settings",
+        lambda: SimpleNamespace(
+            langfuse_public_key=key,
+            langfuse_secret_key="sk-lf-offline",
+            langfuse_host="http://langfuse.invalid",
+        ),
+    )
+
+    for _ in range(2):
+        tracer = build_tracer(span_exporter=InMemorySpanExporter(), flush_at=1)
+        with tracer.conversation(shopper_id="probe", model="m"):
+            tracer.tool(name="view_cart", arguments={}).end()
+        tracer.shutdown()
+
+    manager = LangfuseResourceManager._instances[key]
+    assert not any(c.is_alive() for c in manager._ingestion_consumers)
+    assert manager._score_ingestion_queue.unfinished_tasks > 0, (
+        "the queue a later flush() joins is drained, so the hazard this test "
+        "documents is gone — re-read the comment above and simplify "
+        "evals/runner.py if Langfuse has fixed it"
+    )

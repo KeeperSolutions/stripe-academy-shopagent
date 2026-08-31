@@ -25,6 +25,7 @@ import pytest
 from shopagent.agent.memory import ConversationMemory
 from shopagent.evals import expectations as checks
 from shopagent.evals import runner
+from shopagent.obs.tracing import Tracer
 from shopagent.evals.spec import (
     EXPECTATIONS,
     Expectation,
@@ -438,7 +439,7 @@ def test_a_scenario_that_cannot_run_is_skipped_with_a_reason(monkeypatch):
         "shopagent.evals.runner.get_settings",
         lambda: type("S", (), {"stripe_webhook_secret": None})(),
     )
-    result = runner.run_one(scenario)
+    result = runner.run_one(scenario, Tracer())
 
     assert result.status == "SKIP"
     assert "STRIPE_WEBHOOK_SECRET" in result.skipped
@@ -565,3 +566,41 @@ def test_the_runner_dumps_a_stack_before_anybody_has_to_guess():
     assert "cancel_dump_traceback_later" in RUNNER_CODE, (
         "an armed dump left running would fire after the report"
     )
+
+
+def test_the_run_builds_one_tracer_and_hands_it_to_every_scenario(monkeypatch):
+    """The guard on the fix, at the seam that failed.
+
+    `run_one` used to build its own tracer and shut it down, ten times in one
+    process. Langfuse keeps one resource manager per public key process-wide,
+    so the third scenario's flush waited on a queue two shutdowns had
+    stranded — see
+    `tests/test_tracing.py::test_a_second_shutdown_strands_the_queue_a_later_flush_waits_on`
+    for the measurement.
+
+    What is asserted here is the shape that avoids it: one tracer, built once,
+    passed to every scenario, shut down once at the end. Before the fix this
+    fails outright, because `run_all` called `run_one` with no tracer to give.
+    """
+    from shopagent.obs.tracing import Tracer
+
+    given = []
+    shut_down = []
+
+    class Counting(Tracer):
+        def shutdown(self):
+            shut_down.append(1)
+
+    monkeypatch.setattr(runner, "build_tracer", Counting)
+    monkeypatch.setattr(
+        runner,
+        "run_one",
+        lambda scenario, tracer: given.append(tracer) or runner.Result(scenario=scenario),
+    )
+
+    results = runner.run_all()
+
+    assert len(results) == 10
+    assert len(given) == 10
+    assert len({id(tracer) for tracer in given}) == 1, "a tracer per scenario"
+    assert shut_down == [1], f"shutdown() was called {len(shut_down)} times, not once"
