@@ -55,6 +55,29 @@ class Settings(BaseSettings):
     # Completions on purpose. Blank means the parameter is not sent at all,
     # which is what a model that does not know it needs (e.g. gpt-4o-mini).
     openai_reasoning_effort: OptionalStr = "none"
+    # How long one request to the model may take, and how many times the SDK
+    # may try again. Configured because the default is not a default anybody
+    # chose: `OpenAI(api_key=...)` ships `read=600s` with two retries, so a
+    # connection the peer has dropped stalls a turn for up to thirty minutes
+    # with nothing printed. Measured, not argued — a D10 eval pass hung there
+    # for ten minutes and was killed, and `lsof` showed no open socket to
+    # OpenAI and four in CLOSE_WAIT.
+    #
+    # **Worst case is (connect + read) x (1 + retries) = (10 + 90) x 3 = 300
+    # seconds**, plus the SDK's backoff between attempts. That number is
+    # spelled out because nobody derives it while reading three separate
+    # fields, and because it is the one a person at a terminal actually waits.
+    # The dominant term is the retries, not the read: whoever wants a shorter
+    # worst case should lower `OPENAI_MAX_RETRIES` first, which costs only the
+    # recovery from a transient 5xx, where lowering the read timeout starts
+    # cutting off answers that were going to arrive.
+    #
+    # 90 seconds is roughly forty times the slowest completion this project has
+    # measured (2.3s, in the D10 traces), which is headroom for a longer prompt
+    # and a bad afternoon rather than a guess.
+    openai_connect_timeout_seconds: float = Field(default=10.0, gt=0)
+    openai_read_timeout_seconds: float = Field(default=90.0, gt=0)
+    openai_max_retries: int = Field(default=2, ge=0)
 
     # --- MCP (D4-D5) ---
     # The off switch for the catalog. The agent loop registers the MCP tools
