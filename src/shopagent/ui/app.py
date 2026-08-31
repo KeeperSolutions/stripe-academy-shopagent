@@ -60,9 +60,14 @@ OPENERS = (
 )
 
 WAITING_FOR_YOU = (
-    "The shop is asking you to approve this purchase. Nothing has been ordered "
-    "and nothing has been charged."
+    "Waiting for your confirmation. Nothing has been ordered and nothing has "
+    "been charged."
 )
+
+# The dialog's own heading. It says what is being decided rather than what to
+# press, because the two buttons already say that and the summary underneath is
+# the part worth reading.
+CONFIRM_TITLE = "Confirm this purchase"
 
 
 # --- what this process holds, and what this tab holds --------------------
@@ -164,11 +169,59 @@ def _draw_message(message: turns.ChatMessage) -> None:
         for card in message.cards:
             _draw_card(card)
         if message.payment_url:
-            # Printed in the bytes the shop issued, never relayed by the model:
-            # asked twice for one session, the model changed a character of the
-            # 475-character URL. Measured on PR #9.
-            st.markdown("**Pay here**")
-            st.code(message.payment_url, language=None)
+            # Read from `ChatMessage.payment_url`, which `tools/commerce.py`
+            # wrote onto the conversation's memory — never scraped out of the
+            # model's answer. The model is not given the URL at all: asked
+            # twice for one session it reproduced 475 characters correctly once
+            # and changed one of them the second time, which Stripe answers
+            # with a 401. Measured on PR #9.
+            #
+            # A button rather than the raw string, because a payment page is
+            # something to open, and 475 characters of opaque URL in the middle
+            # of a conversation is something to scroll past.
+            st.link_button(
+                "Pay with Stripe", message.payment_url, type="primary",
+                use_container_width=True,
+            )
+
+
+@st.dialog(CONFIRM_TITLE, dismissible=False)
+def _ask_to_confirm(session: turns.BrowserSession, summary: str) -> None:
+    """Put the parked question to the customer, and carry their answer back.
+
+    **The summary is printed verbatim and is never rebuilt here.**
+    `agent/guardrails.py` made it from a real `view_cart` dispatch, rendered
+    through `money.format_amount`, and that is the whole point of the gate: a
+    person approving a figure the model invented is worse than no gate at all,
+    because it launders the invention through a human and leaves a record
+    saying they agreed. `st.code` rather than `st.markdown`, so the leading
+    spaces and the line breaks survive — markdown would collapse the lines into
+    one paragraph and quietly reflow somebody's order.
+
+    The answer goes through `session.answer_confirmation`, which is
+    `confirmation.resolve_pending` plus one follow-up turn — the protocol D10
+    built for exactly this caller, and the same two calls the CLI and the eval
+    runner make. Nothing here writes to the conversation's memory.
+
+    `dismissible=False` and `st.rerun(scope="app")`: a dialog that can be
+    clicked away would leave the question parked with the chat input disabled
+    behind it, which is a customer with no way forward and no way out.
+    Declining is the way out, and it orders nothing. The `scope="app"` matters
+    because `st.dialog` is a fragment — the default rerun would redraw the
+    dialog and not the transcript the answer just produced.
+    """
+    st.code(summary, language=None)
+    decline, confirm = st.columns(2)
+    if decline.button("Cancel", use_container_width=True, key="confirm-no"):
+        with st.spinner("Cancelling…"):
+            session.answer_confirmation(False)
+        st.rerun(scope="app")
+    if confirm.button(
+        "Confirm", type="primary", use_container_width=True, key="confirm-yes"
+    ):
+        with st.spinner("Placing the order…"):
+            session.answer_confirmation(True)
+        st.rerun(scope="app")
 
 
 def _draw_openers(session: turns.BrowserSession) -> str | None:
@@ -204,22 +257,38 @@ for note in session.notes:
 for message in session.transcript:
     _draw_message(message)
 
-if session.pending is not None:
-    # Shown, not answered. The control that answers it is step 3; until then an
-    # unanswered approval is simply never spendable, which is the safe half of
-    # the protocol rather than a gap in it.
+pending = session.pending
+if pending is not None:
+    # Behind the modal, so the page still says what state it is in — and it is
+    # deliberately the sentence without the summary. The summary belongs to the
+    # dialog; printing it twice on one screen would be two things to approve.
     with st.chat_message("assistant"):
         st.info(WAITING_FOR_YOU)
-        st.code(session.pending.summary, language=None)
 
 picked = _draw_openers(session) if not session.transcript else None
 
-typed = st.chat_input(
-    "Message ShopAgent" if not session.cap_reached else "Session limit reached",
-    disabled=session.cap_reached,
-)
+# Disabled while a question is open, and that is a rule rather than a
+# courtesy. `ConversationMemory.begin_turn(from_customer=True)` drops a pending
+# confirmation — deliberately, since D10 — so a message sent now would silently
+# void the question the customer is looking at, and the modal would vanish with
+# nothing said about why.
+blocked = session.cap_reached or pending is not None
+if session.cap_reached:
+    placeholder = "Session limit reached"
+elif pending is not None:
+    placeholder = "Answer the confirmation to carry on"
+else:
+    placeholder = "Message ShopAgent"
+
+typed = st.chat_input(placeholder, disabled=blocked)
 if session.cap_reached:
     st.caption("This session has stopped spending. Nothing further is charged.")
+
+# Called last, after the transcript and the input, so the modal is drawn over a
+# page that is already in its answered state. Only one dialog may be open per
+# script run, which is exactly the number of questions the gate ever parks.
+if pending is not None:
+    _ask_to_confirm(session, pending.summary)
 
 asked = typed or picked
 if asked:

@@ -937,3 +937,409 @@ def test_a_turn_that_does_not_search_does_not_inherit_the_previous_cards(offline
     # The memory still holds the search, which is what it is for — resolving
     # "the second one" — and that is exactly why it is the wrong thing to draw.
     assert session._memory.last_search is not None
+
+
+# --- the confirmation, with a cart the gate can actually read -------------
+#
+# The fake below answers `CommerceAPI.request`, which is the one method
+# `tools/commerce.py` calls. That is what lets the *real* gate run offline:
+# `GuardedRegistry._describe` dispatches `view_cart` through the registry, and
+# with a cart behind it the summary a person would be shown is built here
+# exactly as it is in production — same dispatch, same `_summarise`, same
+# `money.format_amount`.
+
+
+class FakeCommerceBackend:
+    """A cart and an order, over the one method the commerce tools use.
+
+    Built from the shape the real bodies always have rather than from the shape
+    the assertions need — `api/schemas.py`'s field names, every money field
+    present. A fixture that dropped `line_total_cents` would still satisfy a
+    test about the total while leaving the gate's per-line rendering untested,
+    which is the blind spot CLAUDE.md records D8 and D10 both paying for.
+    """
+
+    VARIANT_ID = 86272
+    CART_ID = "11111111-1111-1111-1111-111111111111"
+    ORDER_ID = "22222222-2222-2222-2222-222222222222"
+    CHECKOUT_URL = "https://checkout.stripe.com/c/pay/cs_test_" + "z" * 60
+
+    def __init__(self, unit_cents: int = 14999) -> None:
+        self.unit_cents = unit_cents
+        self.quantity = 0
+        self.requests: list[tuple[str, str]] = []
+        self.ordered = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return None
+
+    def _line(self) -> dict:
+        return {
+            "item_id": "33333333-3333-3333-3333-333333333333",
+            "variant_id": self.VARIANT_ID,
+            "sku": "NR-SMTPRO-42-CHR",
+            "product_name": "Summit Peak Pro",
+            "variant_label": "size 42, charcoal",
+            "quantity": self.quantity,
+            "unit_price_cents": self.unit_cents,
+            "line_total_cents": self.unit_cents * self.quantity,
+        }
+
+    def _body(self, **extra) -> dict:
+        items = [self._line()] if self.quantity else []
+        return {
+            "currency": "eur",
+            "items": items,
+            "total_cents": sum(item["line_total_cents"] for item in items),
+            **extra,
+        }
+
+    def request(self, method: str, path: str, json=None):
+        self.requests.append((method, path))
+        if method == "POST" and path == "/cart":
+            return {"cart_id": self.CART_ID, **self._body()}
+        if path.endswith("/items") and method == "POST":
+            self.quantity += (json or {}).get("quantity", 1)
+            return self._body(cart_id=self.CART_ID)
+        if method == "GET" and path.startswith("/cart/"):
+            return self._body(cart_id=self.CART_ID)
+        if method == "POST" and path == "/orders":
+            self.ordered = True
+            return self._body(order_id=self.ORDER_ID, status="pending")
+        if method == "GET" and path.startswith("/orders/"):
+            return self._body(order_id=self.ORDER_ID, status="pending")
+        if path.endswith("/checkout"):
+            return {"checkout_url": self.CHECKOUT_URL, "order_id": self.ORDER_ID}
+        raise AssertionError(f"the fake backend was asked for {method} {path}")
+
+
+@pytest.fixture
+def shopping(monkeypatch):
+    """A session whose cart is real enough for the gate to summarise."""
+
+    def build(replies=None, unit_cents=14999, **kwargs):
+        backend = FakeCommerceBackend(unit_cents=unit_cents)
+        # The catalog is on, and it has to be: D9 refuses an `add_to_cart` for
+        # a `variant_id` that has not appeared in a tool result in this
+        # conversation. A script that added straight to the cart was refused by
+        # that guard, which is the guard working — so every script here starts
+        # with the search that puts the variant in front of the model.
+        catalog = FakeCatalogClient(
+            answers=[
+                a_catalog_answer(
+                    2, "Summit Peak Pro", FakeCommerceBackend.VARIANT_ID, unit_cents
+                )
+            ]
+            * 4
+        )
+        resources = ui.SharedResources(
+            tracer=Tracer(),
+            catalog_factory=lambda: catalog,
+            commerce_factory=lambda: backend,
+        )
+        client = FakeClient(replies=replies)
+        monkeypatch.setattr(
+            ui, "LLMClient", lambda tracker=None: setattr(client, "_tracker", tracker) or client
+        )
+        session = ui.BrowserSession(resources, catalog_enabled=True, **kwargs)
+        session.fake_client = client
+        session.backend = backend
+        return session
+
+    return build
+
+
+def _tool(name: str, arguments: dict, said: str | None = None) -> FakeReply:
+    return FakeReply(
+        content=said,
+        tool_calls=[FakeToolCall(id=f"c-{name}", name=name, arguments=json.dumps(arguments))],
+    )
+
+
+def _fills_a_cart_then_checks_out(claimed: str | None = None) -> list[FakeReply]:
+    """Three turns: search, add one Summit Peak Pro, then ask to check out.
+
+    The search is not scene-setting. D9's unknown-variant guardrail refuses an
+    `add_to_cart` for an id the model has not been shown here, so a script
+    without it is refused before the gate is ever reached.
+
+    `claimed` rides along as the model's *narration beside the tool call*
+    rather than as a final answer, so the amount guardrail — which only checks
+    a final answer — is not what stops it. What this measures is the gate, on
+    its own.
+    """
+    return [
+        _tool("search_products", {"query": "trail shoes"}),
+        FakeReply(content="Here is the Summit Peak Pro."),
+        _tool("add_to_cart", {"variant_id": FakeCommerceBackend.VARIANT_ID, "quantity": 1}),
+        FakeReply(content="Added it."),
+        _tool("create_checkout", {}, said=claimed),
+        FakeReply(content="Waiting for your confirmation."),
+    ]
+
+
+def test_the_summary_a_person_is_shown_comes_from_the_cart(shopping):
+    session = shopping(replies=_fills_a_cart_then_checks_out())
+    session.send("find me trail shoes")
+    session.send("add the Summit Peak Pro")
+    session.send("check out")
+
+    pending = session.pending
+
+    assert pending is not None
+    assert pending.tool == "create_checkout"
+    assert "Summit Peak Pro" in pending.summary
+    assert "€149.99" in pending.summary
+    assert "1 x" in pending.summary
+
+
+def test_the_summary_does_not_move_when_the_model_claims_another_total(shopping):
+    """The falsification, and the property the whole gate exists for.
+
+    A person approving a figure the model invented is worse than no gate at
+    all: it launders the invention through a human and leaves a record saying
+    they agreed to it. So the model is made to say €1.00 while asking for the
+    checkout, and the summary must still be the cart's own €149.99 — built by
+    `GuardedRegistry._describe` from a real `view_cart` dispatch through
+    `money.format_amount`.
+    """
+    lie = "Your total comes to €1.00, placing the order now."
+    session = shopping(replies=_fills_a_cart_then_checks_out(claimed=lie))
+    session.send("find me trail shoes")
+    session.send("add the Summit Peak Pro")
+    session.send("check out")
+
+    summary = session.pending.summary
+
+    assert "€1.00" not in summary
+    assert "€149.99" in summary
+    # And the model really did say it — otherwise this test passes for the
+    # wrong reason, which is the failure mode D10 recorded for a probe that
+    # never reproduced its own mechanism.
+    assert any(lie in message.text for message in session.transcript)
+
+
+def test_the_summary_is_the_string_the_dialog_prints(shopping):
+    """`ui/app.py` renders `pending.summary` verbatim through `st.code`.
+
+    Its line breaks and leading spaces are load-bearing — the gate laid the
+    order out as lines and a renderer that reflowed them would be rewriting
+    what somebody approved.
+    """
+    session = shopping(replies=_fills_a_cart_then_checks_out())
+    session.send("find me trail shoes")
+    session.send("add the Summit Peak Pro")
+    session.send("check out")
+
+    summary = session.pending.summary
+
+    assert summary.count("\n") >= 2, "the summary is laid out as lines"
+    assert summary == session._memory.pending_confirmation.summary
+
+
+def test_confirming_lets_the_checkout_run_and_produces_a_payment_link(shopping):
+    session = shopping(
+        replies=[
+            *_fills_a_cart_then_checks_out(),
+            _tool("create_checkout", {}),
+            FakeReply(content="Your order is placed."),
+        ]
+    )
+    session.send("find me trail shoes")
+    session.send("add the Summit Peak Pro")
+    session.send("check out")
+
+    result = session.answer_confirmation(True)
+
+    assert session.backend.ordered is True
+    assert result.messages[0].payment_url == FakeCommerceBackend.CHECKOUT_URL
+    assert session.pending is None
+
+
+def test_the_payment_link_never_reaches_the_model(shopping):
+    """It is read off the conversation's memory, never scraped from prose.
+
+    The model is not given the URL at all — `tools/commerce.py` puts it on the
+    memory and returns `payment_link_shown: true` — so there is nothing for a
+    renderer to extract and nothing for the model to mistype.
+    """
+    session = shopping(
+        replies=[
+            *_fills_a_cart_then_checks_out(),
+            _tool("create_checkout", {}),
+            FakeReply(content="Your order is placed."),
+        ]
+    )
+    session.send("find me trail shoes")
+    session.send("add the Summit Peak Pro")
+    session.send("check out")
+    session.answer_confirmation(True)
+
+    everything_the_model_saw = json.dumps(session._messages)
+
+    assert FakeCommerceBackend.CHECKOUT_URL not in everything_the_model_saw
+    assert "checkout.stripe.com" not in everything_the_model_saw
+
+
+def test_declining_orders_nothing_and_the_conversation_carries_on(shopping):
+    session = shopping(
+        replies=[
+            *_fills_a_cart_then_checks_out(),
+            FakeReply(content="Nothing was ordered."),
+            FakeReply(content="Here are some jackets."),
+        ]
+    )
+    session.send("find me trail shoes")
+    session.send("add the Summit Peak Pro")
+    session.send("check out")
+
+    result = session.answer_confirmation(False)
+
+    assert session.backend.ordered is False
+    assert result.messages[0].payment_url is None
+    assert session.pending is None
+    # And the conversation is usable again.
+    assert session.send("show me jackets").messages[1].text == "Here are some jackets."
+
+
+def test_two_answers_to_one_question_do_not_both_go_through(shopping):
+    """Two reruns must not answer the same question twice.
+
+    D10 made `take_confirmation` clear as it reads and `resolve_pending` refuse
+    an already-answered question; this asserts the UI does not go around either.
+    A double-click on the dialog's button is the case, and it is real: Streamlit
+    reruns the fragment on every click.
+    """
+    session = shopping(
+        replies=[
+            *_fills_a_cart_then_checks_out(),
+            _tool("create_checkout", {}),
+            FakeReply(content="Your order is placed."),
+        ]
+    )
+    session.send("find me trail shoes")
+    session.send("add the Summit Peak Pro")
+    session.send("check out")
+    calls_after_asking = len(session.fake_client.seen)
+
+    first = session.answer_confirmation(True)
+    turns_driven = len(session.fake_client.seen) - calls_after_asking
+    second = session.answer_confirmation(True)
+
+    assert first.messages != ()
+    assert second.messages == (), "the second answer drove a turn of its own"
+    assert len(session.fake_client.seen) - calls_after_asking == turns_driven
+
+
+def test_an_answer_to_the_opposite_question_cannot_arrive_late(shopping):
+    """Declining after confirming changes nothing, rather than un-ordering."""
+    session = shopping(
+        replies=[
+            *_fills_a_cart_then_checks_out(),
+            _tool("create_checkout", {}),
+            FakeReply(content="Your order is placed."),
+        ]
+    )
+    session.send("find me trail shoes")
+    session.send("add the Summit Peak Pro")
+    session.send("check out")
+    session.answer_confirmation(True)
+
+    assert session.answer_confirmation(False).messages == ()
+    assert session.backend.ordered is True
+
+
+def test_an_answered_approval_does_not_survive_the_next_customer_message(shopping):
+    """D10's rule, from the other side: step 1 covered an *unanswered* one.
+
+    An approval is spendable on exactly one turn. `begin_turn(from_customer=
+    True)` is what kills it, and it has to, because an approval that outlives
+    its turn is an answer sitting apart from the question it answered.
+    """
+    session = shopping(
+        replies=[
+            *_fills_a_cart_then_checks_out(),
+            FakeReply(content="Waiting."),
+            _tool("create_checkout", {}),
+            FakeReply(content="I need you to confirm again."),
+        ]
+    )
+    session.send("find me trail shoes")
+    session.send("add the Summit Peak Pro")
+    session.send("check out")
+    session.answer_confirmation(True)
+    # The follow-up turn above did not call `create_checkout`, so the approval
+    # was answered and never spent. It is still recorded — but nobody is being
+    # asked anything, which is what `pending` reports.
+    assert session.pending is None
+    assert session._memory.pending_confirmation.answer is True
+
+    # A fresh message, and then a fresh checkout attempt: it must be asked
+    # again rather than spending the yes given for the previous turn.
+    session.send("actually, go ahead")
+
+    assert session.backend.ordered is False
+    assert session.pending is not None
+
+
+# --- what the page is allowed to do with an amount ------------------------
+
+
+def test_the_page_formats_no_money_of_its_own():
+    """Every figure `app.py` shows was formatted before it got there.
+
+    `VariantCard.price` is `money.format_amount`'s output from `ui/session.py`,
+    and `PendingApproval.summary` is the gate's, built from a real `view_cart`.
+    A renderer that reached for `format_amount` — or worse, for `/ 100` — would
+    be a fourth opinion about what an amount looks like, and the first symptom
+    would be a dialog and a payment page disagreeing about one order.
+    """
+    app = ast.parse((SESSION_PATH.parent / "app.py").read_text())
+
+    assert "money" not in imported_names(app)
+    assert not calls_in(app, "format_amount")
+    assert not calls_in(app, "_summarise")
+    for node in ast.walk(app):
+        # `cents / 100` is the exact shape D1 forbade and D9 found in
+        # `money.format_amount` itself. It has no business reappearing here.
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv)):
+            raise AssertionError(f"app.py divides: {ast.unparse(node)}")
+
+
+def test_a_second_answer_is_refused_even_when_the_first_was_never_spent(shopping):
+    """The narrower half of "two reruns must not answer twice".
+
+    When the follow-up turn *does* call `create_checkout`, `take_confirmation`
+    clears the question and a second answer finds nothing — which is why the
+    obvious version of this test passes with `resolve_pending`'s
+    already-answered check mutated away. The check earns its place in the other
+    branch: the model answered without spending the approval, so the question
+    is still parked, and a double-click on the dialog would otherwise drive a
+    second turn carrying a second CONFIRMED_NOTE.
+    """
+    session = shopping(
+        replies=[
+            *_fills_a_cart_then_checks_out(),
+            FakeReply(content="Understood."),
+            FakeReply(content="A second turn nobody asked for."),
+        ]
+    )
+    session.send("find me trail shoes")
+    session.send("add the Summit Peak Pro")
+    session.send("check out")
+    before = len(session.fake_client.seen)
+
+    first = session.answer_confirmation(True)
+    after_first = len(session.fake_client.seen)
+    second = session.answer_confirmation(True)
+
+    assert first.messages != ()
+    assert after_first > before, "the first answer drove its follow-up turn"
+    assert second.messages == ()
+    assert len(session.fake_client.seen) == after_first, "a second turn was driven"
+    # The approval is still on record and still unspent, which is the state the
+    # `answered` check exists for.
+    assert session._memory.pending_confirmation.answered is True
