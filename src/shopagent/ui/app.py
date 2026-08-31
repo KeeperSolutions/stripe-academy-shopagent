@@ -43,10 +43,16 @@ import html
 
 import streamlit as st
 
+from shopagent.ui import cards as layout
 from shopagent.ui import colors
 from shopagent.ui import session as turns
 
 TITLE = "ShopAgent"
+# Discreet, and text rather than a mark: there is no logo file in this
+# repository, and inventing one would be worse than a wordmark. It sits in the
+# caption beside the cost, not in the heading — the shop is what the page is,
+# and whose shop it is is a footnote.
+OWNER = "Keeper Solutions"
 
 # Three openings, and every one of them is a line the D10 eval suite drove
 # against a live model and a real catalog — scenario 1's price filter,
@@ -125,25 +131,39 @@ def _swatch(color: str | None) -> str:
     )
 
 
-def _variant_line(variant: turns.VariantCard) -> str:
-    """One row of a card: colour, size, price, and whether it can be bought.
+def _group_line(group: layout.VariantGroup) -> str:
+    """One colour of one product at one price, with all of its sizes.
 
-    Everything from the catalog goes through `html.escape` before it meets the
-    swatch's markup. `variant.price` is already `money.format_amount`'s output
-    — no arithmetic happens in this file, which is the D1 rule about money
-    reaching its last mile.
+    Three sizes of one black shoe is one line rather than three — see
+    `ui/cards.py` for why density is the thing being fixed and filtering
+    against the model's prose is not. Everything from the catalog goes through
+    `html.escape` before it meets the swatch's markup, and `group.price` is
+    already `money.format_amount`'s output: no arithmetic happens in this file.
     """
-    parts = [part for part in (variant.color, variant.size) if part]
-    label = " · ".join(parts) or variant.sku
-    body = f"{html.escape(label)} — {html.escape(variant.price)}"
-    if variant.in_stock:
-        return f"{_swatch(variant.color)}{body}"
-    # Dimmed and named. A greyed row with nothing said would read as a
-    # rendering fault rather than as stock information.
-    return (
-        f'<span style="opacity:0.45;">{_swatch(variant.color)}{body}</span>'
-        f'<span style="opacity:0.55;"> · out of stock</span>'
-    )
+    parts = [html.escape(part) for part in (group.color, group.label) if part]
+    head = " · ".join(parts)
+    price = html.escape(group.price)
+
+    if group.all_sold_out:
+        # Nothing left in this colour. Said in words, because a row that was
+        # only dimmed would read as a rendering fault.
+        gone = html.escape(", ".join(group.sold_out))
+        return (
+            f'<span style="opacity:0.45;">{_swatch(group.color)}{head}'
+            f'{" · " if head else ""}{gone} — {price}</span>'
+            f'<span style="opacity:0.55;"> · sold out</span>'
+        )
+
+    line = f"{_swatch(group.color)}{head} — {price}"
+    if group.sold_out:
+        # Struck through and still there. Dropping it would answer "do you have
+        # 42?" by omission, and "there is no 42" is a different sentence from
+        # "the 42 is gone".
+        missing = html.escape(", ".join(group.sold_out))
+        line += (
+            f'<span style="opacity:0.5;"> · <s>{missing}</s> sold out</span>'
+        )
+    return line
 
 
 def _draw_card(card: turns.ProductCard) -> None:
@@ -153,10 +173,77 @@ def _draw_card(card: turns.ProductCard) -> None:
         heading = " · ".join(part for part in (card.brand, card.category) if part)
         if heading:
             st.caption(heading)
-        for variant in card.variants:
-            st.markdown(_variant_line(variant), unsafe_allow_html=True)
+        for group in layout.group_variants(card.variants):
+            st.markdown(_group_line(group), unsafe_allow_html=True)
         if card.description:
             st.caption(card.description)
+
+
+def _draw_cards(cards: tuple[turns.ProductCard, ...]) -> None:
+    """The results, with everything past the first couple behind a fold.
+
+    Nothing is hidden and the fold says how much it holds — a fold that did not
+    name its own size would read as the end of the list.
+    """
+    shown, folded = layout.split_for_display(cards)
+    for card in shown:
+        _draw_card(card)
+    if folded:
+        with st.expander(f"{len(folded)} more result(s) the shop found"):
+            for card in folded:
+                _draw_card(card)
+
+
+def _draw_activity(message: turns.ChatMessage) -> None:
+    """What the agent actually did on this turn, under a fold.
+
+    **Collapsed by default and attached to its own turn.** Collapsed, because
+    a conversation is what this page is and a tool log under every message
+    would bury it. Per turn rather than one panel at the bottom, because a
+    single panel can only ever describe the last turn — and the question this
+    project is built to answer, which tools ran in what order and what they
+    cost, is asked about a turn that has already scrolled past.
+
+    **A refused call is the most valuable row here.** The gate parking a
+    confirmation and the unknown-variant guardrail both come back as failed
+    `ToolResult`s rather than exceptions, so `RecordingRegistry` — which sits
+    outermost for exactly this reason — sees them, and they are drawn in the
+    error colour with the reason the tool gave.
+
+    Monospace, and this is the one place in the page where that is right:
+    everything here is an identifier, a number or a JSON fragment.
+    """
+    if not message.activity and not message.model_calls:
+        return
+
+    failed = sum(1 for call in message.activity if not call.ok)
+    summary = (
+        f"{len(message.activity)} tool call(s) · {message.model_calls} model call(s) · "
+        f"\\${message.cost_usd:.6f}"
+    )
+    if failed:
+        summary += f" · {failed} refused"
+
+    with st.expander(summary, expanded=False):
+        for index, call in enumerate(message.activity, start=1):
+            mark = "ok " if call.ok else "REF"
+            head = f"{index}. [{mark}] {call.name}  ({call.duration_ms:.0f} ms)"
+            if call.ok:
+                st.markdown(f"`{head}`")
+            else:
+                # Red, because a refusal is the row somebody scrolled here for.
+                st.markdown(f":red[`{head}`]")
+            if call.arguments:
+                st.code(call.arguments, language="json")
+            if call.error:
+                st.markdown(f":red[{html.escape(call.error)}]")
+            elif call.result_chars:
+                # The size, not the payload: one catalogue search is 4,728
+                # characters and a panel that inlined them would be the thing
+                # it was meant to make readable.
+                st.caption(f"{call.result_chars:,} characters returned")
+        if message.trace_url:
+            st.link_button("Open this turn in Langfuse", message.trace_url)
 
 
 def _draw_message(message: turns.ChatMessage) -> None:
@@ -166,8 +253,8 @@ def _draw_message(message: turns.ChatMessage) -> None:
             st.markdown(message.text)
         if message.notice:
             st.warning(message.notice)
-        for card in message.cards:
-            _draw_card(card)
+        if message.cards:
+            _draw_cards(message.cards)
         if message.payment_url:
             # Read from `ChatMessage.payment_url`, which `tools/commerce.py`
             # wrote onto the conversation's memory — never scraped out of the
@@ -183,6 +270,8 @@ def _draw_message(message: turns.ChatMessage) -> None:
                 "Pay with Stripe", message.payment_url, type="primary",
                 use_container_width=True,
             )
+        if message.role == turns.SHOP:
+            _draw_activity(message)
 
 
 @st.dialog(CONFIRM_TITLE, dismissible=False)
@@ -248,8 +337,8 @@ st.title(TITLE, anchor=False)
 # put the session cost in a maths block and swallowed the cap entirely. Found
 # by looking at the page rather than by reasoning about it.
 st.caption(
-    f"session \\${session.session_cost_usd:.6f} of \\${session.cap_usd:.2f} · "
-    f"{len(session.tool_names)} tools"
+    f"{OWNER} · session \\${session.session_cost_usd:.6f} of "
+    f"\\${session.cap_usd:.2f} · {len(session.tool_names)} tools"
 )
 for note in session.notes:
     st.caption(f"[{note}]")

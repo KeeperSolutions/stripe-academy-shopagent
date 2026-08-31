@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import atexit
 import threading
+import uuid
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any
@@ -311,6 +312,10 @@ class ChatMessage:
     # Something the shop is saying about itself rather than something the
     # assistant said — the spend cap, a failed turn, a missing catalog.
     notice: str | None = None
+    # Where this turn's trace is, when tracing is on. `None` is the ordinary
+    # answer — an unconfigured Langfuse is a normal state, so the panel that
+    # renders this has to cope with its absence anyway.
+    trace_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -397,6 +402,12 @@ class BrowserSession:
         )
         self._shopper_id = shopper_id if shopper_id is not None else settings.shopper_id
 
+        # One conversation, several traces. A turn opens and closes its own
+        # root — see `_drive` for why it cannot be one root for the tab — and
+        # this is what puts them back together in Langfuse. A `uuid4` rather
+        # than the shopper's id: that one identifies a person and is digested
+        # on its way out; this one identifies a browser tab and nothing else.
+        self._session_id = uuid.uuid4().hex
         self._stack = ExitStack()
         self._confirmer = _BrowserConfirmer()
         self._tracker = UsageTracker()
@@ -451,6 +462,11 @@ class BrowserSession:
         if parked is None or parked.answered:
             return None
         return PendingApproval(tool=parked.tool, summary=parked.summary)
+
+    @property
+    def session_id(self) -> str:
+        """This tab's conversation, as Langfuse groups it."""
+        return self._session_id
 
     @property
     def session_cost_usd(self) -> float:
@@ -573,12 +589,16 @@ class BrowserSession:
         history_length = len(self._messages)
         error: str | None = None
         said: list[str] = []
+        trace_url: str | None = None
 
         append_prompt()
         try:
             with self._tracer.conversation(
-                shopper_id=self._shopper_id, model=self._client.model
+                shopper_id=self._shopper_id,
+                model=self._client.model,
+                session_id=self._session_id,
             ):
+                trace_url = self._tracer.trace_url()
                 run_tool_loop(self._client, self._registry, self._messages, self._tools)
         except Exception as exc:  # noqa: BLE001 - a broken turn must not end a session
             error = f"{type(exc).__name__}: {exc}"
@@ -609,6 +629,7 @@ class BrowserSession:
             # its payment page.
             payment_url=self._memory.take_checkout_url() if self._memory else None,
             notice=None if error is None else f"That turn failed: {error}",
+            trace_url=trace_url,
         )
         self._transcript.append(shop)
         return shop, error

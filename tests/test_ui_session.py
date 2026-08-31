@@ -1343,3 +1343,160 @@ def test_a_second_answer_is_refused_even_when_the_first_was_never_spent(shopping
     # The approval is still on record and still unspent, which is the state the
     # `answered` check exists for.
     assert session._memory.pending_confirmation.answered is True
+
+
+# --- what the activity panel is given ------------------------------------
+
+
+def test_a_refused_tool_call_reaches_the_turn_that_asked_for_it(shopping):
+    """The most valuable row the panel can show, at the level it is produced.
+
+    The gate parking a confirmation is a failed `ToolResult`, not an exception,
+    so only a wrapper *outside* `GuardedRegistry` sees it — which is why
+    `RecordingRegistry` sits outermost. A panel built over anything further in
+    would show a checkout that simply did not happen, with no reason.
+    """
+    session = shopping(replies=_fills_a_cart_then_checks_out())
+    session.send("find me trail shoes")
+    session.send("add the Summit Peak Pro")
+    checkout = session.send("check out")
+
+    (call,) = checkout.messages[1].activity
+
+    assert call.name == "create_checkout"
+    assert call.ok is False
+    assert "confirm" in call.error
+    assert call.duration_ms >= 0.0
+
+
+def test_a_guardrail_refusal_reaches_the_turn_too(shopping):
+    """D9's unknown-variant rule, seen from the panel.
+
+    A `variant_id` the model was never shown is refused before the tool runs,
+    and that refusal is a row somebody debugging this shop needs to see — it is
+    the difference between "the cart call failed" and "the model made an id up".
+    """
+    session = shopping(
+        replies=[
+            _tool("add_to_cart", {"variant_id": 999999, "quantity": 1}),
+            FakeReply(content="I could not add that."),
+        ]
+    )
+
+    result = session.send("add the one I saw yesterday")
+
+    (call,) = result.messages[1].activity
+    assert call.name == "add_to_cart"
+    assert call.ok is False
+    # `error`, not `content`: the panel shows the short machine-facing half,
+    # and the long one is written for the model to correct itself from.
+    assert "never shown in this conversation" in call.error
+
+
+def test_a_turn_reports_its_own_cost_and_model_calls(shopping):
+    """Read from `UsageTracker`, which has computed both since D1. The panel
+    measures nothing of its own."""
+    session = shopping(replies=[_tool("search_products", {"query": "x"}),
+                                FakeReply(content="Found it.")])
+
+    message = session.send("find something").messages[1]
+
+    assert message.model_calls == 2
+    assert message.cost_usd > 0
+    assert message.cost_usd == pytest.approx(session.session_cost_usd)
+
+
+def test_a_refused_call_keeps_no_payload_for_the_panel(shopping):
+    session = shopping(
+        replies=[
+            _tool("add_to_cart", {"variant_id": 999999}),
+            FakeReply(content="No."),
+        ]
+    )
+    (call,) = session.send("add it").messages[1].activity
+    assert call.content == ""
+    assert call.result_chars > 0, "the refusal text still has a length"
+
+
+# --- one conversation, several traces ------------------------------------
+
+
+def test_every_turn_of_one_tab_carries_the_same_session_id(offline):
+    """The D10 Definition of done, reached the only way Streamlit allows.
+
+    A browser cannot hold one root span open for a whole conversation: a rerun
+    runs on a fresh thread and an OTEL span lives in a `contextvar`, so a root
+    entered on one rerun's thread cannot be closed on another's. One root per
+    turn is the shape that closes where it opened — and `session_id` is what
+    Langfuse groups those roots back together with.
+    """
+    session = offline(replies=[FakeReply(content="a"), FakeReply(content="b")])
+    seen = []
+
+    class Recording(Tracer):
+        def conversation(self, **fields):
+            seen.append(fields.get("session_id"))
+            return super().conversation(**fields)
+
+    session._tracer = Recording()
+    session.send("one")
+    session.send("two")
+
+    assert seen == [session.session_id, session.session_id]
+    assert session.session_id
+
+
+def test_two_tabs_are_two_langfuse_sessions(fresh_process):
+    resources = ui.SharedResources(
+        tracer=Tracer(), catalog_factory=FakeCatalogClient, commerce_factory=FakeCommerceAPI
+    )
+    one = ui.BrowserSession(resources, catalog_enabled=False)
+    two = ui.BrowserSession(resources, catalog_enabled=False)
+    try:
+        assert one.session_id != two.session_id
+    finally:
+        one.close()
+        two.close()
+
+
+def test_the_session_id_is_not_the_shopper(fresh_process):
+    """A `uuid4` this process invents, carrying nothing a person wrote.
+
+    `shopper_id` identifies a person and leaves as a digest through
+    `redact_identifier`; this identifies a browser tab and nobody. They are two
+    parameters for that reason rather than one.
+    """
+    resources = ui.SharedResources(
+        tracer=Tracer(), catalog_factory=FakeCatalogClient, commerce_factory=FakeCommerceAPI
+    )
+    session = ui.BrowserSession(resources, catalog_enabled=False, shopper_id="ana@example.com")
+    try:
+        assert "ana" not in session.session_id
+        assert len(session.session_id) == 32
+    finally:
+        session.close()
+
+
+def test_an_untraced_turn_offers_no_trace_link(offline):
+    """Unconfigured tracing is an ordinary state, so the panel has to cope."""
+    session = offline(replies=[FakeReply(content="hello")])
+    assert session._tracer.enabled is False
+
+    assert session.send("hi").messages[1].trace_url is None
+
+
+def test_a_traced_turn_carries_the_link_the_tracer_gave_it(offline):
+    # Only `trace_url` is overridden. An earlier version of this fake also
+    # forced `enabled` true, which made the inert tracer's own `flush()` reach
+    # for a client that was never there — a fake built from the shape the
+    # assertion wanted rather than the shape the real object has.
+    class Linking(Tracer):
+        def trace_url(self):
+            return "https://cloud.langfuse.com/trace/abc123"
+
+    session = offline(replies=[FakeReply(content="hello")])
+    session._tracer = Linking()
+
+    assert session.send("hi").messages[1].trace_url == (
+        "https://cloud.langfuse.com/trace/abc123"
+    )

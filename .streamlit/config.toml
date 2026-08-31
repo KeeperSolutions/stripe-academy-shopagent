@@ -1,0 +1,13 @@
+# Streamlit's own chrome, turned down (D11, step 4).
+#
+# The Deploy button and the hamburger belong to Streamlit Cloud and to
+# developing an app, not to shopping in one. They were on both of D11's first
+# screenshots, which is where this was noticed.
+[client]
+# "minimal" keeps the running indicator and drops Deploy and the developer
+# menu. "hidden" would also take away the rerun/stop control, which is the one
+# thing a person watching a slow turn actually wants.
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
