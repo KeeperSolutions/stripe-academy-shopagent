@@ -31,8 +31,10 @@ either paid off or did not.
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
+from typing import Any
 
 from shopagent.agent import confirmation, profile as profiles
 from shopagent.agent.confirmation import Confirmer
@@ -178,7 +180,8 @@ def build_tool_setup(
     stack: ExitStack,
     *,
     catalog_enabled: bool | None = None,
-    client_factory: type[MCPToolClient] = MCPToolClient,
+    client_factory: Callable[[], Any] = MCPToolClient,
+    api_factory: Callable[[], Any] = CommerceAPI,
     confirm: Confirmer | None = None,
 ) -> ToolSetup:
     """Assemble the registry this session will use.
@@ -193,6 +196,13 @@ def build_tool_setup(
     server subprocess goes with it.
 
     `client_factory` exists so a test can inject a client that fails to start.
+    `api_factory` is its symmetric twin and arrived on D11 for a caller rather
+    than a test: a Streamlit process reruns its whole script on every click, so
+    the browser UI holds the MCP subprocess and the HTTP client for the life of
+    the *process* and hands them back here behind a context manager whose exit
+    is a no-op. Both stay factories called through `stack.enter_context`, so
+    the CLI and the eval runner are unchanged and this function still owns
+    whatever it is given.
     """
     # The registry is the one thing every tool call passes through, which is
     # what makes it the place a conversation's memory is filled: nothing in the
@@ -218,7 +228,7 @@ def build_tool_setup(
     # answered by the tool itself, in words written for the model. The stack
     # owns the client for the same reason it owns the MCP subprocess — whatever
     # ends the session closes the sockets.
-    register_commerce_tools(registry, stack.enter_context(CommerceAPI()), memory)
+    register_commerce_tools(registry, stack.enter_context(api_factory()), memory)
 
     if catalog_enabled is None:
         catalog_enabled = get_settings().mcp_catalog_enabled
