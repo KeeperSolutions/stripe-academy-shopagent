@@ -56,6 +56,11 @@ tracked.
 | `evals/spec.py` | D10 | what a scenario is, and what it may claim |
 | `evals/expectations.py` | D10 | one function per claim the YAML can make |
 | `evals/runner.py` | D10 | drive, report, and undo by id |
+| `agent/activity.py` | D11 | one turn's tool calls, for a reader who is not a vendor |
+| `ui/session.py` | D11 | a browser session's turn; imports no `streamlit` |
+| `ui/app.py` | D11 | the Streamlit page; renders and decides nothing |
+| `ui/cards.py` | D11 | how a search result is laid out |
+| `ui/colors.py` | D11 | a variant's colour name as a hex a browser can draw |
 
 Search logic belongs in `catalog/`, never inside the MCP server. The server is
 a thin wrapper, which is what lets D5 swap transports without touching logic.
@@ -1342,6 +1347,107 @@ ten seconds that way.
 object is replaced by a fake before any call. The fakes mirror the shape of real
 API objects, including the awkward ones, such as the final streaming chunk that
 carries usage alongside an empty `choices` list.
+
+**`ui/session.py` decides a turn and `ui/app.py` renders one, and the module
+that decides imports no `streamlit`.** The same cut `routers/` and `services/`
+make, drawn for the same reason plus one more: a turn can then be driven in a
+test with no browser, no server and no rerun, which is what every D11 test does.
+`tests/test_ui_session.py` walks the AST and fails on an `import streamlit` and
+on a bare `st` — the mechanism `tests/test_evals.py` uses to keep the runner
+from building a registry of its own, and the same guard is applied here for the
+same claim: the browser drives `build_tool_setup` and `run_tool_loop`, not a
+shop of its own.
+
+**Streamlit re-executes the whole script on every interaction, so what a
+process may build once must not be built per rerun.** This is the D10 finding
+arriving where it was always going to matter. Langfuse keeps one resource
+manager per public key, *process-wide*: the second `shutdown()` enqueues a stop
+sentinel per consumer onto a queue whose consumers are already dead, and the
+next `flush()` — which is `queue.join()` — waits for a `task_done()` that
+cannot come. Two eval passes hung there, in scenario three both times. A
+browser would reach that state in a handful of clicks.
+
+So there are two tiers, and which one a thing belongs to is decided by whether
+it holds any of *this conversation's* state:
+
+| per process (`shared_resources`) | per browser session (`BrowserSession`) |
+|---|---|
+| `Tracer` | `ConversationMemory` |
+| `MCPToolClient` (a subprocess) | the registry chain built over it |
+| `CommerceAPI` (an `httpx.Client`) | messages, transcript, cost, pending |
+
+**The second column is not an optimisation and must not move.**
+`@st.cache_resource` is shared by every browser session in the process, not per
+tab, so a `ConversationMemory` up there would put one tab's `add_to_cart` in
+another tab's basket and make a confirmation parked in one spendable in the
+other. `agent/memory.py` says never shared, never global and means it.
+
+The shared clients reach `build_tool_setup` through `client_factory` and
+`api_factory` — the second added on D11, symmetric with the first — wrapped in
+`_Borrowed`, whose `__exit__` is a no-op so a per-session `ExitStack` cannot
+close what the process still needs. Exactly one `Tracer.shutdown()` happens per
+process, from `shutdown_shared_resources()` on `atexit`, and a test asserts
+`shutdown` appears exactly once in `ui/session.py` and only inside that
+function.
+
+**`_Borrowed` takes a lock, and it is not defensive.** Streamlit runs each
+browser session's script on its own thread, so two tabs opened together really
+do arrive at the lazy build at once — and without the lock that is two MCP
+server subprocesses, one of which nothing will ever close. Falsified rather
+than reasoned about: dropping the lock fails an eight-thread test.
+
+**A turn is traced as its own root, and `session_id` is what makes the
+conversation one thing again.** The CLI holds one root open for its whole REPL,
+so its conversation *is* one trace. A browser cannot: a rerun runs on a fresh
+thread and an OTEL span lives in a `contextvar`, so a root entered on one
+rerun's thread cannot be closed on another's. `Tracer.conversation` therefore
+takes an optional `session_id` — default `None`, so the path D1 through D10 use
+is untouched — and `propagate_attributes` groups the roots in Langfuse. It is
+not redacted: it is a `uuid4` this process invents per tab, carrying nothing
+anybody wrote and identifying nobody, where `shopper_id` is the opposite and is
+digested. Asserted on the wire rather than on what the caller passed, because a
+mutation that dropped it *between* the two survived a test that only checked
+the first.
+
+**A turn's search results are captured onto the message that produced them,
+never read back from `last_search` at render time.** D9 makes every new search
+*replace* the previous one on purpose — "the second one" can only mean the
+second row of the list the customer is looking at now — so a transcript
+rendered from it would put the newest cards under every older answer. The rows
+come off the turn's `ActivityLog`, which is cleared per turn, and land on a
+frozen `ChatMessage`.
+
+That frozen eager capture also makes the lazy defect *unrepresentable*, which
+is worth knowing because it moved a test: the obvious assertion — two searches,
+the first message keeps its rows — cannot tell the two designs apart, since at
+capture time both read the same thing. What separates them is that
+`last_search` survives a turn and the activity log does not, so reading it puts
+the boots from two turns ago under "what is your returns policy?". That is the
+test.
+
+**The model never sees the payment link in the browser either, and nothing
+strips it out of prose.** `tools/commerce.py` writes the URL to
+`ConversationMemory` and returns `payment_link_shown: true`; the page renders
+`ChatMessage.payment_url`. There is no regex over the model's answer, because
+there is nothing to remove — measured on the live D11 run, where the model
+wrote "use the payment link shown to you" and no URL at all. A test asserts the
+URL appears nowhere in the message list the model is given.
+
+**The confirmation dialog prints `pending.summary` verbatim, and `ui/app.py`
+formats no money at all.** The summary is the gate's, built from a real
+`view_cart` dispatch through `money.format_amount`, and printing it with
+`st.code` rather than `st.markdown` is what keeps its line breaks and leading
+spaces — markdown would reflow somebody's order into a paragraph. Every other
+figure on the page was formatted before it arrived: `VariantCard.price` in
+`ui/session.py`, the summary in the gate. A test parses `app.py` and fails on
+an import of `money`, a call to `format_amount`, or any division — `cents / 100`
+in a template is the float this project has refused since D1.
+
+**`$` opens a LaTeX block in Streamlit's markdown, so an amount is written
+`\$`.** The first draft of the header caption read `f"session ${cost} of
+${cap}"` and rendered the cost inside a maths block with the cap swallowed
+entirely. Found by looking at the page, not by a test — which is the honest
+account of it and the reason the screenshots are taken rather than assumed.
 
 ## Commands
 

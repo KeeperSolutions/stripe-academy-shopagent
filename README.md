@@ -184,7 +184,7 @@ python scripts/create_schema.py   # exits 2 if a column or foreign key is missin
 # 7. verify
 docker compose exec db psql -U shopagent -d shopagent \
   -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
-pytest tests/ -v          # 1049 pass; add -m network for the ones that cost money
+pytest tests/ -v          # 1137 pass; add -m network for the ones that cost money
 ```
 
 Step 6 matters on any database that predates a schema change: `create_all`
@@ -217,10 +217,8 @@ python -m shopagent.llm.loop            # CLI agent: 10 tools
 MCP_CATALOG_ENABLED=false \
   python -m shopagent.llm.loop          # same CLI without the catalog: 7 tools
 
-# the same agent in a browser (D11). Same registry, same loop, same guardrails
-# — `ui/app.py` renders and `ui/session.py` decides. Chat is the whole
-# interface: search results appear as cards inside the conversation, and there
-# is no catalog to browse around the agent.
+# the same agent in a browser (D11). `uvicorn` must be running first, for the
+# same reason the CLI needs it: the cart and checkout tools reach it over HTTP.
 streamlit run src/shopagent/ui/app.py   # on :8501
 
 # inside the agent
@@ -274,12 +272,12 @@ python scripts/run_evals.py --only the_happy_path_reaches_a_payment_page
                                         # `tail`
 
 # tests
-pytest tests/ -v                        # 1092 collected: 1049 pass, 20 skip,
+pytest tests/ -v                        # 1180 collected: 1137 pass, 20 skip,
                                         # 23 deselected because they cost money
 pytest tests/ -m network                # the 4 embedding tests and the 3 chain runs;
                                         # these cost money and need uvicorn running
 pytest tests/ -m stripe                 # the 16 that call Stripe in test mode (free)
-pytest tests/ -m db                     # the 429 that need Postgres; they skip
+pytest tests/ -m db                     # the 430 that need Postgres; they skip
                                         # with a reason when it is unreachable
 ```
 
@@ -327,7 +325,9 @@ The API and the catalog reach the model over different protocols on purpose:
 products come through MCP, carts and orders over HTTP. `/docs` is the fastest way
 to drive the second — paste `SHOPAGENT_API_KEY` into **Authorize** once and every
 cart and order call carries it, while `/health` needs no key. Screenshots of that
-walkthrough are in `docs/screenshots/`.
+walkthrough are in `docs/screenshots/`, alongside the `d11-*` set showing the
+browser UI: the conversation with product cards, the confirmation dialog, the
+agent activity panel, and one order paid end to end.
 
 The agent spawns the catalog server itself, so `run_mcp_server.py` is only needed
 to drive the server by hand — from the Inspector, or to tell a catalog fault
@@ -337,6 +337,53 @@ of six and says the catalogue is unavailable.
 
 Pass the server path, not `-m shopagent.mcp_server.server`, to the Inspector: it
 parses `-m` as one of its own flags and the module never starts.
+
+## The browser UI (D11)
+
+```bash
+uvicorn shopagent.api.main:app --reload --port 8000   # first, always
+streamlit run src/shopagent/ui/app.py                 # then, on :8501
+```
+
+**`uvicorn` is not optional.** The cart, checkout and order tools reach it over
+HTTP, so without it the catalog still answers and every commerce tool tells the
+model — in words — that the shop is unreachable. The page will load and nothing
+can be bought.
+
+**Chat is the whole interface.** There is no grid beside the conversation and no
+catalog to browse around the agent, which is why the API has no `GET /products`.
+Search results appear as cards *inside* the message that produced them, and a
+card is not clickable: nothing enters a basket except by asking. Variants are
+grouped by colour — `black · 41, 42, 43 — €94.99` — with sold-out sizes struck
+through rather than dropped, because "there is no 42" and "the 42 is gone" are
+different sentences.
+
+**Every turn carries a collapsed activity panel**: which tools ran in what
+order, their arguments, how long each took, whether it was refused and why, the
+turn's cost and model-call count, and a link to its Langfuse trace. Closed, the
+page is a conversation; open, it is what this project is for. A refused call is
+the most useful row in it — the confirmation gate parking a question and the
+unknown-variant guardrail both appear there with their reasons.
+
+**A purchase is confirmed in a modal, and the total in it comes from
+`view_cart`** through `money.format_amount` — never from anything the model
+wrote. The chat input is disabled while that question is open, because a new
+message would silently void it. The payment link is rendered from state the
+shop wrote, never from the model's prose; the model is not given the URL at all.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `UI_SPEND_CAP_USD` | `0.50` | what one browser session may spend on model calls. Checked at the door of a turn, never inside one, so the ceiling is the cap plus one turn — `run_tool_loop` is not opened for it. When it is reached the input is disabled and the conversation stays readable. |
+
+`.streamlit/config.toml` sets `toolbarMode = "minimal"`, which drops the Deploy
+button and the developer menu while keeping the rerun control — the one thing in
+that bar a person watching a slow turn wants.
+
+Measured end to end on D11: search, add to cart, confirm in the dialog, pay with
+`4242 4242 4242 4242`, and the agent answers "your payment went through, the
+order is paid" from `check_order_status` — a status written by a signed
+`checkout.session.completed` and by nothing else. Five webhook deliveries, all
+200. `docs/screenshots/d11-06-paid-end-to-end.png`.
 
 ## Eval results
 

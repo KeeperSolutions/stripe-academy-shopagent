@@ -1563,6 +1563,117 @@ end to end, ten times, in one process — which is the only condition under whic
 either defect is visible. That is the argument for the suite, and it is worth
 stating as a measurement rather than as a hope about evals in general.
 
+## Day 11 — findings
+
+**`grep -c` counted its own line, and a wrong reading sent a correct piece of
+code to be investigated.** Step 3 reported "`stripe listen` is running (1
+process)" on the strength of `ps aux | grep -c "[s]tripe listen"`. That counts
+*lines of output*, not processes, and it returned a number that read as one
+forwarder while nothing was forwarding at all. The conclusion drawn from it —
+"the expiry webhook never arrived, and I do not know whether `cancel_order`
+expires the session" — put a question mark over D7 code that turned out to be
+exactly right: `pgrep -fl` found no forwarder, the session was `expired`, and
+Stripe had emitted `checkout.session.expired` twenty-two seconds after the
+cancel.
+
+This is the fourth time in this project that a tool not doing what it appeared
+to do has looked identical to a result, and the first time it happened in
+process diagnostics rather than in a test. The others were a fixture missing a
+field, a probe exercising a neighbouring operation, and a mutation whose branch
+no scenario reached. The shape is the same every time: **a measurement that
+cannot fail is not a measurement**, and `grep -c` over `ps` cannot report zero
+while the grep itself is running.
+
+**The customer and the model are now looking at two different lists, and the UI
+is what put them there.** Grouping variants by colour is right for a person —
+`black · 41, 42, 43 — €94.99` is one row where three used to be — and it means
+"the second one" no longer means the same thing on both sides of the
+conversation. The model resolves an ordinal against `search_products`' flat
+result; the customer counts rows on the page. In the CLI those were the same
+list, because the CLI printed what the tool returned.
+
+Measured rather than feared: the same sentence, "add the second one to my
+cart", resolved to the *second product* on one run and to the *second variant of
+the first product* on another. That second reading is the one the grouped cards
+make natural, and it is a different kind of problem from the model variance D10
+already records — **that one is the model being non-deterministic; this one is
+the interface having introduced a second frame of reference.** No guardrail can
+see it: both answers are variants the model was legitimately shown, so
+`seen_variant_ids` passes either. Filed as an open gap rather than patched,
+because the fix is a product decision — number the cards, or stop grouping — and
+neither belongs in a rendering step.
+
+**A mutation survived a test that watched the caller instead of the wire.**
+`Tracer.conversation(session_id=...)` reaches Langfuse through
+`propagate_attributes`, and the test asserted what `BrowserSession` *passed*. So
+deleting the argument in `obs/tracing.py`, between the two, changed nothing the
+test could see. Two facts — the caller sending it and the SDK receiving it — and
+a test that checked the first while the entry claimed the second. The
+replacement asserts it on the exported span, using the in-memory exporter D10
+already built for the redaction tests.
+
+**A mutation survived because no scenario reached its branch.** `resolve_pending`
+refuses an already-answered confirmation, and a double-click test passed with
+that check deleted — because when the model *spends* the approval,
+`take_confirmation` clears it and a second answer finds nothing anyway. The
+check earns its place only in the other branch: the model answers without
+calling `create_checkout`, so the question stays parked, and a second click
+would drive a second turn carrying a second `CONFIRMED_NOTE`. Same lesson as
+D10's two-cycle probe, one layer up: **a guard's test has to be written against
+the state the guard exists for, not against the state that is easy to reach.**
+
+**A third category of surviving mutation: the defect was unrepresentable.**
+"Cards must be captured onto the message, not read back from `last_search`" was
+falsified by rewriting the capture to read `last_search` — and the test passed,
+correctly. `ChatMessage` is frozen and its `cards` tuple is built when the
+bubble is made, so at that instant both designs read the same thing. The eager
+capture had made the lazy defect impossible to express, and the assertion was
+therefore measuring something else. The distinguishing property is elsewhere:
+`last_search` survives a turn and the activity log does not, so the wrong
+design puts the boots from two turns ago under "what is your returns policy?".
+Alongside "the test was weak" and "the mutation was broken", this is the third
+reason a mutation survives, and it is the only one where **the code is right and
+the claim was mis-stated.**
+
+**`st.dialog` was measured with a probe outside the project rather than read out
+of a docstring.** The confirmation modal had to satisfy four things nothing in
+the documentation states together: that it closes only programmatically
+(`dismissible=False`), that closing it redraws the *page* and not just itself
+(`st.rerun(scope="app")`, because a dialog is a fragment), that a double-click
+produces one answer and not two, and that a newly parked question reopens it. A
+throwaway script on another port answered all four in a few minutes and cost
+nothing. The alternative was building the real thing on four assumptions and
+finding out during a paid run.
+
+**`$` is LaTeX in Streamlit's markdown, and the page said so before any test
+did.** `f"session ${cost} of ${cap}"` rendered the cost inside a maths block and
+swallowed the cap. It was found by loading the page and reading it, which is
+also how D10 found eighteen plaintext copies of a query in a live trace while
+every unit test agreed the argument was digested. **Some defects are only
+visible in the artefact.**
+
+**D9's unknown-variant guardrail refused a test script, which is the guardrail
+working.** The first draft of the confirmation tests called `add_to_cart(86272)`
+with no preceding search, and was refused because the id had not appeared in a
+tool result in that conversation. Every script here now opens with a search —
+not as scene-setting, but because the guard makes it a precondition. A guard
+that inconveniences the person writing tests for it is one that is actually in
+the path.
+
+**The end-to-end payment worked, and the one thing that broke was the
+harness.** A browser navigated to the Stripe URL *in the same tab*, paid, and
+came back to a cold Streamlit session with the conversation gone — which looked
+like a session-durability defect and was not one. `st.link_button` opens a new
+tab by default, so a customer clicking "Pay with Stripe" leaves the app tab
+alive; only the automation had gone somewhere the customer never goes. Driven
+again through the button, the session survived the round trip and the agent
+answered "Yes, your payment went through. The order is paid." from
+`check_order_status` — a status written by a signed `checkout.session.completed`
+and by nothing else. **An automated path that is not the user's path can
+manufacture a defect report about code that is correct**, which is the same
+lesson as the `grep -c` entry above, arriving from the other direction on the
+same day.
+
 ## Known gaps
 
 Every entry carries the day it was written. **Open** entries are grouped by
@@ -2013,6 +2124,59 @@ out of the list.
 
 ---
 
+### Open — the browser UI
+
+**The customer and the model count different lists.** *(D11.)* Cards group
+variants by colour, so one row on the page can be three variants in the tool
+result. "The second one" therefore resolves against two different orderings,
+and both are legitimate: the model reads `search_products`' flat result, the
+customer reads rows. Measured — the same sentence gave the second *product* on
+one run and the second *variant of the first product* on another. No guardrail
+can catch it, because either answer is a variant the model was genuinely shown,
+so `seen_variant_ids` passes both. It is not the model variance D10 records; it
+is a second frame of reference the interface introduced. Closing it means
+numbering the cards or ungrouping them, which is a product decision and not a
+rendering one.
+
+**The browser's session layer is not the one the eval suite drives.** *(D11.)*
+`evals/runner.py` and `ui/session.py` both enter through `build_tool_setup` and
+both drive `run_tool_loop`, which is asserted structurally on each of them —
+but the runner drives the loop directly while the browser drives it through
+`BrowserSession`, whose state lives in `st.session_state`. So "the browser and
+the runner behave the same" is a claim about two code paths that meet below the
+session layer and not at it, and there is no test that can be written for the
+part above. The honest statement is that the *shop* is the same and the
+*driver* is not.
+
+**A conversation does not survive a restart, or a reload.** *(D11.)* Everything
+one tab holds — the transcript, the `ConversationMemory` with its cart and order
+ids, the cost — is in `st.session_state`, which is per websocket session. A
+server restart, a hard refresh, or a customer returning by URL rather than by
+tab all produce an empty chat and an agent that cannot answer about an order it
+placed a minute earlier. The order is safe in Postgres; the *conversation's
+handle on it* is not. The payment round trip is fine because `st.link_button`
+opens a new tab, but that is one path being lucky rather than the state being
+durable.
+
+**There is no rate limit, only a spend cap.** *(D11.)* `UI_SPEND_CAP_USD` stops
+one browser session at $0.50 and is checked at the door of a turn, so the real
+ceiling is the cap plus one turn. Nothing stops *many* sessions: a new tab is a
+new cap, and there is no per-IP or per-process limit anywhere. Adequate for a
+demo on one machine and not for anything reachable.
+
+**`ui/app.py` has no tests.** *(D11.)* Everything it renders is decided in
+`ui/session.py`, `ui/cards.py` and `ui/colors.py`, all of which are covered —
+and the page itself is exercised only by hand, with screenshots as the record.
+Two things about it *are* asserted by parsing the file: that it formats no money
+and performs no division, and that `ui/session.py` beneath it never imports
+Streamlit. Everything else about the page is claimed by a screenshot, which is
+evidence that something worked once rather than a test that it still does.
+
+**The spend cap is per session and the cost meter is per process.** *(D11.)*
+`UsageTracker` is built per `BrowserSession`, so two tabs each get their own
+$0.50 and the process total is nowhere. A dashboard reading "what has this
+deployment spent today" has nothing to read.
+
 ### Open — deployment and operations
 
 **There is no readiness endpoint.** *(D6.)* `/health` deliberately does not touch
@@ -2103,6 +2267,31 @@ the page: a redirect is a URL anybody can open.
 ---
 
 ### Closed
+
+**A browser conversation was several unrelated traces.** *(D11 step 1 → closed
+on D11 step 4.)* The original entry read: "The CLI opens one conversation span
+for its whole REPL and closes it on the way out; the browser cannot. A Streamlit
+rerun runs on a fresh thread and an OTEL span is put in the current context by a
+`contextvar`, so a span entered on one rerun's thread cannot be closed on
+another's. One span per turn is entered and closed on the same thread, always —
+and the cost is that D10's Definition of done, *a trace shows the whole
+conversation*, is not met on the browser path."
+
+The premise held and the conclusion did not. Per-turn roots are still the only
+shape that closes where it opens; what was missing was that Langfuse groups
+traces natively. `propagate_attributes` takes `session_id`, `Tracer.conversation`
+now takes one too — optional, defaulting to `None`, so the CLI path D1 through
+D10 use is byte-for-byte unaffected — and `BrowserSession` passes a `uuid4` per
+tab. N traces, one session view.
+
+Two details are worth keeping. The id is deliberately *not* redacted: it is a
+value this process invents, carrying nothing anybody wrote and identifying
+nobody, where `shopper_id` identifies a person and leaves as a digest — two
+parameters rather than one for exactly that reason. And the test asserts it on
+the exported span rather than on what the caller passed, because the first
+version checked the caller and a mutation deleting the argument in between
+survived it.
+
 
 **`190 euros`, written as a word, was not caught.** *(D9 → closed on D9, found
 stale on D10.)* The original entry read: "The amount validation matches a number
