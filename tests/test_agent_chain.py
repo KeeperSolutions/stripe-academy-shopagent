@@ -246,8 +246,23 @@ def test_the_model_holds_the_five_tool_chain(name, commerce_api, engine, capsys)
     trace = Trace()
     record_replies(client, trace)
 
+    confirmations = []
+
+    def confirm(summary: str) -> bool:
+        """A test saying yes on a person's behalf, and saying so out loud.
+
+        The gate refuses when there is nobody to ask, which is what a chain run
+        without this argument would hit — correctly, and uninformatively. What
+        this measurement is about is whether the model reaches the gate, so the
+        harness answers it and records the summary it was shown, and the
+        assertion below is that a person would have been shown a real cart
+        rather than a total the model made up.
+        """
+        confirmations.append(summary)
+        return True
+
     with ExitStack() as stack:
-        setup = build_tool_setup(stack, catalog_enabled=True)
+        setup = build_tool_setup(stack, catalog_enabled=True, confirm=confirm)
         if not setup.catalog_available:
             pytest.skip(f"the catalog server did not start: {setup.note}")
 
@@ -278,6 +293,12 @@ def test_the_model_holds_the_five_tool_chain(name, commerce_api, engine, capsys)
         if expected not in trace.names_in(index)
     ]
     assert not missed, f"the chain broke ({name}), see {path}:\n" + "\n".join(missed)
+
+    # The gate was reached and a person was shown the cart, not a figure the
+    # model produced. Without this the test would pass on a chain that called
+    # `create_checkout` through a gate that had been quietly disabled.
+    assert confirmations, "create_checkout ran without anybody being asked"
+    assert "Total:" in confirmations[-1]
 
 
 # --- taking the rows back out --------------------------------------------
