@@ -17,10 +17,17 @@ from typing import Any
 
 import pytest
 
-from shopagent.llm.client import LLMClient
+from shopagent.llm.client import AssistantMessage, LLMClient, ToolCall
 from shopagent.agent.prompt import CATALOG_PROMPT, NO_CATALOG_PROMPT, initial_messages
 from shopagent.agent.memory import ConversationMemory
-from shopagent.llm.loop import _print_payment_link, build_tool_setup, run_tool_loop
+from shopagent.agent.confirmation import CONFIRMED_NOTE, DECLINED_NOTE
+from shopagent.agent.guardrails import FALLBACK_PREFIX, GuardedClient
+from shopagent.llm.loop import (
+    _print_payment_link,
+    _settle_confirmation,
+    build_tool_setup,
+    run_tool_loop,
+)
 from shopagent.mcp_client.client import MCPToolClient
 
 LOCAL_TOOLS = ["get_time", "calculator"]
@@ -411,3 +418,365 @@ def test_a_session_with_no_memory_at_all_does_not_crash(capsys):
     _print_payment_link(None)
 
     assert capsys.readouterr().out == ""
+
+
+# --- the CLI's half of the confirmation protocol (D10, step 1) ------------
+#
+# The gate parks a question and returns; `_settle_confirmation` is what puts it
+# to a person and carries their answer back into a second turn. These tests are
+# about that second half only — what the gate decides is asserted in
+# `tests/test_guardrails.py`, and the protocol under both in
+# `tests/test_confirmation.py`.
+#
+# The point of driving it here is the one thing neither of those can show: the
+# follow-up is a normal `run_tool_loop` call on the same unmodified function,
+# not a suspended one being resumed.
+
+
+class ConfirmationClient:
+    """An LLM answering from a list, and recording the messages it was sent."""
+
+    # `_run_session` prints the model name in its banner, and `GuardedClient`
+    # forwards every attribute but one to whatever it wraps.
+    model = "fake-model"
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    def chat_with_tools(self, messages, tools=None):
+        self.calls.append(list(messages))
+        return self.replies.pop(0)
+
+
+def _reply(content=None, tool=None):
+    calls = [ToolCall(id="c1", name=tool, arguments="{}")] if tool else []
+    return AssistantMessage(content=content, tool_calls=calls)
+
+
+def _gated_setup(confirm):
+    """A real session's gate and memory, over a commerce API answering in-process.
+
+    Built directly rather than through `build_tool_setup`, which would reach a
+    live MCP subprocess and a live HTTP client for nothing: what these tests
+    are about is the two halves of the protocol, and the pieces that carry it
+    are the registry, the memory and the confirmer.
+    """
+    import httpx
+
+    from shopagent.llm.loop import ToolSetup
+    from shopagent.agent.guardrails import GuardedRegistry
+    from shopagent.tools.commerce import register_commerce_tools
+    from shopagent.tools.http import CommerceAPI
+
+    def handler(request):
+        path = request.url.path
+        if path.startswith("/cart"):
+            return httpx.Response(
+                200,
+                json={
+                    "cart_id": "c-1",
+                    "status": "open",
+                    "currency": "eur",
+                    "items": [
+                        {
+                            "item_id": "i-1",
+                            "variant_id": 86263,
+                            "sku": "FF-TRLGTX-42-BLK",
+                            "product_name": "Trail Runner GTX",
+                            "variant_label": "42 / black",
+                            "quantity": 2,
+                            "unit_price_cents": 9499,
+                            "line_total_cents": 18998,
+                        }
+                    ],
+                    "total_cents": 18998,
+                },
+            )
+        if path.endswith("/checkout"):
+            return httpx.Response(
+                200, json={"checkout_url": "https://pay.example/cs_test_1", "status": "pending"}
+            )
+        if path == "/orders":
+            return httpx.Response(
+                201,
+                json={
+                    "order_id": "o-1",
+                    "status": "pending",
+                    "currency": "eur",
+                    "items": [],
+                    "total_cents": 18998,
+                },
+            )
+        return httpx.Response(404, json={"detail": "no such path"})
+
+    memory = ConversationMemory(cart_id="c-1")
+    registry = GuardedRegistry(memory, can_confirm=confirm is not None)
+    api = CommerceAPI(
+        base_url="http://commerce.test", api_key="k", transport=httpx.MockTransport(handler)
+    )
+    register_commerce_tools(registry, api, memory)
+    return ToolSetup(
+        registry=registry, catalog_available=False, memory=memory, confirm=confirm
+    )
+
+
+def test_the_cli_asks_after_the_turn_and_then_drives_one_more(capsys):
+    """The whole protocol, end to end, through the function the CLI calls.
+
+    Two turns, two `run_tool_loop` entries: the first parks the question, the
+    second spends the answer. The customer is asked in between, which is the
+    only moment at which a browser could have been asked instead.
+    """
+    shown = []
+    setup = _gated_setup(confirm=lambda summary: shown.append(summary) or True)
+    client = ConfirmationClient(
+        _reply(tool="create_checkout"),
+        _reply("Waiting for your confirmation."),
+        _reply(tool="create_checkout"),
+        _reply("Your order is placed."),
+    )
+    messages = [{"role": "user", "content": "check me out"}]
+    schemas = setup.registry.openai_schemas()
+
+    setup.memory.begin_turn(from_customer=True)
+    run_tool_loop(client, setup.registry, messages, schemas)
+    assert setup.memory.pending_confirmation is not None, "nothing was parked"
+
+    _settle_confirmation(client, setup.registry, messages, schemas, setup)
+
+    assert len(shown) == 1
+    assert "Total: €189.98" in shown[0]
+    assert setup.memory.order_id == "o-1"
+    assert setup.memory.checkout_url == "https://pay.example/cs_test_1"
+    assert client.replies == [], "both turns ran"
+    assert [message["role"] for message in messages].count("system") == 1
+
+
+def test_the_answer_reaches_the_model_as_a_system_note_not_as_the_customer(capsys):
+    """The customer pressed a key in the shop's interface; they did not speak."""
+    setup = _gated_setup(confirm=lambda summary: True)
+    client = ConfirmationClient(
+        _reply(tool="create_checkout"),
+        _reply("Waiting."),
+        _reply("Placed."),
+    )
+    messages = [{"role": "user", "content": "check me out"}]
+    schemas = setup.registry.openai_schemas()
+
+    setup.memory.begin_turn(from_customer=True)
+    run_tool_loop(client, setup.registry, messages, schemas)
+    _settle_confirmation(client, setup.registry, messages, schemas, setup)
+
+    note = [message for message in messages if message.get("role") == "system"]
+    assert note == [{"role": "system", "content": CONFIRMED_NOTE}]
+    assert not any(
+        message.get("role") == "user" and message["content"] == CONFIRMED_NOTE
+        for message in messages
+    )
+
+
+def test_declining_drives_the_turn_that_tells_the_customer_and_buys_nothing():
+    setup = _gated_setup(confirm=lambda summary: False)
+    client = ConfirmationClient(
+        _reply(tool="create_checkout"),
+        _reply("Waiting."),
+        _reply("Understood, I have not placed it."),
+    )
+    messages = [{"role": "user", "content": "check me out"}]
+    schemas = setup.registry.openai_schemas()
+
+    setup.memory.begin_turn(from_customer=True)
+    run_tool_loop(client, setup.registry, messages, schemas)
+    _settle_confirmation(client, setup.registry, messages, schemas, setup)
+
+    assert setup.memory.order_id is None, "nothing was ordered"
+    assert setup.memory.checkout_url is None
+    assert any(message.get("content") == DECLINED_NOTE for message in messages)
+    assert client.replies == [], "the customer still gets told, which costs a turn"
+
+
+def test_a_turn_that_asked_nobody_anything_drives_no_second_turn():
+    """The ordinary case, which is every turn that did not reach a checkout."""
+    setup = _gated_setup(confirm=lambda summary: True)
+    client = ConfirmationClient(_reply("Here is your cart."))
+    messages = [{"role": "user", "content": "hello"}]
+    schemas = setup.registry.openai_schemas()
+
+    setup.memory.begin_turn(from_customer=True)
+    run_tool_loop(client, setup.registry, messages, schemas)
+    _settle_confirmation(client, setup.registry, messages, schemas, setup)
+
+    assert client.replies == []
+    assert len(client.calls) == 1
+
+
+def test_a_session_with_nobody_to_ask_never_reaches_the_confirmer():
+    """`confirm=None` refuses at the gate, so nothing is parked to be answered."""
+    setup = _gated_setup(confirm=None)
+    client = ConfirmationClient(
+        _reply(tool="create_checkout"),
+        _reply("I cannot complete that here."),
+    )
+    messages = [{"role": "user", "content": "check me out"}]
+    schemas = setup.registry.openai_schemas()
+
+    setup.memory.begin_turn(from_customer=True)
+    run_tool_loop(client, setup.registry, messages, schemas)
+    assert setup.memory.pending_confirmation is None
+
+    _settle_confirmation(client, setup.registry, messages, schemas, setup)
+
+    assert setup.memory.order_id is None
+    assert client.replies == []
+
+
+# --- the amount guard over the turn the gate created (D10, step 1) --------
+#
+# The confirmation protocol added a second `run_tool_loop` entry per checkout,
+# and a new path is a new place a rule can fail to reach. Two answers now exist
+# that did not before: the sentence the model writes while a person is being
+# asked, and the one it writes after they have answered. Both state figures to
+# a customer, so both have to be checked against `seen_amount_cents` — a gate
+# that opened a hole in the amount guardrail would have traded one rule for
+# another.
+#
+# `_settle_confirmation` takes whatever client it is given, and `_run_session`
+# gives it the `GuardedClient` it wraps once at the top. These tests assert the
+# consequence rather than the wiring: a bad figure in either sentence comes back
+# as the fallback.
+
+
+def _guarded(setup, *replies):
+    inner = ConfirmationClient(*replies)
+    return GuardedClient(inner, setup.memory), inner
+
+
+def test_an_invented_amount_after_the_confirmation_is_caught_like_any_other():
+    """The follow-up turn is not a privileged one."""
+    setup = _gated_setup(confirm=lambda summary: True)
+    client, inner = _guarded(
+        setup,
+        _reply(tool="create_checkout"),
+        _reply("Waiting for your confirmation."),
+        _reply(tool="create_checkout"),
+        _reply("Done — that came to €5.00."),
+        # The retry the correction buys, wrong in the same way.
+        _reply("Done — that came to €5.00."),
+    )
+    messages = [{"role": "user", "content": "check me out"}]
+    schemas = setup.registry.openai_schemas()
+
+    setup.memory.begin_turn(from_customer=True)
+    run_tool_loop(client, setup.registry, messages, schemas)
+    _settle_confirmation(client, setup.registry, messages, schemas, setup)
+
+    assert inner.replies == [], "the retry was never asked for"
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"].startswith(FALLBACK_PREFIX)
+    assert "€5.00" not in messages[-1]["content"].removeprefix(FALLBACK_PREFIX).split(")")[1]
+
+
+def test_an_invented_amount_while_the_customer_is_being_asked_is_caught_too():
+    """The other new sentence: the one written before anybody has answered.
+
+    It is the turn the gate ends, and the model is told to say briefly that it
+    is waiting — which is an invitation to restate the total from memory.
+    """
+    setup = _gated_setup(confirm=lambda summary: True)
+    client, inner = _guarded(
+        setup,
+        _reply(tool="create_checkout"),
+        _reply("Confirm the €5.00 and I will place it."),
+        _reply("Confirm the €5.00 and I will place it."),
+        _reply(tool="create_checkout"),
+        _reply("Placed."),
+    )
+    messages = [{"role": "user", "content": "check me out"}]
+    schemas = setup.registry.openai_schemas()
+
+    setup.memory.begin_turn(from_customer=True)
+    run_tool_loop(client, setup.registry, messages, schemas)
+
+    waiting = [m for m in messages if m.get("role") == "assistant" and m.get("content")]
+    assert waiting[-1]["content"].startswith(FALLBACK_PREFIX)
+
+    # And the purchase is unaffected: a blocked sentence is not a blocked gate.
+    _settle_confirmation(client, setup.registry, messages, schemas, setup)
+    assert setup.memory.order_id == "o-1"
+
+
+def test_the_cart_total_quoted_after_a_confirmation_passes_untouched():
+    """The control. A guard that rejected the right answer too would pass the
+    two tests above and be worthless."""
+    setup = _gated_setup(confirm=lambda summary: True)
+    client, inner = _guarded(
+        setup,
+        _reply(tool="create_checkout"),
+        _reply("Waiting for your confirmation."),
+        _reply(tool="create_checkout"),
+        _reply("Placed — €189.98 in total."),
+    )
+    messages = [{"role": "user", "content": "check me out"}]
+    schemas = setup.registry.openai_schemas()
+
+    setup.memory.begin_turn(from_customer=True)
+    run_tool_loop(client, setup.registry, messages, schemas)
+    _settle_confirmation(client, setup.registry, messages, schemas, setup)
+
+    assert messages[-1]["content"] == "Placed — €189.98 in total."
+    assert inner.replies == [], "a correct answer must not cost a retry"
+
+
+def test_the_repl_itself_guards_the_turn_the_gate_created():
+    """The claim the three tests above cannot make on their own.
+
+    They hand `_settle_confirmation` a client they wrapped themselves, so they
+    prove the guard works when it is there — not that the CLI puts it there. An
+    edit that built a second, unwrapped client for the follow-up would leave
+    all three green and let an invented figure reach a customer on the one turn
+    a purchase happens.
+
+    So this drives `_run_session`, which is the function that does the wrapping,
+    with `input` standing in for a person at the keyboard: a customer message, a
+    `y` at the confirmation prompt, and `/exit`. What reaches the terminal is
+    what a customer would have read.
+    """
+    import builtins
+
+    from shopagent.agent import profile as profiles
+    from shopagent.llm.loop import _ask_to_confirm, _run_session
+    from shopagent.llm.usage import UsageTracker
+
+    setup = _gated_setup(confirm=_ask_to_confirm)
+    client = ConfirmationClient(
+        _reply(tool="create_checkout"),
+        _reply("Waiting for your confirmation."),
+        _reply(tool="create_checkout"),
+        _reply("Done — that came to €5.00."),
+        _reply("Done — that came to €5.00."),
+    )
+    typed = iter(["check me out", "y", "/exit"])
+    printed = []
+
+    original_input = builtins.input
+    original_print = builtins.print
+    original_load = profiles.load_for_session
+    builtins.input = lambda prompt="": next(typed)
+    builtins.print = lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args))
+    profiles.load_for_session = lambda shopper_id: (None, None)
+    try:
+        _run_session(client, UsageTracker(), setup)
+    finally:
+        builtins.input = original_input
+        builtins.print = original_print
+        profiles.load_for_session = original_load
+
+    transcript = "\n".join(printed)
+    assert "About to place this order:" in transcript, "the person was never asked"
+    assert "Total: €189.98" in transcript
+    assert FALLBACK_PREFIX in transcript, (
+        "an amount no tool produced reached the customer on the turn the "
+        "confirmation created"
+    )
+    assert client.replies == [], "the correction was never sent"

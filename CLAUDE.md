@@ -49,6 +49,7 @@ tracked.
 | `agent/memory.py` | D9 | one conversation's state outside the message list |
 | `agent/profile.py` | D9 | what the shop remembers about a customer |
 | `agent/guardrails.py` | D9 | the confirmation gate and output validation |
+| `agent/confirmation.py` | D10 | the two-phase protocol the gate asks through |
 | `obs/` | D10 | Langfuse tracing |
 
 Search logic belongs in `catalog/`, never inside the MCP server. The server is
@@ -781,12 +782,77 @@ An instruction that states a precondition without stating how it is satisfied
 cannot be satisfied — it is not weak, it is unsatisfiable. The sentence is
 gone and `agent/guardrails.py` intercepts the call instead, shows a person what
 they are buying, and asks. There is no `confirmed` argument on purpose: an
-argument the model sets is a suggestion with a type annotation.
+argument the model sets is a suggestion with a type annotation. *How* it asks
+changed on D10 — it parks the question rather than blocking on the answer — and
+what it asks about did not; see the two-phase entry below.
 
 The same reasoning closed D2's older debt. The prompt said never do arithmetic
 in your head; the model did it anyway and was right, silently. So an amount in
 an answer is now checked against the amounts tools produced, with one retry and
 then a fallback that names the figure it could not trace.
+
+**The gate parks its question; it never blocks for the answer.** D9 called a
+`confirm` callable from inside `GuardedRegistry.dispatch`, which in the CLI
+meant a tool call suspended on `input()`. That was the right rule in the wrong
+shape, and two callers arriving after it could not use it at all: D10's eval
+runner has nobody at a keyboard, and D11's browser answers in a *later HTTP
+request* than the one that asked, so there is no callable that could block for
+it. Adapting a blocking protocol to either is not possible, so it was replaced
+once, before anything was built on it.
+
+`create_checkout` meets the gate, the cart is read through `view_cart`, the
+summary is *parked* on `ConversationMemory` and a `ToolResult` says a
+confirmation has been requested. The tool has not run. Whatever is presenting
+the conversation reads `memory.pending_confirmation`, puts it to whoever it can
+reach, records the answer, and drives one more turn carrying a system note; the
+next `create_checkout` spends that answer or is refused by it. Parking state
+the model never sees is the same answer `checkout_url` and `cart_id` already
+got, and this is the fourth piece.
+
+**The total a person approves still comes from `view_cart` and never from the
+model's prose.** That is the property D9 paid for and the one thing this
+rewrite was not allowed to lose. A person approving a figure the model invented
+is worse than no gate at all — it launders the invention through a human and
+leaves a record saying they agreed. `GuardedRegistry` therefore still dispatches
+`view_cart` itself and renders it through `money.format_amount`, and the test
+that holds it makes the model say a different number and checks the summary
+does not move.
+
+The visible cost is one sentence. The turn ends before anybody is asked, so the
+model answers first — "waiting for your confirmation" — and the summary and the
+`[y/N]` prompt follow it. That is a change to what the CLI prints and it was
+accepted deliberately; the alternative was reaching into `run_tool_loop`.
+
+**An approval is spendable on exactly one turn, and any customer message drops
+it.** The failure this is set against was seen in another codebase: a
+classifier deciding "did they say yes" from the *shape* of the word will read a
+"yes" aimed at some other question as authorisation to spend money. This gate
+never had that defect, because it asks the question itself and reads the answer
+to that question and no other — but a pending approval that outlives its turn
+hands the immunity back, since it is then an answer sitting apart from what it
+answered. `ConversationMemory.begin_turn(from_customer=True)` is what kills it,
+and it is load-bearing rather than decorative: a customer message advances to
+exactly the turn number the approval was good for, so the counter alone would
+let it through. `test_an_approval_given_but_never_carried_back_dies_on_the_next_message`
+is what fails without it.
+
+`spendable_on_turn` is the single record of "answered, and for which turn".
+A `not pending.answered` check stood beside it for one round and was deleted:
+mutating it away failed nothing, because an unanswered question can never be in
+the window either. Two spellings of one fact, which is what this document
+refuses everywhere else — and the mutation surviving is how it was found rather
+than reasoned about.
+
+**`GuardedRegistry` takes `can_confirm: bool`, not a callable.** It no longer
+asks anybody, so holding a confirmer it never invokes would read as a bug to
+every reader after the first. What it still needs is D9's rule unchanged —
+nobody reachable means refuse, because a gate that cannot reach a person is not
+a gate — and that is a fact, not a function. The confirmer belongs to whatever
+is presenting the conversation, which is the only layer that knows how to reach
+a person: `_ask_to_confirm` in `llm/loop.py` prints and reads a line,
+`ScriptedConfirmer` answers from a rule for the runner, and D11's will do
+neither. **Nothing below the CLI may print or read one**, which is the check on
+whether the boundary is in the right place.
 
 **The gate binds the model, not the shop, and the boundary is deliberate.**
 `tools/commerce.py` holds plain functions anybody can import and the commerce

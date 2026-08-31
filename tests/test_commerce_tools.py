@@ -665,3 +665,220 @@ def test_bad_arguments_still_come_back_from_the_registry_not_from_here():
     assert not result.ok
     assert "variant_id" in result.content
     assert "greater than 0" in result.content
+
+
+# --- the gate and the resume, against the real API (D10, step 1) ---------
+#
+# Everything above is offline against `MockTransport`, which is what makes the
+# failure paths reachable. This one is not, and it is the only test here that
+# needs a database, because the claim is about rows: a `create_checkout`
+# confirmed twice in one conversation must place *one* order.
+#
+# The claim is not obvious and it is not the gate's doing. `create_checkout`
+# writes `order_id` and clears `cart_id` before it calls Stripe, so a second
+# call takes the resume branch — `GET /orders/{id}` and the idempotent
+# `POST /orders/{id}/checkout` D7 built, which hands back the session already
+# stored rather than opening another. D10 put a second approval in front of
+# that path; what this asserts is that the approval buys a payment link and not
+# a second order.
+
+
+class FakeCheckoutSession:
+    """What Stripe returns, reduced to the two fields the router reads."""
+
+    def __init__(self, identifier="cs_test_resume"):
+        self.id = identifier
+        self.url = f"https://checkout.stripe.com/c/pay/{identifier}"
+
+
+@pytest.fixture
+def commerce_through_the_api(authed_client, monkeypatch):
+    """A `CommerceAPI` whose requests are served by the in-process FastAPI app.
+
+    `authed_client` already routes handlers into the test's own transaction and
+    carries the API key, so forwarding to it puts the agent's tools through the
+    same door as any other client — which is the reason `tools/commerce.py`
+    speaks HTTP in the first place.
+    """
+    from shopagent.api.routers import orders as orders_router
+
+    sessions = []
+
+    def fake_create(session, order_id):
+        # Idempotent by lookup, the way D7's real one is: one session per order,
+        # returned again on every later call.
+        if not sessions:
+            sessions.append(FakeCheckoutSession())
+        return sessions[0]
+
+    monkeypatch.setattr(
+        orders_router.checkout_service, "create_checkout_session", fake_create
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        forwarded = authed_client.request(
+            request.method,
+            str(request.url),
+            content=request.content or None,
+            headers={
+                name: value
+                for name, value in request.headers.items()
+                if name.lower() not in {"host", "content-length"}
+            },
+        )
+        return httpx.Response(
+            forwarded.status_code,
+            content=forwarded.content,
+            headers={"content-type": forwarded.headers.get("content-type", "application/json")},
+        )
+
+    # The real key rather than a placeholder: the forwarded request carries
+    # the header the agent sent, so a wrong one here would be a 401 from the
+    # app's own `require_api_key` — which is the point of routing through it.
+    from shopagent.config import get_settings
+
+    return CommerceAPI(
+        base_url="http://commerce.test",
+        api_key=get_settings().shopagent_api_key,
+        transport=httpx.MockTransport(handler),
+    )
+
+
+@pytest.mark.db
+def test_a_second_confirmed_checkout_resumes_and_places_no_second_order(
+    commerce_through_the_api, session
+):
+    from sqlalchemy import func, select
+
+    from shopagent.agent import confirmation
+    from shopagent.agent.guardrails import GuardedRegistry
+    from shopagent.agent.memory import ConversationMemory
+    from shopagent.api.models import Order
+    from shopagent.catalog.models import Inventory, Price, Product, Variant
+    from shopagent.config import get_settings
+    from shopagent.tools.commerce import build_commerce_tools
+
+    product = Product(
+        name="Resume Fixture",
+        description="A product that exists only for this test.",
+        category="shoes",
+        brand="Fleetfoot",
+        variants=[
+            Variant(
+                size="42",
+                color="blue",
+                sku="FF-RESUME-42-BLU",
+                prices=[
+                    Price(currency=get_settings().currency, amount_cents=9499, active=True)
+                ],
+                inventory=Inventory(quantity=10, reserved=0),
+            )
+        ],
+    )
+    session.add(product)
+    session.commit()
+    variant_id = product.variants[0].id
+
+    # A delta rather than an absolute count. `orders` holds what real people
+    # did, so a row left behind by a manual run is not a reason for this to
+    # fail — CLAUDE.md says so about the D6 suite and it is true here too.
+    orders_before = session.execute(select(func.count()).select_from(Order)).scalar_one()
+
+    memory = ConversationMemory()
+    registry = GuardedRegistry(memory, can_confirm=True)
+    for spec in build_commerce_tools(commerce_through_the_api, memory):
+        registry.register(spec)
+
+    def one_confirmed_checkout():
+        """A whole turn's worth of the protocol, as a caller drives it."""
+        memory.begin_turn(from_customer=True)
+        asked = registry.dispatch("create_checkout", {})
+        confirmation.resolve_pending(memory, confirmation.ScriptedConfirmer(answer=True))
+        memory.begin_turn(from_customer=False)
+        return asked, registry.dispatch("create_checkout", {})
+
+    # The variant guard refuses an id the model was never shown, and in a real
+    # conversation a search is what shows it. This test is about the checkout,
+    # so the showing is recorded directly rather than standing a catalog up.
+    memory.observe("search_products", {}, json.dumps({"results": [{"variant_id": variant_id}]}))
+    assert registry.dispatch("add_to_cart", {"variant_id": variant_id}).ok
+
+    _, first = one_confirmed_checkout()
+    assert first.ok, first.content
+    first_order_id = memory.order_id
+    first_url = memory.checkout_url
+
+    _, second = one_confirmed_checkout()
+
+    assert second.ok, second.content
+    assert memory.order_id == first_order_id, "the resume placed a second order"
+    assert memory.checkout_url == first_url, "and it must be the same payment page"
+
+    orders = session.execute(
+        select(func.count()).select_from(Order).where(Order.id == first_order_id)
+    ).scalar_one()
+    assert orders == 1
+
+    orders_after = session.execute(select(func.count()).select_from(Order)).scalar_one()
+    assert orders_after == orders_before + 1, (
+        f"{orders_after - orders_before} orders were placed by two confirmed checkouts"
+    )
+
+
+@pytest.mark.db
+def test_the_second_approval_is_asked_about_the_order_and_not_an_empty_cart(
+    commerce_through_the_api, session
+):
+    """The resume summary is what PR #9 found: a cart cleared by the first
+    checkout must not be summarised as "Total: €0.00" for a real purchase."""
+    from shopagent.agent import confirmation
+    from shopagent.agent.guardrails import RESUMING, GuardedRegistry
+    from shopagent.agent.memory import ConversationMemory
+    from shopagent.catalog.models import Inventory, Price, Product, Variant
+    from shopagent.config import get_settings
+    from shopagent.tools.commerce import build_commerce_tools
+
+    product = Product(
+        name="Resume Summary Fixture",
+        description="A product that exists only for this test.",
+        category="shoes",
+        brand="Fleetfoot",
+        variants=[
+            Variant(
+                size="43",
+                color="red",
+                sku="FF-RESUME-43-RED",
+                prices=[
+                    Price(currency=get_settings().currency, amount_cents=9499, active=True)
+                ],
+                inventory=Inventory(quantity=10, reserved=0),
+            )
+        ],
+    )
+    session.add(product)
+    session.commit()
+
+    memory = ConversationMemory()
+    registry = GuardedRegistry(memory, can_confirm=True)
+    for spec in build_commerce_tools(commerce_through_the_api, memory):
+        registry.register(spec)
+    memory.observe(
+        "search_products",
+        {},
+        json.dumps({"results": [{"variant_id": product.variants[0].id}]}),
+    )
+    registry.dispatch("add_to_cart", {"variant_id": product.variants[0].id})
+
+    confirmer = confirmation.ScriptedConfirmer(answer=True)
+    for _ in range(2):
+        memory.begin_turn(from_customer=True)
+        registry.dispatch("create_checkout", {})
+        confirmation.resolve_pending(memory, confirmer)
+        memory.begin_turn(from_customer=False)
+        registry.dispatch("create_checkout", {})
+
+    first_summary, second_summary = confirmer.asked
+    assert "€94.99" in first_summary
+    assert RESUMING in second_summary
+    assert "€94.99" in second_summary
+    assert "€0.00" not in second_summary

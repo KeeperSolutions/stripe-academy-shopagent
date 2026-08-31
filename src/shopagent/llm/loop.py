@@ -31,11 +31,11 @@ either paid off or did not.
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 
-from shopagent.agent import profile as profiles
+from shopagent.agent import confirmation, profile as profiles
+from shopagent.agent.confirmation import Confirmer
 from shopagent.agent.guardrails import GuardedClient, GuardedRegistry
 from shopagent.agent.memory import ConversationMemory
 from shopagent.agent.prompt import PROFILE_LABELS, initial_messages
@@ -164,6 +164,12 @@ class ToolSetup:
     # result. Exposed here because the CLI and the tests are the only things
     # that can see it — nothing is put in front of the model.
     memory: ConversationMemory | None = None
+    # Who answers a parked confirmation. Held here rather than inside the
+    # registry because the registry no longer asks anybody (D10, step 1): the
+    # gate parks a question and whatever is presenting the conversation puts it
+    # to a person. `None` means nobody can be reached, which the gate reads as
+    # a refusal.
+    confirm: Confirmer | None = None
 
 
 def build_tool_setup(
@@ -171,7 +177,7 @@ def build_tool_setup(
     *,
     catalog_enabled: bool | None = None,
     client_factory: type[MCPToolClient] = MCPToolClient,
-    confirm: Callable[[str], bool] | None = None,
+    confirm: Confirmer | None = None,
 ) -> ToolSetup:
     """Assemble the registry this session will use.
 
@@ -192,7 +198,9 @@ def build_tool_setup(
     # remembered because of where it is registered rather than because whoever
     # added it knew to.
     memory = ConversationMemory()
-    registry = GuardedRegistry(memory, confirm=confirm)
+    # The registry is told only that somebody can be asked. Who, and how, is
+    # this function's caller's business — see `agent/confirmation.py`.
+    registry = GuardedRegistry(memory, can_confirm=confirm is not None)
     for spec in REGISTRY.specs():
         registry.register(spec)
 
@@ -218,6 +226,7 @@ def build_tool_setup(
             registry=registry,
             catalog_available=False,
             memory=memory,
+            confirm=confirm,
             note="catalog disabled (MCP_CATALOG_ENABLED=false)",
         )
 
@@ -233,10 +242,13 @@ def build_tool_setup(
             registry=registry,
             catalog_available=False,
             memory=memory,
+            confirm=confirm,
             note=f"catalog unavailable ({type(exc).__name__}: {exc})",
         )
 
-    return ToolSetup(registry=registry, catalog_available=True, memory=memory)
+    return ToolSetup(
+        registry=registry, catalog_available=True, memory=memory, confirm=confirm
+    )
 
 
 def main() -> None:
@@ -328,11 +340,16 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
         # their `tool` messages would make every later request a 400 — so a
         # broken turn is removed whole rather than patched up.
         history_length = len(messages)
+        if setup.memory is not None:
+            # A customer message. Anything a person was asked to approve before
+            # it lapses here — see `ConversationMemory.begin_turn`.
+            setup.memory.begin_turn(from_customer=True)
         messages.append({"role": "user", "content": user_input})
         calls_before = len(tracker.calls)
 
         try:
             run_tool_loop(client, registry, messages, tools)
+            _settle_confirmation(client, registry, messages, tools, setup)
         except KeyboardInterrupt:
             # Aborts this answer only — the application stays alive.
             print("\n[interrupted]")
@@ -349,6 +366,45 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
 
     print()
     print(tracker.summary())
+
+
+def _settle_confirmation(
+    client: LLMClient,
+    registry: ToolRegistry,
+    messages: list[Message],
+    tools: list[dict],
+    setup: ToolSetup,
+) -> None:
+    """Put a parked confirmation to the customer and carry their answer back.
+
+    This is the second half of the protocol, and the whole reason the gate
+    stopped blocking: the question is asked *between* turns, not in the middle
+    of one, so `run_tool_loop` is entered again rather than being suspended.
+    That is what a browser will do on D11 with an HTTP round trip in place of
+    an `input()`, and what the eval runner does with a rule in place of a
+    person — none of them needs this function, only the same two calls it
+    makes: `resolve_pending`, then a turn carrying `follow_up_note`.
+
+    Exactly one follow-up turn, because an approval is good for exactly one
+    turn. If the model asks for a second confirmation inside it — which needs
+    two `create_checkout` calls in one turn — that question is left parked and
+    lapses at the customer's next message, where the model will ask again and
+    be asked again. Driving turns until nothing is parked would put the cost of
+    a loop in the model's hands.
+    """
+    memory = setup.memory
+    if memory is None:
+        return
+    answered = confirmation.resolve_pending(memory, setup.confirm)
+    if answered is None:
+        return
+
+    memory.begin_turn(from_customer=False)
+    # A system message, not a user one: the customer pressed a key in the
+    # shop's own interface, and recording that as something they said would put
+    # words in the transcript they never typed.
+    messages.append({"role": "system", "content": confirmation.follow_up_note(answered)})
+    run_tool_loop(client, registry, messages, tools)
 
 
 def _print_payment_link(memory: ConversationMemory | None) -> None:
@@ -390,6 +446,13 @@ def _ask_to_confirm(summary: str) -> bool:
     The summary comes from `agent/guardrails.py`, which built it from a real
     `view_cart` or `check_order_status` call — not from anything the model
     said. This function only prints it and reads a line.
+
+    D10 moved *when* it is called and not what it does. It used to run inside
+    `GuardedRegistry.dispatch`, which meant a tool call was suspended on stdin;
+    it now runs between turns, from `_settle_confirmation`. This is the one
+    confirmer that knows about a terminal, and it is deliberately the topmost
+    layer — anything below the CLI that printed or read a line would be a layer
+    a browser could not reuse.
 
     Anything that is not an explicit yes is a no, including end-of-input. A
     piped session, a closed terminal or a stray newline must not buy anything:
