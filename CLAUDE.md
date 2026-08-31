@@ -53,6 +53,9 @@ tracked.
 | `obs/redaction.py` | D10 | what must not leave this machine |
 | `obs/tracing.py` | D10 | Langfuse, behind a facade that cannot raise |
 | `obs/instrumentation.py` | D10 | the two wrappers that read what exists |
+| `evals/spec.py` | D10 | what a scenario is, and what it may claim |
+| `evals/expectations.py` | D10 | one function per claim the YAML can make |
+| `evals/runner.py` | D10 | drive, report, and undo by id |
 
 Search logic belongs in `catalog/`, never inside the MCP server. The server is
 a thin wrapper, which is what lets D5 swap transports without touching logic.
@@ -1029,6 +1032,20 @@ it; and `mcp_server/` is a thin protocol wrapper by rule, so giving it a
 dependency on this project's observability to save eight lines would invert the
 one direction that module may point in.
 
+**A tool result passes into a trace uncensored, and the boundary is worth
+naming.** It is the shop's own data — a catalogue row, a price, a stock count —
+and it is most of what makes a trace readable. But `view_cart` and
+`check_order_status` are not only that: their results carry the `order_id`, the
+amounts and what this customer chose, and today all three pass on the argument
+that none of them is a personal detail. That argument is about the fields those
+tools return *now*. The rule as written admits a field added later — an email
+on an order, a delivery address on a cart — and would pass it silently, because
+nothing in `redact_messages` looks at a `tool` message at all. This is a
+sentence rather than a guard on purpose: a filter would have to know which
+fields are which, and this project has no such list. What it means concretely
+is that adding a customer's own data to a commerce response is a change that has
+to reach `obs/redaction.py` in the same commit.
+
 **Tracing attaches around, never inside, and `run_tool_loop` is why.** Its
 source hashes to `161bdc1c…9d00` on `main` and on the D10 branch. Instrumentation
 is the easiest thing in this project to justify putting inside that `while`, and
@@ -1160,6 +1177,55 @@ ends the conversation.
 name the field, state what was expected and say what to do next. The model is
 their only reader, and its next turn depends on them.
 
+**The eval suite's criterion is tool calls and database state, not text.**
+`evals/scenarios.yaml` says what this shop is claimed to do and
+`scripts/run_evals.py` settles it. The shape is D9's chain test rather than
+anything new, for the reason that test exists: an implementation producing a
+plausible final sentence while calling nothing at all satisfies every assertion
+about the words. `answer_matches` appears exactly once, in the scenario where
+the text *is* the measurement — an ambiguous request has to produce a question,
+and no tool log can show that.
+
+**There is no threshold that allows N failures in M runs, and there will not
+be.** D9 measured two identical runs producing eight and nine model calls, so
+the vocabulary in `evals/spec.py` can express only the invariants — which tools
+ran, the order of the ones where the order is causal, what they answered, what
+the database holds afterwards, whether a guardrail fired — and deliberately
+cannot express the variance: how many times a tool ran, how many model calls a
+turn took, or the exact words. `tools_in_order` is a *subsequence* for that
+reason. A threshold is a number somebody tunes until the suite is green; if a
+claim is not deterministic, the claim is wrong.
+
+That cuts both ways, and the first run proved it. The gate scenario ended at
+`say: place the order`, and the model answered by asking for confirmation
+itself instead of calling `create_checkout` — so no purchase was attempted, the
+gate never decided, and the scenario measured nothing. The fix is a second turn
+that carries the conversation past the model's own question, which is harmless
+in the branch where it does not ask. **The claim did not move; the conversation
+was made able to test it.** Widening an expectation to accept both outcomes
+would have been the other thing, and is what a threshold looks like before
+anyone calls it one.
+
+**The runner enters the loop by the door the CLI uses.** It calls
+`build_tool_setup` and hands `run_tool_loop` the registry that comes back, so
+the gate, the memory, the guardrails, the traced wrappers and the MCP catalog
+are the ones a customer gets; a confirmation is answered through
+`resolve_pending` and a follow-up turn, which is the D10 protocol and not a
+back door into the memory. `tests/test_evals.py` walks the runner's AST and
+fails if it constructs a registry of its own — the same mechanism
+`tests/test_lifecycle.py` uses for `transition()`, and for the same reason: a
+runner measuring a shop nobody uses would pass every behavioural test it had.
+
+**A scenario undoes itself by id, and a paid one is refunded rather than
+deleted.** Never a truncate, which would take the rows of whatever else was
+running. `paid -> cancelled` is not in the transition table, so scenario 10 —
+which pays with a signed `checkout.session.completed` — is undone with a signed
+`charge.refunded`: `apply_transition` moves it `paid -> refunded` and releases
+exactly the units it held. Nothing in `evals/` touches `inventory.reserved`,
+which is asserted rather than intended. Anything that could not be undone is
+named in the report and makes the scenario a failure, and the D10 collection
+guard stops the next `pytest` run if a row survives anyway.
+
 **Tests come in three kinds, and the marker says which.** Unmarked tests reach
 nothing outside the process — that is the default and the rule below. `db`
 tests connect to the local Postgres, because a schema and a seed are claims
@@ -1224,6 +1290,27 @@ created since the last snapshot. Anything older goes by hand, and an order
 holds stock: decrement `inventory.reserved` by its lines rather than zeroing the
 column — `catalog/seed.py` ships `FF-TRLGTX-42-BLK` with `reserved=2`
 deliberately, which is the mistake `manual_test_state.py` exists to document.
+
+**A fixture that omits a field the real object always has is a blind spot with
+the shape of coverage.** It has cost this project twice, in the same way both
+times: the test looks thorough, the assertion is real, and the defect is in the
+half the fixture never built.
+
+- D8: `refunded_event` carried no `payment_intent`, so no test could have
+  noticed that refunds were attributed by `metadata.order_id` rather than by the
+  PaymentIntent — and a refund of a superseded session's duplicate charge would
+  have driven a real order terminal.
+- D10: the tracing tests built messages with `content` and no `tool_calls`, so
+  none of them saw that a tool call's `arguments` are replayed verbatim into
+  every later generation's input. A live trace carried eighteen plaintext copies
+  of a search query beside a span that showed a digest.
+
+The rule that follows: **build a fixture from the shape the real object always
+has, not from the shape the assertion needs.** When a field is dropped for
+brevity, the thing being asserted has to be one that field cannot affect — and
+if that is not obvious, it is not true. The cheapest check is to read a real
+payload once and diff it against the fixture; both misses above are visible in
+ten seconds that way.
 
 **Tests reach no network and call no SDK method.** Importing `openai` is fine —
 `tests/test_client.py` imports `LLMClient`, which pulls it in — but the client
