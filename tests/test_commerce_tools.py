@@ -14,7 +14,8 @@ import json
 import httpx
 import pytest
 
-from shopagent.tools.commerce import CommerceSession, register_commerce_tools
+from shopagent.agent.memory import ConversationMemory
+from shopagent.tools.commerce import register_commerce_tools
 from shopagent.tools.http import CommerceAPI
 from shopagent.tools.registry import ToolRegistry
 
@@ -39,7 +40,7 @@ def build(handler, session=None):
         transport=httpx.MockTransport(handler),
     )
     registry = ToolRegistry()
-    session = session or CommerceSession()
+    session = session or ConversationMemory()
     register_commerce_tools(registry, api, session)
     return registry, session
 
@@ -200,7 +201,7 @@ def test_remove_from_cart_deletes_the_line_holding_that_variant():
         ("GET", f"/cart/{CART_ID}", httpx.Response(200, json=cart_body([one_line()]))),
         ("DELETE", f"/cart/{CART_ID}/items/{ITEM_ID}", httpx.Response(204)),
     ])
-    registry, _ = build(recorder, CommerceSession(cart_id=CART_ID))
+    registry, _ = build(recorder, ConversationMemory(cart_id=CART_ID))
 
     result = registry.dispatch("remove_from_cart", {"variant_id": 21})
 
@@ -212,7 +213,7 @@ def test_remove_from_cart_refuses_a_variant_the_cart_does_not_hold():
     recorder = Recorder([
         ("GET", f"/cart/{CART_ID}", httpx.Response(200, json=cart_body([one_line(variant_id=21)]))),
     ])
-    registry, _ = build(recorder, CommerceSession(cart_id=CART_ID))
+    registry, _ = build(recorder, ConversationMemory(cart_id=CART_ID))
 
     result = registry.dispatch("remove_from_cart", {"variant_id": 99})
 
@@ -253,7 +254,7 @@ def test_create_checkout_places_the_order_then_asks_for_the_payment_link():
         ("POST", "/orders", httpx.Response(201, json=order_body())),
         checkout_ok(),
     ])
-    registry, session = build(recorder, CommerceSession(cart_id=CART_ID))
+    registry, session = build(recorder, ConversationMemory(cart_id=CART_ID))
 
     result = registry.dispatch("create_checkout", {})
 
@@ -287,7 +288,7 @@ def test_the_order_is_remembered_even_when_the_payment_link_fails():
         ("POST", f"/orders/{ORDER_ID}/checkout", httpx.Response(503, json={"detail": "STRIPE_SECRET_KEY is not set"})),
         ("GET", f"/orders/{ORDER_ID}", httpx.Response(200, json=order_body())),
     ])
-    registry, session = build(recorder, CommerceSession(cart_id=CART_ID))
+    registry, session = build(recorder, ConversationMemory(cart_id=CART_ID))
 
     failed = registry.dispatch("create_checkout", {})
     status = registry.dispatch("check_order_status", {})
@@ -299,7 +300,7 @@ def test_the_order_is_remembered_even_when_the_payment_link_fails():
 
 def test_check_order_status_reads_the_session_order_not_one_the_model_names():
     recorder = Recorder([("GET", f"/orders/{ORDER_ID}", httpx.Response(200, json=order_body("paid")))])
-    registry, _ = build(recorder, CommerceSession(order_id=ORDER_ID))
+    registry, _ = build(recorder, ConversationMemory(order_id=ORDER_ID))
 
     result = registry.dispatch("check_order_status", {"order_id": "an-id-the-model-made-up"})
 
@@ -331,7 +332,7 @@ def failing(exc_or_response):
             raise exc_or_response
         return exc_or_response
 
-    return build(handler, CommerceSession(cart_id=CART_ID, order_id=ORDER_ID))[0]
+    return build(handler, ConversationMemory(cart_id=CART_ID, order_id=ORDER_ID))[0]
 
 
 def test_a_dead_api_reaches_the_model_as_advice_not_as_a_traceback():

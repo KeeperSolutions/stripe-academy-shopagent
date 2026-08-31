@@ -286,14 +286,14 @@ def test_the_commerce_tools_are_in_every_session():
     assert [name for name in setup.registry.names() if name in COMMERCE_TOOLS] == COMMERCE_TOOLS
 
 
-def test_a_session_holds_one_cart_across_its_commerce_tools():
+def test_a_session_holds_one_memory_across_its_commerce_tools():
     """Two tools, one basket — the state that is deliberately not global."""
     with ExitStack() as stack:
         first = build_tool_setup(stack, catalog_enabled=False)
         second = build_tool_setup(stack, catalog_enabled=False)
 
-    assert first.commerce is not None
-    assert first.commerce is not second.commerce
+    assert first.memory is not None
+    assert first.memory is not second.memory
 
 
 # --- the whole list, offline (D9, step 2) --------------------------------

@@ -14,7 +14,7 @@ this module's.
 Everything filters in SQL. The plan flags this as the trap of the day and it is
 worth being explicit about why: `LIMIT` runs after `WHERE` and before anything
 Python sees, so a price filter applied to the returned list is a filter applied
-to an already-truncated set. Ask for five shoes under $50 and you get whatever
+to an already-truncated set. Ask for five shoes under €50 and you get whatever
 of the first five happened to qualify — usually nothing — while the shop is
 full of matches. Every predicate below therefore reaches the database.
 
@@ -224,7 +224,7 @@ def candidate_products_statement(
 
     Either way the filters are WHERE predicates and `LIMIT` runs after them,
     which is the trap the plan warns about: rank first and filter afterwards,
-    and a search for shoes under $100 quietly returns the five nearest shoes
+    and a search for shoes under €100 quietly returns the five nearest shoes
     minus the ones that were too expensive — often nothing, while the shop is
     full of matches.
     """

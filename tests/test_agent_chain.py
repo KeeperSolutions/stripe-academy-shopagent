@@ -82,6 +82,11 @@ from shopagent.llm.usage import UsageTracker
 # candidate explanation rather than five.
 AMBIGUOUS_TURN_3 = "add it to my cart"
 NAMED_TURN_3 = "add the Trail Runner GTX in size 42 to my cart"
+# The reference step 3 is about. Not a third reading of the same question: the
+# `ambiguous` script asks whether the model calls a write tool at all, and this
+# one asks whether it can count rows in a list it was shown several turns ago
+# without being handed a mechanism for doing so.
+ORDINAL_TURN_3 = "add the second one to my cart"
 
 
 def script(turn_3: str) -> list[tuple[str, str]]:
@@ -97,6 +102,7 @@ def script(turn_3: str) -> list[tuple[str, str]]:
 SCRIPTS = {
     "ambiguous": script(AMBIGUOUS_TURN_3),
     "named": script(NAMED_TURN_3),
+    "ordinal": script(ORDINAL_TURN_3),
 }
 
 
@@ -256,7 +262,7 @@ def test_the_model_holds_the_five_tool_chain(name, commerce_api, engine, capsys)
                 messages.append({"role": "user", "content": prompt})
                 run_tool_loop(client, registry, messages, schemas)
         finally:
-            leftovers = clean_up(commerce_api, setup.commerce, engine)
+            leftovers = clean_up(commerce_api, setup.memory, engine)
             path = write_transcript(name, turns, trace, tracker, leftovers)
             print(f"\n--- {name}: {path}")
             for index, (prompt, _) in enumerate(turns, start=1):

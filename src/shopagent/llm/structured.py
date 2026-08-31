@@ -1,13 +1,13 @@
 """Turning free text into a validated catalogue query (D2, used from D3).
 
-The user says "running shoes under $100 in size 42"; `catalog/search.py` on D3
+The user says "running shoes under €100 in size 42"; `catalog/search.py` on D3
 wants `keywords`, `category`, `max_price_cents` and `size` as typed fields.
 This module is the seam between the two, and it is a real parser rather than a
 demonstration — D3 and D9 call it.
 
 Two rules it exists to enforce:
 
-**Money is an integer number of cents, converted exactly once.** "under $100"
+**Money is an integer number of cents, converted exactly once.** "under €100"
 becomes `10000`, never `100` and never `100.0`. The rule is stated in the
 system prompt below and enforced by the model's own strict field type, so no
 other module has to know that dollars were ever involved. A float here is a

@@ -194,7 +194,7 @@ class Price(Base):
         String(3), default=lambda: get_settings().currency
     )
     # INTEGER, spelled out rather than inferred, because this is the one column
-    # in the schema where the type is the whole point. Minor units: $89.99 is
+    # in the schema where the type is the whole point. Minor units: €89.99 is
     # 8999. See the module docstring.
     amount_cents: Mapped[int] = mapped_column(Integer)
     active: Mapped[bool] = mapped_column(Boolean, default=True)

@@ -34,6 +34,7 @@ import sys
 from contextlib import ExitStack
 from dataclasses import dataclass
 
+from shopagent.agent.memory import ConversationMemory, RememberingRegistry
 from shopagent.agent.prompt import initial_messages
 from shopagent.config import get_settings
 from shopagent.llm.client import LLMClient, Message, ToolCall
@@ -41,7 +42,7 @@ from shopagent.llm.usage import UsageTracker
 from shopagent.mcp_client.client import MCPToolClient
 from shopagent.mcp_client.registration import register_mcp_tools
 from shopagent.tools.basic import REGISTRY
-from shopagent.tools.commerce import CommerceSession, register_commerce_tools
+from shopagent.tools.commerce import register_commerce_tools
 from shopagent.tools.http import CommerceAPI
 from shopagent.tools.registry import ToolRegistry, ToolResult
 
@@ -148,12 +149,12 @@ class ToolSetup:
     registry: ToolRegistry
     catalog_available: bool
     note: str | None = None
-    # The cart and order this conversation is holding (D9, step 1). Exposed
-    # here because it is the one piece of a session's state that lives outside
-    # the message list, and something has to be able to see it: today the
-    # tests, on step 3 `agent/memory.py`, which takes it over. The model is
-    # never shown any of it.
-    commerce: CommerceSession | None = None
+    # Everything this conversation holds outside its message list (D9, step
+    # 3): the cart and order ids the model is never shown, the last search in
+    # the order it came back, and every variant id that has appeared in a
+    # result. Exposed here because the CLI and the tests are the only things
+    # that can see it — nothing is put in front of the model.
+    memory: ConversationMemory | None = None
 
 
 def build_tool_setup(
@@ -175,7 +176,13 @@ def build_tool_setup(
 
     `client_factory` exists so a test can inject a client that fails to start.
     """
-    registry = ToolRegistry()
+    # The registry is the one thing every tool call passes through, which is
+    # what makes it the place a conversation's memory is filled: nothing in the
+    # loop has to remember to record anything, and a tool added later is
+    # remembered because of where it is registered rather than because whoever
+    # added it knew to.
+    memory = ConversationMemory()
+    registry = RememberingRegistry(memory)
     for spec in REGISTRY.specs():
         registry.register(spec)
 
@@ -191,8 +198,7 @@ def build_tool_setup(
     # answered by the tool itself, in words written for the model. The stack
     # owns the client for the same reason it owns the MCP subprocess — whatever
     # ends the session closes the sockets.
-    commerce = CommerceSession()
-    register_commerce_tools(registry, stack.enter_context(CommerceAPI()), commerce)
+    register_commerce_tools(registry, stack.enter_context(CommerceAPI()), memory)
 
     if catalog_enabled is None:
         catalog_enabled = get_settings().mcp_catalog_enabled
@@ -201,7 +207,7 @@ def build_tool_setup(
         return ToolSetup(
             registry=registry,
             catalog_available=False,
-            commerce=commerce,
+            memory=memory,
             note="catalog disabled (MCP_CATALOG_ENABLED=false)",
         )
 
@@ -216,11 +222,11 @@ def build_tool_setup(
         return ToolSetup(
             registry=registry,
             catalog_available=False,
-            commerce=commerce,
+            memory=memory,
             note=f"catalog unavailable ({type(exc).__name__}: {exc})",
         )
 
-    return ToolSetup(registry=registry, catalog_available=True, commerce=commerce)
+    return ToolSetup(registry=registry, catalog_available=True, memory=memory)
 
 
 def main() -> None:

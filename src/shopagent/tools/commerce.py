@@ -25,8 +25,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -42,31 +41,22 @@ from shopagent.tools.http import (
 from shopagent.tools.registry import ToolRegistry, ToolResult, ToolSpec
 
 
-@dataclass
-class CommerceSession:
-    """The state one conversation carries that the model is never shown.
+class HoldsCartState(Protocol):
+    """The two attributes these tools need from a conversation's memory.
 
-    **This is a seam, not the answer.** Step 3 of D9 replaces it with
-    `agent/memory.py`, which holds the same two ids alongside the rest of what
-    a conversation remembers — the last search results, so "add the second
-    one" resolves, and whatever long-term memory turns out to be. It is here
-    now for the same reason `process_event` was split out on D8 before
-    anything else needed it: the tools have to hold a cart id *somewhere* from
-    the first line of code, and a module-level global would have to be unpicked
-    later, while a parameter can simply be passed a different object.
+    A protocol rather than an import of `agent.memory.ConversationMemory`,
+    which is the same choice `api/lifecycle.py` makes when it takes anything
+    with a `status` attribute rather than an ORM row: `tools/` is reached by
+    the agent, not the other way round, and a tool module that imported the
+    agent's memory would invert that for the sake of two fields.
 
-    What must survive the replacement is the property, not the class: the two
-    ids are held by the tool layer, and neither reaches a tool schema.
+    Step 1 filled this with a small `CommerceSession` dataclass, declared
+    temporary in its own docstring; step 3's `ConversationMemory` is what took
+    it over. Everything below still only knows that something holds two ids.
     """
 
-    cart_id: str | None = None
-    # Set as soon as `POST /orders` answers, before the Checkout Session is
-    # created. That ordering is what makes `check_order_status` honest after a
-    # `create_checkout` that failed partway: the order exists, so the tool that
-    # reports on it has to be able to find it.
-    order_id: str | None = None
-    # Kept for the CLI banner and for tests; nothing the model reads.
-    notes: list[str] = field(default_factory=list)
+    cart_id: str | None
+    order_id: str | None
 
 
 # --- argument models -----------------------------------------------------
@@ -288,8 +278,8 @@ def _order_view(body: dict[str, Any]) -> dict[str, Any]:
 # --- the tools -----------------------------------------------------------
 
 
-def build_commerce_tools(api: CommerceAPI, session: CommerceSession) -> list[ToolSpec]:
-    """The five tools, closed over one conversation's API client and state.
+def build_commerce_tools(api: CommerceAPI, state: HoldsCartState) -> list[ToolSpec]:
+    """The five tools, closed over one conversation's API client and memory.
 
     A factory rather than a module-level registry with decorators, which is
     what `tools/basic.py` uses: those two tools are stateless, these five share
@@ -307,10 +297,10 @@ def build_commerce_tools(api: CommerceAPI, session: CommerceSession) -> list[Too
         answers, so a failure in the call that follows leaves one empty cart
         rather than a new one on every attempt.
         """
-        if session.cart_id is None:
+        if state.cart_id is None:
             body = api.request("POST", "/cart")
-            session.cart_id = str(body["cart_id"])
-        return session.cart_id
+            state.cart_id = str(body["cart_id"])
+        return state.cart_id
 
     @_reports_failures(changes_state=True)
     def add_to_cart(variant_id: int, quantity: int = 1) -> Any:
@@ -324,7 +314,7 @@ def build_commerce_tools(api: CommerceAPI, session: CommerceSession) -> list[Too
 
     @_reports_failures(changes_state=False)
     def view_cart() -> Any:
-        if session.cart_id is None:
+        if state.cart_id is None:
             # Not an error: a shopper who has added nothing has an empty cart,
             # and answering with a failure would have the model apologise for
             # a system that is working.
@@ -335,17 +325,17 @@ def build_commerce_tools(api: CommerceAPI, session: CommerceSession) -> list[Too
                 "total_cents": 0,
                 "note": "The cart is empty — nothing has been added in this conversation yet.",
             }
-        return _cart_view(api.request("GET", f"/cart/{session.cart_id}"))
+        return _cart_view(api.request("GET", f"/cart/{state.cart_id}"))
 
     @_reports_failures(changes_state=True)
     def remove_from_cart(variant_id: int) -> Any:
-        if session.cart_id is None:
+        if state.cart_id is None:
             return _refuse(
                 "the cart is empty, so there is nothing to remove. Tell the "
                 "customer their cart is already empty."
             )
 
-        cart = api.request("GET", f"/cart/{session.cart_id}")
+        cart = api.request("GET", f"/cart/{state.cart_id}")
         # The lookup that keeps the item id on this side. `view_cart` shows the
         # model a variant, so a variant is what it can name; translating that
         # into the line's own id is this layer's job, and doing it against a
@@ -360,30 +350,30 @@ def build_commerce_tools(api: CommerceAPI, session: CommerceSession) -> list[Too
                 f"holds: {held or 'nothing'}. Call view_cart and remove one of those."
             )
 
-        api.request("DELETE", f"/cart/{session.cart_id}/items/{line['item_id']}")
+        api.request("DELETE", f"/cart/{state.cart_id}/items/{line['item_id']}")
         # Read back rather than subtracting the line here: the total is the
         # server's to compute, and D6 recomputes it from the database on every
         # read precisely so nobody else has to.
-        return _cart_view(api.request("GET", f"/cart/{session.cart_id}"))
+        return _cart_view(api.request("GET", f"/cart/{state.cart_id}"))
 
     @_reports_failures(changes_state=True)
     def create_checkout() -> Any:
-        if session.cart_id is None:
+        if state.cart_id is None:
             return _refuse(
                 "there is nothing to check out — the cart is empty. Add at "
                 "least one item with add_to_cart first."
             )
 
-        order = api.request("POST", "/orders", json={"cart_id": session.cart_id})
+        order = api.request("POST", "/orders", json={"cart_id": state.cart_id})
         # Both writes happen before the Stripe call, and in this order. The
         # order id is stored first so `check_order_status` can find the order
         # even if the checkout below fails; the cart is released second because
         # `place_order` has already flipped it to `ordered`, and a cart id kept
         # here would send the next `add_to_cart` into a guaranteed 409.
-        session.order_id = str(order["order_id"])
-        session.cart_id = None
+        state.order_id = str(order["order_id"])
+        state.cart_id = None
 
-        checkout = api.request("POST", f"/orders/{session.order_id}/checkout")
+        checkout = api.request("POST", f"/orders/{state.order_id}/checkout")
         return {
             "order_id": order["order_id"],
             "status": order["status"],
@@ -399,12 +389,12 @@ def build_commerce_tools(api: CommerceAPI, session: CommerceSession) -> list[Too
 
     @_reports_failures(changes_state=False)
     def check_order_status() -> Any:
-        if session.order_id is None:
+        if state.order_id is None:
             return _refuse(
                 "no order has been placed in this conversation, so there is no "
                 "status to report. Use create_checkout to place one."
             )
-        return _order_view(api.request("GET", f"/orders/{session.order_id}"))
+        return _order_view(api.request("GET", f"/orders/{state.order_id}"))
 
     return [
         ToolSpec(
@@ -476,12 +466,12 @@ def build_commerce_tools(api: CommerceAPI, session: CommerceSession) -> list[Too
 
 
 def register_commerce_tools(
-    registry: ToolRegistry, api: CommerceAPI, session: CommerceSession
-) -> CommerceSession:
+    registry: ToolRegistry, api: CommerceAPI, state: HoldsCartState
+) -> HoldsCartState:
     """Put the five tools into a registry, the way D5 puts the MCP ones in.
 
     Returns the session so a caller that let this build one can still reach it.
     """
-    for spec in build_commerce_tools(api, session):
+    for spec in build_commerce_tools(api, state):
         registry.register(spec)
-    return session
+    return state

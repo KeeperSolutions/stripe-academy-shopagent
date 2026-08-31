@@ -44,7 +44,8 @@ tracked.
 | `api/routers/webhooks.py` | D8 | `POST /webhooks/stripe` — verify, claim, dispatch |
 | `api/services/events.py` | D8 | idempotency and what each event type means |
 | `agent/prompt.py` | D9 | the system prompt; the only file that says it |
-| `agent/` | D9 | memory, guardrails |
+| `agent/memory.py` | D9 | one conversation's state outside the message list |
+| `agent/` | D9 | guardrails |
 | `obs/` | D10 | Langfuse tracing |
 
 Search logic belongs in `catalog/`, never inside the MCP server. The server is
