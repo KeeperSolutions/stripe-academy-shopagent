@@ -1731,6 +1731,40 @@ it repeatedly. The entry above names the same gap for the API as a whole; this
 route makes it more pointed by being the one address that must stay open to the
 internet.
 
+**The `db` suite is not hermetic, and a leftover manual run still makes ~29 of
+it wrong.** *(D6, narrowed on D10.)* The original entry was written in the Day 6
+findings and ends "Deferred, and recorded below" — and it was never recorded
+below. It is filed here now, four days late, which is the failure the grouping
+note at the top of this section describes happening to the note itself.
+
+The text stands as written: `tests/test_api_orders.py` and
+`tests/test_commerce_models.py` assert `count(orders) == 0`, `tests/test_seed.py`
+then errors on the `ON DELETE RESTRICT` that protects order history, and
+`tests/test_webhooks.py` asserts the same about `processed_events`. None of that
+is a bug — the tests are right to fail when the rows exist — but the failure
+appears about thirty places away from its cause, and it has now happened five
+times, each time costing somebody the minutes it takes to establish that nothing
+they changed did it.
+
+D10 did not fix it. The suite still shares one database, those tests still
+assume two tables are empty, and the honest fixes the entry named — a suite that
+builds its own database, or one that marks the tests carrying the assumption —
+are both still undone. What changed is the *report*: `pytest_collection_modifyitems`
+counts the two tables before the first test and, when either is dirty, stops the
+run with one sentence naming the counts, saying it is not a regression, and
+giving the cleanup command. Thirty seconds of confusion became one line.
+
+Three things about that are worth stating, because each was a live choice.
+It stops rather than skipping: a skip reports success in green, and D9 already
+measured what that costs when `452 passed, 380 skipped` was technically correct
+and unreadable. It stops rather than failing one test and skipping the rest,
+which reads better and needs a marker on twenty-nine tests across four files —
+the refactor this entry is still open about. And it fires whenever *any* `db`
+test is collected rather than only for the tests that carry the assumption,
+because narrowing it means listing those four modules in `conftest.py`, and that
+list goes stale the first time somebody writes a fifth. `pytest tests/test_money.py`
+never connects, which is what keeps the offline promise intact.
+
 **Three routes are unauthenticated, and each for a different reason.** *(D7,
 extended on D8.)* `GET /checkout/success` and `GET /checkout/cancel` are public
 because Stripe redirects a *browser* to them and a browser carries no key — safe

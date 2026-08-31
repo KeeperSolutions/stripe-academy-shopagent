@@ -1126,10 +1126,29 @@ back. The override is a plain function, not a generator — FastAPI closes
 generator dependencies, and closing that session would leave the test holding a
 dead one after its first request.
 
-Those tests also assume `orders` is empty. A real order left behind by a manual
-run fails them, and `--reset`'s RESTRICT then blocks `tests/test_seed.py` as
-well — correct behaviour from the guard, and a reminder to clean up after
-driving the API by hand.
+Those tests also assume `orders` is empty, and `tests/test_webhooks.py` assumes
+the same of `processed_events`. A real order left behind by a manual run fails
+them, and `--reset`'s RESTRICT then blocks `tests/test_seed.py` as well —
+correct behaviour from the guard, and a reminder to clean up after driving the
+API by hand.
+
+**That assumption is checked before the first test rather than discovered
+twenty-nine failures later.** It went wrong five times, and each time the
+failures appeared a long way from their cause — the shape of defect D8 recorded
+for `InFailedSqlTransaction`. `pytest_collection_modifyitems` in
+`tests/conftest.py` counts `orders` and `processed_events` when the run collects
+any `db` test, and stops it with one sentence naming the counts and the cleanup
+command. It **stops** rather than skipping: a skip reports success in green, and
+a green summary over a database that will make the suite lie is the exact trap
+D9 recorded when `452 passed, 380 skipped` was correct in every detail and
+unreadable. A run with no `db` test never opens a connection, so
+`pytest tests/test_money.py` stays free and offline.
+
+Cleaning up is `python scripts/manual_test_state.py restore`, which undoes rows
+created since the last snapshot. Anything older goes by hand, and an order
+holds stock: decrement `inventory.reserved` by its lines rather than zeroing the
+column — `catalog/seed.py` ships `FF-TRLGTX-42-BLK` with `reserved=2`
+deliberately, which is the mistake `manual_test_state.py` exists to document.
 
 **Tests reach no network and call no SDK method.** Importing `openai` is fine —
 `tests/test_client.py` imports `LLMClient`, which pulls it in — but the client

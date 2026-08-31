@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
 # Imported for the side effect of registering the commerce tables on the
@@ -26,6 +26,85 @@ from shopagent.agent import profile as agent_profile  # noqa: F401
 from shopagent.api import models as commerce_models  # noqa: F401
 from shopagent.catalog.models import Base
 from shopagent.db import ensure_vector_extension, get_engine
+
+
+# --- the state a manual run leaves behind (D10, step 1) ------------------
+#
+# The tables a manual run writes to and that some tests assume are empty. Not
+# `carts`: five of them can sit in this database with nothing failing, and a
+# guard that stops the suite over rows nothing reads would be a guard people
+# learn to work around.
+DIRTY_TABLES = ("orders", "processed_events")
+
+CLEAN_UP_COMMAND = "python scripts/manual_test_state.py restore"
+
+
+def pytest_collection_modifyitems(config, items):
+    """Stop before the first test if a manual run is still in the database.
+
+    Five times now, a leftover order has turned ~29 tests red for a reason with
+    nothing to do with what changed: `test_api_orders` and
+    `test_commerce_models` assert `orders` is empty, `test_seed` then dies on
+    the `ON DELETE RESTRICT` that stops a reset taking order history with it,
+    and `test_webhooks` asserts the same thing about `processed_events`. The
+    defect appears a long way from its cause, which is the shape of failure D8
+    already recorded for `InFailedSqlTransaction`.
+
+    **Not a skip.** A skip reports "nothing to see here" in green, and D9
+    measured what that costs: a run that said `452 passed, 380 skipped` in
+    green while the Docker daemon was down, correct in every detail and
+    unreadable. A dirty database is not a reason to report success.
+
+    **Not twenty-nine failures.** That is the thing being removed.
+
+    **Not one failure plus twenty-eight skips**, which would read best of all
+    and needs a marker on twenty-nine tests across four files — a refactor, and
+    a second record in `conftest.py` of which tests assume what. A partly green
+    run over a database known to be lying is also a worse report than one that
+    did not start.
+
+    So the run stops with one sentence naming the counts and the command. It is
+    deliberately broader than the tests that actually assert emptiness: it fires
+    whenever *any* `db` test is collected, because narrowing it means listing
+    those four modules here, and that list goes stale the first time somebody
+    writes a fifth. The cost of being broad is one command; the cost of being
+    stale is this paragraph again.
+    """
+    if not any(item.get_closest_marker("db") for item in items):
+        # Nothing collected touches Postgres — do not even connect. This is
+        # what keeps `pytest tests/test_money.py` free and offline.
+        return
+
+    engine = get_engine()
+    try:
+        with engine.connect() as connection:
+            leftovers = {
+                table: connection.execute(
+                    text(f"SELECT count(*) FROM {table}")  # noqa: S608 - a literal from DIRTY_TABLES
+                ).scalar_one()
+                for table in DIRTY_TABLES
+            }
+    except (OperationalError, ProgrammingError):
+        # Unreachable, or the schema is not built yet. Both are already handled
+        # — the `engine` fixture skips with its own explanation — and neither is
+        # this guard's business.
+        return
+
+    dirty = {table: count for table, count in leftovers.items() if count}
+    if not dirty:
+        return
+
+    counts = ", ".join(f"{count} {table}" for table, count in dirty.items())
+    pytest.exit(
+        f"\nThe database still holds a manual run: {counts}.\n"
+        f"This is not a regression — around 29 db tests assert these tables are "
+        f"empty and would fail for that reason alone.\n"
+        f"Clean up with:  {CLEAN_UP_COMMAND}\n"
+        f"(That deletes rows created since the last snapshot. Anything older "
+        f"has to go by hand, and an order holds stock: decrement "
+        f"inventory.reserved by its lines rather than zeroing the column.)",
+        returncode=1,
+    )
 
 
 @pytest.fixture(autouse=True)
