@@ -126,6 +126,13 @@ class ConversationMemory:
     # Set as soon as an order exists, before its payment link is created, so a
     # checkout that fails partway still leaves the order findable.
     order_id: str | None = None
+    # The Stripe payment page, exactly as the shop issued it. Written by
+    # `tools/commerce.py`, never put in a tool result, and read out through
+    # `take_checkout_url` below. A third piece of state the model does not see,
+    # for the reason the first two are hidden: it is a long opaque string, and
+    # a model asked to carry one across a turn eventually changes a character
+    # of it. Measured on PR #9.
+    checkout_url: str | None = None
 
     _last_search: LastSearch | None = None
     _seen_variant_ids: set[int] = field(default_factory=set)
@@ -136,6 +143,22 @@ class ConversationMemory:
     @property
     def last_search(self) -> LastSearch | None:
         return self._last_search
+
+    def take_checkout_url(self) -> str | None:
+        """The payment link produced since this was last asked, and clears it.
+
+        It clears deliberately, so the caller is answering "did a link arrive
+        during that turn?" rather than "is there a link anywhere in this
+        conversation?". The second question would reprint the same link under
+        every later answer, and a payment page shown again under "your order is
+        paid" is a page somebody clicks.
+
+        A resume produces the same URL as the original checkout, and that must
+        still print — which is why this is a flag being taken rather than a
+        value being compared against the last one seen.
+        """
+        url, self.checkout_url = self.checkout_url, None
+        return url
 
     @property
     def seen_amount_cents(self) -> frozenset[int]:

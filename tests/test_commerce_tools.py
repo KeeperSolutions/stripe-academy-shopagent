@@ -176,6 +176,67 @@ def test_no_result_the_model_reads_carries_the_cart_id():
         assert "cart_id" not in content, f"{name} leaked the cart_id field"
 
 
+def test_no_result_the_model_reads_carries_the_payment_link():
+    """The same rule as the cart id, and it was written for a measured failure.
+
+    A Checkout Session URL is 475 opaque characters. Asked twice for the same
+    session in one conversation, the model reproduced it correctly once and
+    changed a single character the second time — `TlZQ` to `TlVQ`, at position
+    329 — and Stripe answers 401 for the result. The customer gets a dead
+    payment page. Found in the end-to-end run for PR #9.
+
+    So the link is not in the result at all: it goes to the conversation's
+    state and whatever is presenting the conversation prints the bytes the shop
+    issued. A model cannot mistype a string it was never given.
+    """
+    recorder = Recorder([
+        ("POST", "/orders", httpx.Response(201, json=order_body())),
+        checkout_ok(),
+    ])
+    registry, session = build(recorder, ConversationMemory(cart_id=CART_ID))
+
+    content = registry.dispatch("create_checkout", {}).content
+
+    assert "checkout.stripe.com" not in content, "the payment link leaked to the model"
+    assert "cs_test_123" not in content, "the session id leaked to the model"
+    assert "checkout_url" not in content, "the field name leaked to the model"
+    assert session.checkout_url, "and it still has to reach the layer that prints it"
+
+
+def test_the_note_tells_the_model_not_to_write_a_link_it_does_not_have():
+    """Without this the model invents one, which is the failure one step worse.
+
+    A tool result that silently drops a field the model was expecting leaves it
+    filling the gap from memory. The note has to say the link exists, that the
+    customer already has it, and that writing one is wrong.
+    """
+    recorder = Recorder([
+        ("POST", "/orders", httpx.Response(201, json=order_body())),
+        checkout_ok(),
+    ])
+    registry, _ = build(recorder, ConversationMemory(cart_id=CART_ID))
+
+    note = json.loads(registry.dispatch("create_checkout", {}).content)["note"].lower()
+
+    assert "do not write a link" in note
+    assert "customer" in note
+    assert "pending" in note
+
+
+def test_the_link_is_taken_once_so_it_is_not_reprinted_under_every_later_answer():
+    """`take_checkout_url` answers "did a link arrive?", not "is there one?".
+
+    The second question would print the payment page under every later answer
+    in the conversation, and a payment page shown again beneath "your order is
+    paid" is one somebody clicks.
+    """
+    url = "https://checkout.stripe.com/c/pay/cs_test_123"
+    memory = ConversationMemory(checkout_url=url)
+
+    assert memory.take_checkout_url() == url
+    assert memory.take_checkout_url() is None
+
+
 def test_the_money_fields_keep_the_names_the_api_gave_them():
     """No third vocabulary for one amount (CLAUDE.md)."""
     recorder = Recorder([
@@ -260,9 +321,10 @@ def test_create_checkout_places_the_order_then_asks_for_the_payment_link():
 
     assert result.ok
     assert recorder.calls == ["POST /orders", f"POST /orders/{ORDER_ID}/checkout"]
-    assert "https://checkout.stripe.com/c/pay/cs_test_123" in result.content
     assert session.order_id == ORDER_ID
     assert session.cart_id is None, "the ordered cart must not take another line"
+    # The link reaches the conversation's state, which is what the CLI prints.
+    assert session.checkout_url == "https://checkout.stripe.com/c/pay/cs_test_123"
 
 
 def test_create_checkout_with_nothing_in_the_cart_never_reaches_the_api():
@@ -338,9 +400,11 @@ def test_a_checkout_that_failed_at_stripe_can_be_retried_for_the_same_order():
 
     assert not failed.ok
     assert resumed.ok, "the second attempt must not be refused for an empty cart"
-    assert "https://checkout.stripe.com/c/pay/cs_test_123" in resumed.content
     assert "empty" not in resumed.content
     assert session.order_id == ORDER_ID
+    # The same link as the first checkout, and the customer gets it again: a
+    # resume is what a shopper who lost the page asks for.
+    assert session.checkout_url == "https://checkout.stripe.com/c/pay/cs_test_123"
     # No second order: the existing one is resumed, never replaced. A retry
     # that placed another would reserve the stock a second time.
     assert calls.count("POST /orders") == 1

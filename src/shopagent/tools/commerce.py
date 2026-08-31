@@ -43,7 +43,7 @@ from shopagent.tools.registry import ToolRegistry, ToolResult, ToolSpec
 
 
 class HoldsCartState(Protocol):
-    """The two attributes these tools need from a conversation's memory.
+    """The three attributes these tools need from a conversation's memory.
 
     A protocol rather than an import of `agent.memory.ConversationMemory`,
     which is the same choice `api/lifecycle.py` makes when it takes anything
@@ -53,11 +53,15 @@ class HoldsCartState(Protocol):
 
     Step 1 filled this with a small `CommerceSession` dataclass, declared
     temporary in its own docstring; step 3's `ConversationMemory` is what took
-    it over. Everything below still only knows that something holds two ids.
+    it over. Everything below still only knows that something holds two ids
+    and a payment link.
     """
 
     cart_id: str | None
     order_id: str | None
+    # Written by `create_checkout`, read by whatever is presenting this
+    # conversation, and never put in a tool result. See the note there.
+    checkout_url: str | None
 
 
 # --- argument models -----------------------------------------------------
@@ -393,16 +397,33 @@ def build_commerce_tools(api: CommerceAPI, state: HoldsCartState) -> list[ToolSp
         is what lets the refusal below be a resumption instead of a dead end.
         """
         checkout = api.request("POST", f"/orders/{order['order_id']}/checkout")
+        # The link goes to the state, not into the result. The model never sees
+        # it, for the reason it never sees a `cart_id`: an opaque string it has
+        # to carry is one it will eventually get wrong. Measured rather than
+        # feared — asked twice for the same session in one conversation, the
+        # model reproduced a 475-character Stripe URL correctly once and
+        # changed a single character the second time (`TlZQ` to `TlVQ`, at
+        # position 329). Stripe answers 401 for that URL, so the customer gets
+        # a dead payment page and no way to tell why. Found in the end-to-end
+        # run for PR #9.
+        #
+        # Whatever is presenting this conversation reads `state.checkout_url`
+        # and shows the bytes the shop issued. That is not a rule the model can
+        # break, which an instruction to copy carefully would have been.
+        state.checkout_url = checkout["checkout_url"]
         return {
             "order_id": order["order_id"],
             "status": order["status"],
             "currency": order["currency"],
             "total_cents": order["total_cents"],
-            "checkout_url": checkout["checkout_url"],
+            "payment_link_shown": True,
             "note": (
-                "Give the customer this checkout_url and ask them to pay there. "
-                "The order is not paid until they do — say it is pending, never "
-                "that it is complete."
+                "The payment link has already been put in front of the customer "
+                "by the shop itself. Do NOT write a link, a URL or any part of "
+                "one in your answer — you do not have it and anything you write "
+                "would be wrong. Tell them the order is placed and to use the "
+                "payment link shown to them. The order is not paid until they "
+                "do — say it is pending, never that it is complete."
             ),
         }
 

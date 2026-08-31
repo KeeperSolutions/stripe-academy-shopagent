@@ -341,10 +341,34 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
             print(f"\n[error] {type(exc).__name__}: {exc}")
             del messages[history_length:]
 
+        # After the answer, and outside the try: a tool that ran before a
+        # failure still placed the order, and the customer still needs its
+        # payment page.
+        _print_payment_link(setup.memory)
         _print_cost(tracker, calls_before)
 
     print()
     print(tracker.summary())
+
+
+def _print_payment_link(memory: ConversationMemory | None) -> None:
+    """Show the Stripe payment page, in the bytes the shop issued.
+
+    Printed here rather than relayed by the model, and the difference is not
+    stylistic. A Checkout Session URL is 475 opaque characters; asked twice for
+    the same session, the model reproduced it once and changed one character
+    the second time, which Stripe answers with a 401. The customer sees a
+    payment page that does not work and has nothing to compare it against.
+
+    So the link never enters the conversation: `tools/commerce.py` puts it on
+    the memory and this prints it. The same answer D9 gave for `cart_id`, for
+    the same reason, and it is code rather than an instruction to copy
+    carefully — which the model could not have followed reliably anyway.
+    """
+    url = memory.take_checkout_url() if memory is not None else None
+    if url:
+        print("\n  Pay here:")
+        print(f"  {url}")
 
 
 def _print_cost(tracker: UsageTracker, calls_before: int) -> None:

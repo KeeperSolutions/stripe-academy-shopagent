@@ -797,6 +797,28 @@ dangerous. The protections that bind *everyone* are elsewhere and unchanged —
 `place_order` locks inventory under `FOR UPDATE`, the lifecycle table refuses
 illegal transitions, and only a signed webhook may mark an order paid.
 
+**The model never sees the payment link either, and that was measured.** The
+end-to-end run for PR #9 asked twice in one conversation for the same Checkout
+Session. The model reproduced its 475-character URL correctly the first time
+and changed one character the second — `TlZQ` to `TlVQ`, at position 329 —
+which Stripe answers with a 401. The customer gets a payment page that does not
+work and nothing to compare it against, and no amount of telling the model to
+copy carefully fixes a transcription it cannot verify.
+
+So `create_checkout` puts the URL on the conversation's state and returns
+`payment_link_shown: true` instead, and the CLI prints the bytes the shop
+issued. It is the `cart_id` rule reaching its third piece of state, for exactly
+the reason the first two are hidden: an opaque string the model has to carry is
+one it will eventually get wrong. The tool's note says the link exists, that
+the customer already has it, and that writing one is wrong — because a field
+that silently disappears from a result is a gap the model fills from memory,
+which is the same failure one step worse.
+
+`take_checkout_url()` clears as it reads, so the caller is answering "did a
+link arrive this turn?" rather than "is there one anywhere?". The second
+question reprints the payment page under every later answer, and a payment page
+sitting beneath "your order is paid" is one somebody clicks.
+
 **The model never sees a `cart_id`.** It appears in no tool schema and in no
 tool result; the tool layer holds it and the tools take what a shopper would
 actually say. An identifier the model has to carry across turns is one it will

@@ -19,7 +19,8 @@ import pytest
 
 from shopagent.llm.client import LLMClient
 from shopagent.agent.prompt import CATALOG_PROMPT, NO_CATALOG_PROMPT, initial_messages
-from shopagent.llm.loop import build_tool_setup, run_tool_loop
+from shopagent.agent.memory import ConversationMemory
+from shopagent.llm.loop import _print_payment_link, build_tool_setup, run_tool_loop
 from shopagent.mcp_client.client import MCPToolClient
 
 LOCAL_TOOLS = ["get_time", "calculator"]
@@ -357,3 +358,56 @@ def test_the_model_is_offered_exactly_these_ten_tools():
     ]
     assert len(setup.registry.names()) == 10
     assert "ping" not in setup.registry.names()
+
+
+# --- the payment link the CLI prints (PR #9) ------------------------------
+#
+# A Checkout Session URL is 475 opaque characters, and the end-to-end run for
+# PR #9 measured what happens when the model relays one: asked twice for the
+# same session, it reproduced the URL correctly once and changed a single
+# character the second time (`TlZQ` to `TlVQ`, position 329). Stripe answers
+# 401 for that, so the customer gets a payment page that does not work.
+#
+# The link therefore never enters the conversation. `tools/commerce.py` puts it
+# on the memory and the CLI prints it. These tests are about that last step.
+
+
+def test_the_cli_prints_the_link_exactly_as_the_shop_issued_it(capsys):
+    url = (
+        "https://checkout.stripe.com/c/pay/cs_test_a1lat7VO5sgjzwy5bFZM4N4mqoDv7c6"
+        "#fidnandhYHdWcXxpYCc%2FJ2FgY2RwaXEnKSdicGRmZGhqaWBTZHdsZGtxJz8nZmprcXdqaSc"
+    )
+    memory = ConversationMemory(checkout_url=url)
+
+    _print_payment_link(memory)
+
+    printed = capsys.readouterr().out
+    assert url in printed, "the link must appear byte-for-byte"
+    assert "Pay here" in printed
+
+
+def test_a_turn_that_produced_no_link_prints_nothing(capsys):
+    """Otherwise every answer in the conversation carries a payment page."""
+    _print_payment_link(ConversationMemory())
+
+    assert capsys.readouterr().out == ""
+
+
+def test_the_link_is_printed_once_and_not_under_every_later_answer(capsys):
+    """A payment page shown again beneath "your order is paid" is one somebody clicks."""
+    memory = ConversationMemory(checkout_url="https://checkout.stripe.com/c/pay/cs_test_1")
+
+    _print_payment_link(memory)
+    first = capsys.readouterr().out
+    _print_payment_link(memory)
+    second = capsys.readouterr().out
+
+    assert "cs_test_1" in first
+    assert second == ""
+
+
+def test_a_session_with_no_memory_at_all_does_not_crash(capsys):
+    """`ToolSetup.memory` is optional, and a missing one is not a reason to fail a turn."""
+    _print_payment_link(None)
+
+    assert capsys.readouterr().out == ""
