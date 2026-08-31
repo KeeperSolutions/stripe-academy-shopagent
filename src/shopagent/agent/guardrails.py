@@ -57,6 +57,7 @@ import json
 import re
 from typing import Any
 
+from shopagent.agent.confirmation import PendingConfirmation
 from shopagent.agent.memory import ConversationMemory, RememberingRegistry
 from shopagent.config import get_settings
 from shopagent.money import WORDS, ZERO_DECIMAL_CURRENCIES, SYMBOLS, format_amount
@@ -108,6 +109,15 @@ AWAITING_ANSWER = (
     "create_checkout again and do not ask them to confirm yourself — the shop "
     "is asking them directly. Say briefly that you are waiting for their "
     "confirmation and stop there. Their answer will reach you next."
+)
+
+BASKET_CHANGED = (
+    "The basket is not the one the customer approved — it changed after they "
+    "said yes, so their approval does not cover it and nothing has been "
+    "ordered or charged. The shop is now showing them the new total and "
+    "waiting for a fresh answer. Do not call create_checkout again and do not "
+    "ask them to confirm yourself. Say briefly that the order changed and you "
+    "are waiting for their confirmation, and stop there."
 )
 
 
@@ -443,8 +453,7 @@ class GuardedRegistry(RememberingRegistry):
         answered = self.memory.take_confirmation(name)
         if answered is not None:
             if answered.answer:
-                # The one path on which a checkout runs.
-                return None
+                return self._spend(name, answered)
             return ToolResult(
                 ok=False,
                 content=(
@@ -477,6 +486,64 @@ class GuardedRegistry(RememberingRegistry):
                 error="no confirmation is possible in this session",
             )
 
+        summary = self._describe()
+        if isinstance(summary, ToolResult) or summary is None:
+            return summary
+
+        self.memory.park_confirmation(name, summary)
+        return ToolResult(
+            ok=False, content=AWAITING_ANSWER, error="waiting for the customer to confirm"
+        )
+
+    def _spend(self, name: str, approved: PendingConfirmation) -> ToolResult | None:
+        """Let the checkout run, but only against what the person actually saw.
+
+        A person approves a basket, not a tool name. The turn that carries
+        their answer back is a whole `run_tool_loop` with every tool available,
+        so the model can call `add_to_cart` between the yes and the checkout —
+        and an approval bound to the name alone would spend a yes given for
+        €189.98 on a basket that is now €569.94. That is the same laundering
+        `_summarise` exists to prevent, one step later in the protocol: a
+        record saying somebody agreed to a figure they were never shown.
+
+        The comparison is against the summary itself rather than a separate
+        fingerprint, because the summary already *is* the thing they approved —
+        every line, every quantity, every price and the total, rendered through
+        `money.format_amount`. A second representation would be a second record
+        of one fact, and the first symptom would be the two disagreeing about
+        what "the same basket" means.
+
+        A change is not an error and is not a refusal: it is a new question.
+        The new summary is parked, the customer is asked about what the basket
+        is *now*, and — because `_settle_confirmation` drives exactly one
+        follow-up turn — that question lapses at their next message rather than
+        driving a loop the model controls. Raised by review on PR #10.
+        """
+        current = self._describe()
+        if isinstance(current, ToolResult) or current is None:
+            # Unreadable, or nothing left to buy. Both are already answered
+            # above: the first is a sentence about the cart, and the second
+            # lets the tool say "the cart is empty" in its own words.
+            return current
+        if current == approved.summary:
+            # The one path on which a checkout runs.
+            return None
+
+        self.memory.park_confirmation(name, current)
+        return ToolResult(
+            ok=False, content=BASKET_CHANGED, error="the basket changed after it was approved"
+        )
+
+    def _describe(self) -> ToolResult | str | None:
+        """What a person would be shown right now, read from the shop.
+
+        Three answers, and each is a different thing for the caller to do: a
+        string is the summary, `None` means there is nothing to confirm and the
+        tool should answer in its own words, and a `ToolResult` is the cart
+        being unreadable. One function because parking a question and spending
+        its answer have to describe the basket the same way — two renderers
+        would be two opinions about whether it changed.
+        """
         cart = super().dispatch(CART_TOOL, {})
         if not cart.ok:
             return ToolResult(
@@ -490,24 +557,19 @@ class GuardedRegistry(RememberingRegistry):
             )
 
         if _has_lines(cart.content):
-            summary = f"{PLACING}\n{_summarise(cart.content)}"
-        else:
-            # An empty cart here is not a mistake: `create_checkout` clears the
-            # cart when it places the order, so this is what a resume looks
-            # like. Summarise the order instead — the alternative is asking a
-            # person to approve a total of zero for a purchase that is real.
-            order = super().dispatch(ORDER_TOOL, {})
-            if not order.ok or not _has_lines(order.content):
-                # Nothing to confirm at all. Let the tool answer: "the cart is
-                # empty, add something" is its sentence and a better one than
-                # any question this gate could ask about nothing.
-                return None
-            summary = f"{RESUMING}\n{_summarise(order.content)}"
+            return f"{PLACING}\n{_summarise(cart.content)}"
 
-        self.memory.park_confirmation(name, summary)
-        return ToolResult(
-            ok=False, content=AWAITING_ANSWER, error="waiting for the customer to confirm"
-        )
+        # An empty cart here is not a mistake: `create_checkout` clears the
+        # cart when it places the order, so this is what a resume looks like.
+        # Summarise the order instead — the alternative is asking a person to
+        # approve a total of zero for a purchase that is real.
+        order = super().dispatch(ORDER_TOOL, {})
+        if not order.ok or not _has_lines(order.content):
+            # Nothing to confirm at all. Let the tool answer: "the cart is
+            # empty, add something" is its sentence and a better one than any
+            # question this gate could ask about nothing.
+            return None
+        return f"{RESUMING}\n{_summarise(order.content)}"
 
 
 def _as_dict(raw_args: Any) -> dict[str, Any] | None:

@@ -63,10 +63,20 @@ class Settings(BaseSettings):
     # for ten minutes and was killed, and `lsof` showed no open socket to
     # OpenAI and four in CLOSE_WAIT.
     #
-    # **Worst case is (connect + read) x (1 + retries) = (10 + 90) x 3 = 300
-    # seconds**, plus the SDK's backoff between attempts. That number is
-    # spelled out because nobody derives it while reading three separate
-    # fields, and because it is the one a person at a terminal actually waits.
+    # **A dead connection is given up on within (connect + read) x (1 +
+    # retries) = (10 + 90) x 3 = 300 seconds.** That is the number to know, and
+    # it is spelled out because nobody derives it while reading three separate
+    # fields.
+    #
+    # It bounds a *stall*, not a request. `httpx.Timeout` is per phase and
+    # measures inactivity: `read=90` means ninety seconds with no byte
+    # arriving, not ninety seconds in total, so a response that trickles can
+    # legitimately outlast it, and the SDK's backoff between retries is on top.
+    # Bounding total wall clock would need a deadline around the call — a real
+    # change, deliberately not made, because the failure being fixed here is a
+    # connection that has stopped rather than one that is slow. Raised by
+    # review on PR #10, which was right about the semantics.
+    #
     # The dominant term is the retries, not the read: whoever wants a shorter
     # worst case should lower `OPENAI_MAX_RETRIES` first, which costs only the
     # recovery from a transient 5xx, where lowering the read timeout starts
@@ -257,12 +267,6 @@ class Settings(BaseSettings):
                 "prints, or read it from the endpoint's page in the dashboard."
             )
         return value
-
-    # --- Langfuse (D10) --- same, only populated on D10
-    langfuse_public_key: OptionalStr = None
-    langfuse_secret_key: OptionalStr = None
-    langfuse_host: str = "https://cloud.langfuse.com"
-
 
     @property
     def success_url(self) -> str:

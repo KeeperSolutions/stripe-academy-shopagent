@@ -28,6 +28,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from shopagent.obs.redaction import redact_text
 from shopagent.obs.tracing import Observation, Tracer
 from shopagent.tools.registry import ToolResult
 
@@ -78,15 +79,24 @@ class TracedClient:
 def _generation_fields(reply: Any, latency_ms: float) -> dict[str, Any]:
     """What one finished call contributes, read from what already measured it.
 
-    The output is deliberately *not* the model's prose. `redact_messages` would
-    have to be applied to it and there is nothing left after that a reader can
-    use, so what is sent instead is the shape of the turn: whether it answered
-    or asked for tools, and which tools. That is the half of an assistant turn
-    the redaction rule permits and the half a trace is read for.
+    The shape of the turn — whether it answered or asked for tools, and which
+    tools — is the part a trace is read for, and it is never redacted because
+    none of it is anybody's text.
+
+    The answer itself goes through `redact_text`, the same function
+    `redact_messages` applies to an assistant message, so it is a digest by
+    default and plaintext only where the operator has turned redaction off.
+    This used to be omitted on the argument that a digest is unreadable, and
+    that argument had a hole: a conversation's *last* answer appears in no
+    later generation's input, because there is no later generation. So with
+    `TRACE_REDACT_TEXT=false` — whose whole promise is that a trace reads as a
+    conversation — the final answer was the one thing missing from it. Raised
+    by review on PR #10.
     """
     fields: dict[str, Any] = {
         "output": {
             "answered": bool(getattr(reply, "content", None)),
+            "content": redact_text(getattr(reply, "content", None)),
             "tool_calls": [call.name for call in getattr(reply, "tool_calls", []) or []],
         },
         "metadata": {"latency_ms": latency_ms},

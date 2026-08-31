@@ -469,13 +469,21 @@ def test_the_timeout_is_not_the_sdk_default():
     assert LLMClient()._client.timeout.read < DEFAULT_TIMEOUT.read
 
 
-def test_the_worst_case_wait_stays_inside_five_minutes():
+def test_a_dead_connection_is_given_up_on_inside_five_minutes():
     """The number nobody derives while reading three separate fields.
 
-    `(connect + read) x (1 + retries)`, which is what a person at a terminal
-    actually waits when a connection dies. This is the criterion the values
-    were chosen against, so it is asserted rather than left in a comment —
-    raising `read` to the SDK's 600 would fail here with the reason attached.
+    `(connect + read) x (1 + retries)` is what a person waits when the
+    connection has *stopped* — nothing arriving, which is the outage this
+    setting exists for. It is the criterion the values were chosen against, so
+    it is asserted rather than left in a comment: raising `read` to the SDK's
+    600 fails here with the reason attached.
+
+    **It is not a request deadline, and the name says stall rather than wait
+    for that reason.** `httpx.Timeout` is per phase and measures inactivity, so
+    a response arriving slowly can outlast `read` legitimately, and the SDK's
+    backoff between retries adds more. Asserting a total bound would mean
+    building one — a deadline around the call — which is a change this project
+    has not made and should not pretend to have. Raised by review on PR #10.
 
     The dominant term is the retries: lowering `OPENAI_MAX_RETRIES` shortens
     this at the cost of recovering from a transient 5xx, where lowering the
@@ -489,7 +497,7 @@ def test_the_worst_case_wait_stays_inside_five_minutes():
     ) * (1 + settings.openai_max_retries)
 
     assert worst_case == 300.0
-    assert worst_case <= 300.0, f"a dead connection would hang a turn for {worst_case}s"
+    assert worst_case <= 300.0, f"a dead connection would stall a turn for {worst_case}s"
 
 
 def test_a_timed_out_turn_reaches_the_customer_as_a_sentence(monkeypatch, capsys):

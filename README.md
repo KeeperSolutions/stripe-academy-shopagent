@@ -151,13 +151,16 @@ cp .env.example .env     # .env is never committed; fill in your keys locally
 # Three more, with defaults chosen rather than inherited:
 #   OPENAI_CONNECT_TIMEOUT_SECONDS  10
 #   OPENAI_READ_TIMEOUT_SECONDS     90
-#   OPENAI_MAX_RETRIES              2   worst case (10+90) x 3 = 300 seconds.
-#                                       The SDK's own default is read=600s
-#                                       with two retries, which turns a
-#                                       dropped connection into a
-#                                       thirty-minute silence. Measured: a
-#                                       D10 eval pass sat there for ten
-#                                       minutes.
+#   OPENAI_MAX_RETRIES              2   a dead connection is given up on
+#                                       within (10+90) x 3 = 300s. That bounds
+#                                       a stall, not a request: these are
+#                                       per-phase inactivity timeouts, so a
+#                                       reply arriving slowly can outlast them.
+#                                       The SDK's own default is read=600s with
+#                                       two retries, which turns a dropped
+#                                       connection into a thirty-minute
+#                                       silence. Measured: a D10 eval pass sat
+#                                       there for ten minutes.
 
 # 4. database (Postgres 16 + pgvector)
 docker compose up -d

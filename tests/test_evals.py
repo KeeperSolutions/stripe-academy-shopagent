@@ -414,6 +414,23 @@ def test_the_runner_never_truncates_a_table():
         assert f"{statement} where" in lowered, f"{statement!r} must be constrained by id"
 
 
+def test_no_delete_matches_a_prefix_rather_than_an_id():
+    """A `LIKE` in a cleanup is a truncate wearing a WHERE clause.
+
+    `DELETE FROM processed_events WHERE event_id LIKE 'evt_eval_%'` looks
+    constrained and takes the idempotency claims of every eval process sharing
+    this database. A concurrent run would find its own handled events
+    forgotten, and Stripe redelivering one of them would be processed twice —
+    the exact thing that table exists to prevent. The runner records the ids it
+    signed and deletes those. Raised by review on PR #10.
+    """
+    lowered = RUNNER_CODE.lower()
+
+    assert " like " not in lowered, "cleanup matches a prefix instead of an id"
+    assert "evt_eval_%" not in lowered
+    assert "delete from processed_events where event_id = any(" in lowered
+
+
 def test_the_runner_releases_stock_through_the_lifecycle_and_not_by_hand():
     """`inventory.reserved` is moved by `apply_transition` or not at all.
 

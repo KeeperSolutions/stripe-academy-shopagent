@@ -700,3 +700,43 @@ def test_a_second_shutdown_strands_the_queue_a_later_flush_waits_on(monkeypatch)
         "documents is gone — re-read the comment above and simplify "
         "evals/runner.py if Langfuse has fixed it"
     )
+
+
+def test_the_answer_a_conversation_ends_on_reaches_the_trace():
+    """The last answer appears in no later generation's input, so it needs its own.
+
+    Every other assistant message is replayed into the next call and reaches a
+    trace that way. The final one is not, because there is no next call — so
+    with `TRACE_REDACT_TEXT=false`, whose whole promise is that a trace reads
+    as a conversation, it was the one thing missing. Raised by review on PR
+    #10.
+
+    The phrase is chosen to appear in no input message, so finding it can only
+    mean the reply itself was recorded.
+    """
+    monkey = redaction.redacting
+    redaction.redacting = lambda: False
+    try:
+        capture = Capture()
+        client = TracedClient(ScriptedClient(reply("Your order is on its way.")), capture.tracer)
+        client.chat_with_tools([{"role": "user", "content": "did it go through"}])
+        assert "Your order is on its way." in capture.wire()
+    finally:
+        redaction.redacting = monkey
+
+
+def test_that_answer_is_redacted_like_every_other_thing_a_person_reads():
+    """Recording it must not become a way round the switch.
+
+    Same reply, redaction left at its default. `redact_text` is the function
+    `redact_messages` already applies to an assistant message, so the answer
+    obeys one rule rather than a second one written for this field.
+    """
+    capture = Capture()
+    client = TracedClient(ScriptedClient(reply("Your order is on its way.")), capture.tracer)
+
+    client.chat_with_tools([{"role": "user", "content": "did it go through"}])
+
+    wire = capture.wire()
+    assert "Your order is on its way." not in wire
+    assert "<redacted:" in wire, "the answer was dropped rather than digested"

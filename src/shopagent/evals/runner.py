@@ -76,9 +76,15 @@ def stuck_after_seconds() -> float:
     """When silence stops being slowness and becomes a hang.
 
     Derived from the model timeouts rather than written down, so the two cannot
-    drift: `(connect + read) x (1 + retries)` is the worst a single
-    `chat_with_tools` can take now that `llm/client.py` bounds it, and anything
-    past that plus a margin is something no configured timeout will end.
+    drift: `(connect + read) x (1 + retries)` is how long a *stalled* call can
+    go before `llm/client.py` gives up on it, and anything past that plus a
+    margin is silence no configured timeout is going to end.
+
+    It is a threshold for arming a dump, not a claim about the maximum. A call
+    receiving bytes slowly can legitimately outlast it — `httpx` timeouts
+    measure inactivity per phase rather than total elapsed — which is exactly
+    why the dump is `repeat=True` and `exit=False`: a false alarm costs one
+    stack on stderr, and a run that really is stuck says so again.
 
     This exists because a D10 eval pass hung for ten minutes and had to be
     diagnosed from `lsof` and a Langfuse trace, after the first hypothesis
@@ -103,6 +109,9 @@ class Result:
     skipped: str | None = None
     error: str | None = None
     leftovers: list[str] = field(default_factory=list)
+    # Every webhook event id this scenario signed and posted, so cleanup can
+    # delete exactly those. See `clean_up`.
+    events: list[str] = field(default_factory=list)
     # Reported rather than asserted: whether the amount guardrail actually
     # fired. See `_every_amount_traceable` for why this is an observation and
     # not an expectation.
@@ -222,7 +231,7 @@ def run_one(scenario: Scenario, tracer: Tracer) -> Result:
         result.calls = len(tracker.calls)
         if setup is not None:
             observed.order_status = _order_status(setup.memory.order_id)
-            result.leftovers = clean_up(setup.memory)
+            result.leftovers = clean_up(setup.memory, result.events)
 
     if result.error is None and result.skipped is None:
         result.verdicts = [
@@ -245,7 +254,7 @@ def _drive(scenario, setup, confirmer, tracker, tracer, observed, result) -> Non
 
     for turn in scenario.turns:
         if turn.is_action:
-            ACTIONS[turn.value](setup)
+            ACTIONS[turn.value](setup, result.events)
             continue
 
         setup.memory.begin_turn(from_customer=True)
@@ -315,7 +324,7 @@ class _Recording:
 # --- actions a customer cannot perform ------------------------------------
 
 
-def simulate_payment(setup) -> None:
+def simulate_payment(setup, events: list[str]) -> None:
     """Mark this conversation's order paid the way Stripe would.
 
     A real card is a browser and a person, which is a demo rather than an eval.
@@ -340,7 +349,7 @@ def simulate_payment(setup) -> None:
         raise RuntimeError(f"simulate_payment: order {order_id} has no Checkout Session")
 
     payment_intent = f"pi_eval_{uuid.uuid4().hex[:24]}"
-    _post_event(
+    events.append(_post_event(
         "checkout.session.completed",
         {
             "id": session_id,
@@ -351,23 +360,31 @@ def simulate_payment(setup) -> None:
             "amount_total": _order_total(order_id),
             "metadata": {"order_id": str(order_id)},
         },
-    )
+    ))
 
 
 ACTIONS = {"simulate_payment": simulate_payment}
 
 
-def _post_event(event_type: str, data: dict) -> httpx.Response:
-    """Sign an event the way Stripe documents and post it to the local API.
+def _post_event(event_type: str, data: dict) -> str:
+    """Sign an event the way Stripe documents, post it, and return its id.
 
     The signing secret is the configured one, so the endpoint verifies this
     exactly as it verifies a real delivery. `livemode` is false and is checked
     by the handler — a live event is recorded and never dispatched.
+
+    The id is returned rather than discarded because `clean_up` deletes the
+    `processed_events` rows by it. That used to be a `LIKE 'evt_eval_%'`, which
+    is a small truncate wearing a WHERE clause: it takes the idempotency claims
+    of every other eval process against this database, and a concurrent run
+    would find its own handled events forgotten and open to being processed
+    twice. Raised by review on PR #10.
     """
     settings = get_settings()
+    event_id = f"evt_eval_{uuid.uuid4().hex[:24]}"
     body = json.dumps(
         {
-            "id": f"evt_eval_{uuid.uuid4().hex[:24]}",
+            "id": event_id,
             "object": "event",
             # The version this project pins, so a simulated event is shaped
             # like the ones the handler already sees.
@@ -395,20 +412,26 @@ def _post_event(event_type: str, data: dict) -> httpx.Response:
         timeout=TIMEOUT_SECONDS,
     )
     response.raise_for_status()
-    return response
+    return event_id
 
 
 # --- undoing the run ------------------------------------------------------
 
 
-def clean_up(memory) -> list[str]:
+def clean_up(memory, events: list[str] | None = None) -> list[str]:
     """Undo exactly this scenario, by id. Returns what could not be undone.
 
     Ordered so the reservation is released before the rows that record it are
     deleted. A cancel or a refund that fails stops the deletion of that order:
     a row removed without its release leaves units unsellable with nothing in
     the database left to explain why.
+
+    `events` is every webhook id this scenario signed — including the refund
+    `_released` posts on the way out, which is why the list is passed in and
+    appended to rather than returned. Deleting by those ids rather than by a
+    prefix is what keeps "by id" true when two runs share a database.
     """
+    events = [] if events is None else events
     leftovers: list[str] = []
     order_id, cart_id = memory.order_id, memory.cart_id
 
@@ -422,7 +445,7 @@ def clean_up(memory) -> list[str]:
         if row is not None:
             cart_id = str(row[0])
 
-    if order_id and not _released(order_id, leftovers):
+    if order_id and not _released(order_id, leftovers, events):
         return leftovers + [f"cart {cart_id} (kept; its order still holds stock)"]
 
     try:
@@ -432,8 +455,10 @@ def clean_up(memory) -> list[str]:
                     text("DELETE FROM order_items WHERE order_id = :id"), {"id": order_id}
                 )
                 connection.execute(text("DELETE FROM orders WHERE id = :id"), {"id": order_id})
+            if events:
                 connection.execute(
-                    text("DELETE FROM processed_events WHERE event_id LIKE 'evt_eval_%'")
+                    text("DELETE FROM processed_events WHERE event_id = ANY(:ids)"),
+                    {"ids": events},
                 )
             if cart_id:
                 connection.execute(
@@ -448,7 +473,7 @@ def clean_up(memory) -> list[str]:
     return leftovers
 
 
-def _released(order_id: str, leftovers: list[str]) -> bool:
+def _released(order_id: str, leftovers: list[str], events: list[str]) -> bool:
     """Get this order's reservation back, whatever state it is in.
 
     `pending` cancels. `paid` cannot — `paid -> cancelled` is not in the
@@ -463,7 +488,7 @@ def _released(order_id: str, leftovers: list[str]) -> bool:
         return True
 
     if status == "paid":
-        return _refunded(order_id, leftovers)
+        return _refunded(order_id, leftovers, events)
 
     headers = {"X-API-Key": get_settings().shopagent_api_key}
     try:
@@ -487,7 +512,7 @@ def _released(order_id: str, leftovers: list[str]) -> bool:
     return False
 
 
-def _refunded(order_id: str, leftovers: list[str]) -> bool:
+def _refunded(order_id: str, leftovers: list[str], events: list[str]) -> bool:
     """Undo a simulated payment with a simulated full refund.
 
     Full, and it has to be: `charge.refunded` fires for a partial refund too,
@@ -511,7 +536,7 @@ def _refunded(order_id: str, leftovers: list[str]) -> bool:
 
     total = _order_total(order_id)
     try:
-        _post_event(
+        events.append(_post_event(
             "charge.refunded",
             {
                 "id": f"ch_eval_{uuid.uuid4().hex[:24]}",
@@ -522,7 +547,7 @@ def _refunded(order_id: str, leftovers: list[str]) -> bool:
                 "refunded": True,
                 "metadata": {"order_id": str(order_id)},
             },
-        )
+        ))
     except httpx.HTTPError as exc:
         leftovers.append(
             f"order {order_id} is paid and the simulated refund failed "

@@ -647,3 +647,32 @@ def test_adding_a_variant_the_model_was_shown_goes_through():
 
     assert result.ok
     assert ran == ["add_to_cart:86263"]
+
+
+def test_an_approval_is_not_spent_on_a_cart_that_changed_after_it_was_given():
+    """The person approved a total, not a tool name.
+
+    The follow-up turn that carries an answer back is a full `run_tool_loop`
+    with every tool available, so the model can call `add_to_cart` and then
+    `create_checkout` inside it. Binding the approval to the tool name alone
+    would spend a yes given for €189.98 on a basket that is now €569.94 — the
+    exact laundering the summary exists to prevent, one step later. Raised by
+    review on PR #10.
+    """
+    basket = json.loads(json.dumps(CART))
+    registry, memory, ran = build(cart=basket)
+
+    registry.dispatch("create_checkout", {})
+    (shown,) = settle(memory, said_yes=True)
+    assert "€189.98" in shown
+
+    # What the model can do in the follow-up turn, before checking out.
+    basket["items"][0]["quantity"] = 6
+    basket["items"][0]["line_total_cents"] = 56994
+    basket["unit_count"] = 6
+    basket["total_cents"] = 56994
+
+    result = registry.dispatch("create_checkout", {})
+
+    assert ran == [], "an approval for one basket bought another"
+    assert not result.ok

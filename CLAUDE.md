@@ -841,6 +841,31 @@ exactly the turn number the approval was good for, so the counter alone would
 let it through. `test_an_approval_given_but_never_carried_back_dies_on_the_next_message`
 is what fails without it.
 
+**An approval is for a basket, not for a tool name.** The turn that carries an
+answer back is a whole `run_tool_loop` with every tool available, so the model
+can call `add_to_cart` between the yes and the `create_checkout` that spends it.
+Binding the approval to the name alone spent a yes given for €189.98 on a
+basket that had become €569.94 — the same laundering `_summarise` exists to
+prevent, one step later in the protocol and with a record saying somebody
+agreed to a figure they were never shown. `_spend` re-reads the shop through
+`_describe` and compares against `PendingConfirmation.summary`.
+
+The comparison is against that summary rather than a separate fingerprint,
+because the summary already *is* what was approved — every line, quantity and
+price, rendered through `money.format_amount`. A second representation would be
+two records of one fact, and the first symptom would be the two disagreeing
+about what "the same basket" means. `_describe` is one function for the same
+reason: parking a question and spending its answer have to render the basket
+identically, and two renderers would be two opinions about whether it changed.
+
+A change is not a refusal but a new question — the new summary is parked and
+the customer is asked about what the basket is now. That cannot loop, because
+`_settle_confirmation` drives exactly one follow-up turn and the new question
+lapses at the customer's next message. This binds the model and not the shop,
+like the rest of the gate: another client holding the API key can still change
+a cart, which is the boundary the entry below draws. Raised in review on PR
+#10.
+
 `spendable_on_turn` is the single record of "answered, and for which turn".
 A `not pending.answered` check stood beside it for one round and was deleted:
 mutating it away failed nothing, because an unanswered question can never be in
