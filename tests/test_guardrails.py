@@ -37,6 +37,8 @@ from pydantic import BaseModel
 from shopagent.agent.guardrails import (
     CONFIRM_BEFORE,
     FALLBACK_PREFIX,
+    PLACING,
+    RESUMING,
     GuardedClient,
     GuardedRegistry,
     unsupported_amounts,
@@ -73,7 +75,33 @@ class AddArgs(BaseModel):
     quantity: int = 1
 
 
-def build(confirm=None, cart=CART, memory=None):
+# What `view_cart` answers once `create_checkout` has closed the cart, and what
+# `check_order_status` answers for the order that closed it. Same shape, which
+# is what lets the gate render either.
+EMPTY_CART = {"currency": "eur", "line_count": 0, "unit_count": 0, "items": [], "total_cents": 0}
+
+ORDER = {
+    "order_id": "o-1",
+    "status": "pending",
+    "currency": "eur",
+    "line_count": 1,
+    "items": [
+        {
+            "variant_id": 86287,
+            "product_name": "Storm Guard Shell",
+            "variant_label": "M / red",
+            "quantity": 1,
+            "unit_price_cents": 19999,
+            "line_total_cents": 19999,
+        }
+    ],
+    "total_cents": 19999,
+}
+
+EMPTY_ORDER = {"error": "no order has been placed in this conversation"}
+
+
+def build(confirm=None, cart=CART, memory=None, order=ORDER):
     """A registry holding a fake cart and a fake checkout, with the gate on."""
     memory = memory or ConversationMemory()
     registry = GuardedRegistry(memory, confirm=confirm)
@@ -84,6 +112,9 @@ def build(confirm=None, cart=CART, memory=None):
             raise cart
         return cart
 
+    def check_order_status():
+        return order
+
     def create_checkout():
         ran.append("create_checkout")
         return {"order_id": "o-1", "checkout_url": "https://pay.example/1", "total_cents": 18998}
@@ -93,6 +124,11 @@ def build(confirm=None, cart=CART, memory=None):
         return cart
 
     registry.register(ToolSpec(name="view_cart", description="d", args_model=NoArgs, fn=view_cart))
+    registry.register(
+        ToolSpec(
+            name="check_order_status", description="d", args_model=NoArgs, fn=check_order_status
+        )
+    )
     registry.register(
         ToolSpec(name="create_checkout", description="d", args_model=NoArgs, fn=create_checkout)
     )
@@ -146,6 +182,60 @@ def test_the_total_a_person_confirms_comes_from_the_cart_not_the_model():
     assert "€189.98" in summary
     assert "Trail Runner GTX" in summary
     assert "42 / black" in summary
+
+
+def test_a_resume_confirms_the_order_and_never_a_total_of_zero():
+    """`create_checkout` clears the cart, so a resume reads an empty one.
+
+    The gate summarised that cart anyway and asked a person to approve "About
+    to place this order: Total: €0.00" for a purchase of €199.99 that was
+    already made — a person approving a figure that is not the real one, which
+    is the exact failure the gate exists to prevent. Found in the end-to-end
+    run for PR #9.
+    """
+    shown = []
+    registry, _, ran = build(confirm=lambda summary: shown.append(summary) or True, cart=EMPTY_CART)
+
+    result = registry.dispatch("create_checkout", {})
+
+    assert result.ok
+    assert ran == ["create_checkout"]
+    (summary,) = shown
+    assert "0.00" not in summary
+    assert "€199.99" in summary
+    assert RESUMING in summary
+    assert PLACING not in summary, "this is not a new order and must not say it is"
+
+
+def test_an_order_being_placed_still_says_so():
+    """The other heading, so the two cannot collapse into one."""
+    shown = []
+    registry, _, _ = build(confirm=lambda summary: shown.append(summary) or True)
+
+    registry.dispatch("create_checkout", {})
+
+    (summary,) = shown
+    assert PLACING in summary
+    assert RESUMING not in summary
+
+
+def test_an_empty_cart_with_no_order_is_left_to_the_tool_to_refuse():
+    """Nothing to confirm is not a question to ask a person.
+
+    "The cart is empty, add something" is the tool's own sentence and a better
+    answer than a gate asking whether to buy nothing.
+    """
+    asked = []
+    registry, _, ran = build(
+        confirm=lambda summary: asked.append(summary) or True,
+        cart=EMPTY_CART,
+        order=EMPTY_ORDER,
+    )
+
+    registry.dispatch("create_checkout", {})
+
+    assert asked == [], "nobody should be asked to approve an empty purchase"
+    assert ran == ["create_checkout"], "the tool answers instead"
 
 
 def test_a_registry_with_nobody_to_ask_refuses_to_buy():
@@ -279,6 +369,62 @@ def test_the_fallback_is_something_a_customer_can_act_on():
 
     assert len(reply.content) > 60
     assert "cart" in reply.content.lower()
+
+
+def test_a_correction_answered_with_a_tool_call_dispatches_it():
+    """The correction says "call a tool"; doing so must not reach the fallback.
+
+    A tool-call reply normally carries no text, and the retry was accepted only
+    when `retry.content` was truthy — so the one behaviour `CORRECTION`
+    explicitly asks for was the one that could never satisfy it. The model
+    obeyed, the call was thrown away, and the customer got the fallback instead
+    of the looked-up figure. Found by review on PR #9.
+    """
+    looks_it_up = answer(None, [ToolCall(id="1", name="view_cart", arguments="{}")])
+    client = FakeClient(answer("That is €94.00."), looks_it_up)
+    guarded = GuardedClient(client, memory_holding_the_cart())
+
+    reply = guarded.chat_with_tools([{"role": "user", "content": "total?"}])
+
+    assert reply is looks_it_up
+    assert reply.tool_calls, "the lookup has to survive to be dispatched"
+    assert not reply.content or not reply.content.startswith(FALLBACK_PREFIX)
+
+
+def test_a_correction_answered_with_narration_and_a_tool_call_also_passes():
+    """Text alongside a tool call is still not a final answer."""
+    both = answer("Let me check: €94.00.", [ToolCall(id="1", name="view_cart", arguments="{}")])
+    client = FakeClient(answer("That is €94.00."), both)
+    guarded = GuardedClient(client, memory_holding_the_cart())
+
+    assert guarded.chat_with_tools([{"role": "user", "content": "total?"}]) is both
+
+
+@pytest.mark.parametrize(
+    "answer_text",
+    ["That will be 94 euros.", "That will be 94 euro.", "It costs euros 94."],
+)
+def test_an_amount_written_as_a_word_is_caught_like_one_written_with_a_symbol(answer_text):
+    """"94 euros" is a money claim with no symbol and no decimals.
+
+    Documented as a known miss for one review round, on the argument that the
+    prompt teaches the symbol form. That is an argument about what the model
+    usually does, and this guard exists for when it does something else — a
+    bypass reachable by writing a word is still a bypass. Raised on PR #9.
+    """
+    assert unsupported_amounts(answer_text, memory_holding_the_cart())
+
+
+def test_the_word_form_quotes_the_whole_claim_back_not_just_the_number():
+    """A correction naming `94` is about a string the model cannot find."""
+    (written,) = unsupported_amounts("That will be 94 euros.", memory_holding_the_cart())
+
+    assert written == "94 euros"
+
+
+def test_a_real_amount_written_as_a_word_is_not_flagged():
+    """The guard must not start refusing figures the shop actually quoted."""
+    assert unsupported_amounts("That is 189.98 euros.", memory_holding_the_cart()) == []
 
 
 def test_a_turn_that_is_still_calling_tools_is_not_validated():

@@ -25,7 +25,19 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
+from shopagent.config import get_settings
 from shopagent.llm.client import LLMClient, Message
+from shopagent.money import format_amount
+
+# Worked examples generated from the shop's currency rather than typed against
+# it. These sentences say what a price bound means, and they said "dollars" for
+# a week after the shop moved to EUR — a unit the model is taught wrongly is a
+# search it runs wrongly, silently. Same idiom as `agent/prompt.py` and
+# `mcp_server/server.py`. Raised in review on PR #9.
+_CURRENCY = get_settings().currency
+_HUNDRED = format_amount(10000, _CURRENCY)
+_FORTY_NINE_NINETY_NINE = format_amount(4999, _CURRENCY)
+_TWENTY = format_amount(2000, _CURRENCY)
 
 # Only two of these are actually enforced by the API today — a schema missing
 # `additionalProperties: false` is rejected with "Invalid schema for
@@ -71,9 +83,10 @@ class ProductQuery(BaseModel):
         strict=True,
         ge=0,
         description=(
-            "Upper price bound as a whole number of CENTS, never dollars and "
-            "never a decimal: '€100' is 10000, '€49.99' is 4999. Null if the "
-            "user set no upper bound."
+            "Upper price bound as a whole number of CENTS, never whole "
+            f"{_CURRENCY.upper()} and never a decimal: '{_HUNDRED}' is 10000, "
+            f"'{_FORTY_NINE_NINETY_NINE}' is 4999. Null if the user set no "
+            "upper bound."
         ),
     )
     min_price_cents: int | None = Field(
@@ -138,9 +151,10 @@ SYSTEM_PROMPT = (
     "Fill only what the text actually states. Any field the text does not "
     "state is null — never guess a category, colour or size, and never use 0 "
     "for a price that was not mentioned, because 0 means free. "
-    "Prices are whole numbers of CENTS, never dollars and never decimals: "
-    "'under €100' is max_price_cents 10000, '€49.99' is 4999, "
-    "'at least €20' is min_price_cents 2000."
+    f"Prices are whole numbers of CENTS, never whole {_CURRENCY.upper()} and "
+    f"never decimals: 'under {_HUNDRED}' is max_price_cents 10000, "
+    f"'{_FORTY_NINE_NINETY_NINE}' is 4999, "
+    f"'at least {_TWENTY}' is min_price_cents 2000."
 )
 
 

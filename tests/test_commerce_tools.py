@@ -298,6 +298,75 @@ def test_the_order_is_remembered_even_when_the_payment_link_fails():
     assert status.ok and '"status": "pending"' in status.content
 
 
+def test_a_checkout_that_failed_at_stripe_can_be_retried_for_the_same_order():
+    """The gap the test above stops one step short of.
+
+    An order placed with no payment link left the conversation in a state
+    neither the customer nor the model could leave: the cart id is gone, so a
+    second `create_checkout` read an empty cart and said to add something,
+    while the order sat pending and holding stock with no way to pay it and no
+    way to cancel it. `POST /orders/{id}/checkout` is idempotent by lookup, so
+    the honest answer is to call it again. Raised in review on PR #9.
+
+    A hand-written handler rather than `Recorder`, which matches on method and
+    path and would answer both checkout attempts with whichever was scripted
+    first — and the whole point here is that the two answer differently.
+    """
+    calls = []
+
+    def handler(request):
+        calls.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/orders":
+            return httpx.Response(201, json=order_body())
+        if request.url.path == f"/orders/{ORDER_ID}":
+            return httpx.Response(200, json=order_body())
+        if request.url.path == f"/orders/{ORDER_ID}/checkout":
+            # Stripe unconfigured on the first attempt, working on the second.
+            if calls.count(f"POST /orders/{ORDER_ID}/checkout") == 1:
+                return httpx.Response(503, json={"detail": "STRIPE_SECRET_KEY is not set"})
+            return httpx.Response(201, json={
+                "order_id": ORDER_ID,
+                "checkout_session_id": "cs_test_123",
+                "checkout_url": "https://checkout.stripe.com/c/pay/cs_test_123",
+            })
+        raise AssertionError(f"unexpected call: {request.url.path}")
+
+    registry, session = build(handler, ConversationMemory(cart_id=CART_ID))
+
+    failed = registry.dispatch("create_checkout", {})
+    resumed = registry.dispatch("create_checkout", {})
+
+    assert not failed.ok
+    assert resumed.ok, "the second attempt must not be refused for an empty cart"
+    assert "https://checkout.stripe.com/c/pay/cs_test_123" in resumed.content
+    assert "empty" not in resumed.content
+    assert session.order_id == ORDER_ID
+    # No second order: the existing one is resumed, never replaced. A retry
+    # that placed another would reserve the stock a second time.
+    assert calls.count("POST /orders") == 1
+
+
+def test_resuming_an_order_that_can_no_longer_be_paid_says_so_in_the_api_s_words():
+    """A paid or cancelled order is refused by the API, not by a guess here.
+
+    409 is the answer, and its sentence is the one the model should repeat.
+    Checking that here is what keeps the resume path from having to know which
+    statuses are payable — a second place that would drift from the lifecycle.
+    """
+    recorder = Recorder([
+        ("GET", f"/orders/{ORDER_ID}", httpx.Response(200, json=order_body("paid"))),
+        ("POST", f"/orders/{ORDER_ID}/checkout", httpx.Response(409, json={
+            "detail": f"order {ORDER_ID} is paid and cannot be paid. Only a pending order can start a checkout."
+        })),
+    ])
+    registry, _ = build(recorder, ConversationMemory(order_id=ORDER_ID))
+
+    result = registry.dispatch("create_checkout", {})
+
+    assert not result.ok
+    assert "is paid and cannot be paid" in result.content
+
+
 def test_check_order_status_reads_the_session_order_not_one_the_model_names():
     recorder = Recorder([("GET", f"/orders/{ORDER_ID}", httpx.Response(200, json=order_body("paid")))])
     registry, _ = build(recorder, ConversationMemory(order_id=ORDER_ID))
@@ -376,6 +445,75 @@ def test_a_timeout_on_a_read_allows_one_more_attempt():
     assert not result.ok
     assert "Nothing was changed" in result.content
     assert "one more time" in result.content
+
+
+# --- a socket that broke after the request went out -----------------------
+#
+# Raised in review on PR #9. Every non-timeout transport failure used to be
+# mapped to "unreachable", whose message tells the model **"Nothing was
+# charged"** — a definite claim. It is only definite for a connection that was
+# never established. A read error or a protocol violation happens with the
+# socket already open, so the request may well have arrived and been committed,
+# and on `create_checkout` that is precisely an order placed behind a lost
+# answer.
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ReadError("connection reset"),
+        httpx.WriteError("broken pipe"),
+        httpx.RemoteProtocolError("server disconnected"),
+    ],
+)
+def test_a_broken_exchange_on_a_write_never_claims_nothing_was_charged(exc):
+    registry = failing(exc)
+
+    result = registry.dispatch("create_checkout", {})
+
+    assert not result.ok
+    assert "Nothing was charged" not in result.content
+    assert "not known whether this took effect" in result.content
+    assert "Do NOT repeat it" in result.content
+    assert "check_order_status" in result.content
+
+
+def test_a_broken_exchange_does_not_borrow_the_timeout_s_sentence():
+    """It is a different cause, and the timeout's message names seconds.
+
+    Telling a customer the shop "did not answer within 10 seconds" about a
+    connection that was reset immediately is a sentence the model repeats and
+    nobody can act on.
+    """
+    result = failing(httpx.ReadError("connection reset")).dispatch("create_checkout", {})
+
+    assert "seconds" not in result.content
+    assert "connection" in result.content.lower()
+
+
+def test_a_broken_exchange_on_a_read_still_allows_one_more_attempt():
+    """A read changed nothing whatever happened to the socket."""
+    result = failing(httpx.ReadError("connection reset")).dispatch("check_order_status", {})
+
+    assert not result.ok
+    assert "Nothing was changed" in result.content
+    assert "one more time" in result.content
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectError("[Errno 61] Connection refused"),
+        httpx.ConnectTimeout("timed out"),
+        httpx.PoolTimeout("no connection available"),
+    ],
+)
+def test_only_a_connection_that_was_never_made_may_say_nothing_went_through(exc):
+    """The other half of the split, so it cannot be widened back by accident."""
+    result = failing(exc).dispatch("create_checkout", {})
+
+    assert not result.ok
+    assert "Nothing was charged" in result.content
 
 
 def test_a_409_reaches_the_model_in_the_api_s_own_words():

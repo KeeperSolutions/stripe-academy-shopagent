@@ -52,7 +52,7 @@ from typing import Any
 
 from shopagent.agent.memory import ConversationMemory, RememberingRegistry
 from shopagent.config import get_settings
-from shopagent.money import ZERO_DECIMAL_CURRENCIES, SYMBOLS, format_amount
+from shopagent.money import WORDS, ZERO_DECIMAL_CURRENCIES, SYMBOLS, format_amount
 from shopagent.tools.registry import ToolResult
 
 # The calls that spend money. A set rather than a check inside the tool,
@@ -66,7 +66,20 @@ CONFIRM_BEFORE = frozenset({"create_checkout"})
 # reason `agent/memory.py` names `search_products`: this is the layer whose job
 # is to know what the tools mean.
 CART_TOOL = "view_cart"
+ORDER_TOOL = "check_order_status"
 ADD_TOOL = "add_to_cart"
+
+# The two things `create_checkout` can be about, and the person confirming has
+# to be told which. It places an order from the cart; it also hands back the
+# payment link of an order already placed, for a customer who lost it. Those
+# are not the same commitment, and the second one reads an empty cart — which
+# summarised as "About to place this order: Total: €0.00", a figure that is
+# neither the order's nor anything else's. Found in the end-to-end run for
+# PR #9, in the fix that made the resume reachable.
+# Indented to sit with the summary lines under it, which is where the CLI used
+# to add the indentation itself.
+PLACING = "  About to place this order:"
+RESUMING = "  That order is already placed. This only fetches its payment link again:"
 
 
 # --- amounts -------------------------------------------------------------
@@ -82,29 +95,57 @@ ADD_TOOL = "add_to_cart"
 # noisy in exactly the situation where it has to be trusted. That is the same
 # trade `find_column_gaps` makes when it declines to report extra columns.
 #
-# Known miss, stated rather than hidden: "190 euros", written as a word with no
-# symbol and no decimals, is not caught. Catching it needs a word per currency,
-# and `money.py` deliberately keeps one symbol rather than a table of every
-# currency's spelling. The prompt teaches the symbol form and every measured
-# run has used it.
+# Also caught: the currency written as a word, singular or plural — "190 euros".
+# This was a documented miss for one review round, on the argument that the
+# prompt teaches the symbol form and every measured run had used it. That is an
+# argument about what the model usually does, and a guardrail is for the times
+# it does something else: an unambiguous claim about money that the guard
+# cannot see is a bypass, and one the model reaches by writing a word. The
+# spellings live in `money.WORDS`, one entry, under the same policy as
+# `money.SYMBOLS` — the shop sells in one currency at a time. Raised in review
+# on PR #9.
 
 _DECIMAL = r"\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?"
 
 
 def _patterns(currency: str) -> list[re.Pattern[str]]:
-    symbol = re.escape(SYMBOLS.get(currency, "")) if currency in SYMBOLS else None
+    """The ways an amount can be written, most specific first.
+
+    Order is not cosmetic. `amount_claims` keeps the first match on a span and
+    drops anything overlapping it, so whichever pattern runs first decides what
+    the model gets quoted back. The bare-two-decimal pattern would find `190.00`
+    inside `190.00 euros`, and a correction naming `190.00` is about a
+    different string than the one the model wrote — so every form that carries
+    a currency marker is tried before the one that carries none.
+    """
+    symbol = re.escape(SYMBOLS[currency]) if currency in SYMBOLS else None
     code = re.escape(currency)
-    patterns = [
-        # 94.99 EUR, 94.99 eur
-        re.compile(rf"({_DECIMAL})\s*{code}\b", re.IGNORECASE),
-        # EUR 94.99
-        re.compile(rf"\b{code}\s*({_DECIMAL})", re.IGNORECASE),
-        # a bare number with exactly two decimals
-        re.compile(rf"(?<![\d.,]) ?(\d{{1,3}}(?:,\d{{3}})*\.\d{{2}}|\d+\.\d{{2}})(?![\d])"),
-    ]
+    # Longest first, so "euros" is matched whole rather than as "euro" with a
+    # stray "s" left behind.
+    words = sorted(WORDS.get(currency, ()), key=len, reverse=True)
+    spelled = "|".join(re.escape(word) for word in words) if words else None
+
+    patterns: list[re.Pattern[str]] = []
+
     if symbol:
-        patterns.insert(0, re.compile(rf"{symbol}\s*({_DECIMAL})"))
-        patterns.insert(1, re.compile(rf"({_DECIMAL})\s*{symbol}"))
+        # €94.99 and 94.99€
+        patterns.append(re.compile(rf"{symbol}\s*({_DECIMAL})"))
+        patterns.append(re.compile(rf"({_DECIMAL})\s*{symbol}"))
+
+    if spelled:
+        # 190 euros, and the rarer "euros 190"
+        patterns.append(re.compile(rf"({_DECIMAL})\s*(?:{spelled})\b", re.IGNORECASE))
+        patterns.append(re.compile(rf"\b(?:{spelled})\s*({_DECIMAL})", re.IGNORECASE))
+
+    # 94.99 EUR and EUR 94.99
+    patterns.append(re.compile(rf"({_DECIMAL})\s*{code}\b", re.IGNORECASE))
+    patterns.append(re.compile(rf"\b{code}\s*({_DECIMAL})", re.IGNORECASE))
+
+    # A bare number with exactly two decimals. Last, because it carries no
+    # marker and would otherwise claim the number out of every form above.
+    patterns.append(
+        re.compile(rf"(?<![\d.,]) ?(\d{{1,3}}(?:,\d{{3}})*\.\d{{2}}|\d+\.\d{{2}})(?![\d])")
+    )
     return patterns
 
 
@@ -233,6 +274,16 @@ class GuardedClient:
             ],
             tools,
         )
+        # A retry that asks for a tool is not a final answer and is not
+        # checked, exactly like a first attempt that asks for one. `CORRECTION`
+        # ends by telling the model to "call a tool to get the right figure",
+        # and a tool-call reply normally carries no text at all — so treating
+        # an empty `content` as a failed retry replaced the very behaviour the
+        # correction asked for with the fallback, and the lookup was never
+        # dispatched. Raised in review on PR #9.
+        if retry.tool_calls:
+            return retry
+
         if retry.content and not unsupported_amounts(retry.content, self._memory):
             return retry
 
@@ -351,7 +402,22 @@ class GuardedRegistry(RememberingRegistry):
                 error="the cart could not be read before confirming",
             )
 
-        if self._confirm(_summarise(cart.content)):
+        if _has_lines(cart.content):
+            summary = f"{PLACING}\n{_summarise(cart.content)}"
+        else:
+            # An empty cart here is not a mistake: `create_checkout` clears the
+            # cart when it places the order, so this is what a resume looks
+            # like. Summarise the order instead — the alternative is asking a
+            # person to approve a total of zero for a purchase that is real.
+            order = super().dispatch(ORDER_TOOL, {})
+            if not order.ok or not _has_lines(order.content):
+                # Nothing to confirm at all. Let the tool answer: "the cart is
+                # empty, add something" is its sentence and a better one than
+                # any question this gate could ask about nothing.
+                return None
+            summary = f"{RESUMING}\n{_summarise(order.content)}"
+
+        if self._confirm(summary):
             return None
 
         return ToolResult(
@@ -376,6 +442,20 @@ def _as_dict(raw_args: Any) -> dict[str, Any] | None:
             return None
         return parsed if isinstance(parsed, dict) else None
     return None
+
+
+def _has_lines(content: str) -> bool:
+    """Whether a cart or an order actually holds anything.
+
+    One reader for both, because `view_cart` and `check_order_status` return
+    the same shape — items with a name, a label, a quantity and a line total.
+    That is what lets the gate summarise either without a second renderer.
+    """
+    try:
+        payload = json.loads(content)
+    except ValueError:
+        return False
+    return bool(isinstance(payload, dict) and payload.get("items"))
 
 
 def _summarise(content: str) -> str:

@@ -41,6 +41,18 @@ ZERO_DECIMAL_CURRENCIES = frozenset(
 # several currencies share one. Add a line here when the shop adds a currency.
 SYMBOLS = {"eur": "€"}
 
+# The same currency spelled out, singular and plural. One entry, and it grows
+# with `SYMBOLS` for the same reason and under the same policy: the shop sells
+# in one currency at a time, and a table of every currency's spelling would be
+# work in service of a shop that does not exist.
+#
+# It exists because `agent/guardrails.py` reads it. The symbol form is what the
+# prompt teaches and what every measured run has produced, but "190 euros" is
+# an unambiguous claim about money that carries no symbol and no decimals, and
+# a guardrail that cannot see it is one a model can walk straight through by
+# writing the word. Raised in review on PR #9.
+WORDS = {"eur": ("euro", "euros")}
+
 
 def format_amount(minor_units: int | None, currency: str | None) -> str:
     """Render an amount for a person to read.
@@ -60,9 +72,25 @@ def format_amount(minor_units: int | None, currency: str | None) -> str:
 
     code = (currency or "").lower()
     if code in ZERO_DECIMAL_CURRENCIES:
-        amount = f"{minor_units:,}"
+        # `abs` here for the same reason as below: the sign is added once, in
+        # front of the symbol, and a branch carrying its own would double it.
+        amount = f"{abs(minor_units):,}"
     else:
-        amount = f"{minor_units / 100:,.2f}"
+        # Integer arithmetic, never `minor_units / 100`. Division makes a
+        # binary float out of an exact integer, and this project holds money as
+        # minor units precisely so that never happens — a formatter that
+        # reintroduces the float at the last step is the rounding bug arriving
+        # where it is hardest to see. `divmod` on the absolute value keeps the
+        # sign out of the fraction: `divmod(-1, 100)` is `(-1, 99)`, which
+        # would render one cent under zero as `-1.99`. Raised on PR #9.
+        whole, fraction = divmod(abs(minor_units), 100)
+        amount = f"{whole:,}.{fraction:02d}"
 
+    # Ahead of the symbol rather than inside the number: `-€0.01` is how a
+    # negative amount is written, `€-0.01` is not. Nothing in this shop
+    # produces one — `total_amount_cents` and `prices.amount_cents` are both
+    # non-negative — but a formatter that renders every amount should not have
+    # a shape it renders wrongly.
+    sign = "-" if minor_units < 0 else ""
     symbol = SYMBOLS.get(code)
-    return f"{symbol}{amount}" if symbol else f"{amount} {code.upper()}"
+    return f"{sign}{symbol}{amount}" if symbol else f"{sign}{amount} {code.upper()}"

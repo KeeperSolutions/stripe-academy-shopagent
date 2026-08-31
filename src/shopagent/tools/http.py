@@ -53,11 +53,33 @@ class CommerceAPIError(Exception):
 
 
 class CommerceAPIUnreachable(CommerceAPIError):
-    """No answer at all: the process is not running, or the host is not there."""
+    """The request was never delivered: no connection was established.
+
+    The distinction from `CommerceAPIInterrupted` below is about money, not
+    about tidiness. This one is the only failure the layer above may describe
+    as "nothing was charged", because it is the only one where nothing can have
+    reached the API.
+    """
+
+
+class CommerceAPIInterrupted(CommerceAPIError):
+    """The connection broke after the request went out, so the outcome is unknown.
+
+    A read error, a write error, a protocol violation mid-exchange: the socket
+    was open, the bytes may have arrived, and the API may have committed the
+    write before the answer was lost. Telling the model "nothing was charged"
+    here would be a guess presented as a fact — and on `create_checkout` the
+    guess is wrong exactly when an order was placed. Raised in review on PR #9.
+    """
 
 
 class CommerceAPITimeout(CommerceAPIError):
-    """A connection was made and the answer did not arrive in time."""
+    """A connection was made and the answer did not arrive in time.
+
+    Same ambiguity as `CommerceAPIInterrupted` and a different cause, which is
+    why it keeps its own class: the message the model gets can name the number
+    of seconds, and that sentence would be false for a broken socket.
+    """
 
 
 class CommerceAPIRefused(CommerceAPIError):
@@ -124,12 +146,23 @@ class CommerceAPI:
         """
         try:
             response = self._client.request(method, path, json=json)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            # Nothing was sent: no connection was established, or none was
+            # available. These are the only failures that can honestly be
+            # reported as "this did not go through".
+            raise CommerceAPIUnreachable(str(exc)) from exc
         except httpx.TimeoutException as exc:
+            # A read or write timeout. The request is out; the answer is not
+            # back. Whether it took effect is unknown.
             raise CommerceAPITimeout(str(exc)) from exc
         except httpx.HTTPError as exc:
-            # Everything else httpx raises before a response exists: a refused
-            # connection, an unresolvable host, a broken pipe mid-request.
-            raise CommerceAPIUnreachable(str(exc)) from exc
+            # `ReadError`, `WriteError`, `RemoteProtocolError` and anything
+            # else httpx raises once the exchange has started. Grouped with the
+            # unknown outcome rather than with "unreachable", which is where
+            # they used to land: a socket that broke mid-exchange may well have
+            # delivered the request first, and an order placed behind a lost
+            # answer is the case that makes the difference matter.
+            raise CommerceAPIInterrupted(str(exc)) from exc
 
         return self._read(response)
 

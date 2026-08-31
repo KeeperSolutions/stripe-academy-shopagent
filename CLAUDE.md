@@ -847,6 +847,60 @@ region is data and not instructions — and `MONEY_PROMPT` plus the amount
 guardrail mean the most valuable thing such a string could ask for is
 unavailable however persuasive it is.
 
+**Only a connection that was never made may say "nothing was charged".**
+`tools/http.py` mapped every non-timeout `httpx.HTTPError` to
+`CommerceAPIUnreachable`, whose message to the model is a definite claim that
+the request did not go through. That is true for a `ConnectError`, a
+`ConnectTimeout` and a `PoolTimeout` — no connection, no bytes. It is not true
+for a `ReadError`, a `WriteError` or a `RemoteProtocolError`, which happen with
+the socket already open: the request may have arrived and been committed before
+the answer was lost. On `create_checkout` that is an order placed, stock
+reserved, and the model telling a customer nothing happened.
+`CommerceAPIInterrupted` carries that outcome now, and it keeps its own class
+rather than reusing `CommerceAPITimeout` because the timeout's sentence names a
+number of seconds that did not elapse. Raised in review on PR #9.
+
+**An order placed in this conversation is resumed, never refused for an empty
+cart.** `create_checkout` writes `order_id` and clears `cart_id` before it
+calls Stripe, and the Stripe call can still fail — a 503 when no key is
+configured, which this project treats as a normal state. The order was then
+pending and holding stock with no payment page, while a second
+`create_checkout` read an empty cart and told the customer to add something:
+neither paying nor cancelling was reachable through the agent at all.
+`POST /orders/{id}/checkout` is idempotent by lookup — D7 stores
+`stripe_checkout_session_id` and returns the open session — so the answer is to
+call it again rather than to place a second order. An order that can no longer
+be paid is refused by the API in its own words, which keeps the list of payable
+statuses in `lifecycle.py` and out of the tool. Raised in review on PR #9.
+
+**Every currency a model reads is generated from `CURRENCY`, never typed beside
+it.** `agent/prompt.py` already did this; `mcp_server/server.py` and
+`llm/structured.py` did not, and one of them told the model that passing `100`
+as a price bound "means one dollar" for a week after the shop moved to EUR — a
+wrong unit is a wrong search with no symptom. Both now build their worked
+examples through `money.format_amount`. The test that holds it is a sweep for
+the names of currencies this shop does not sell in, over every tool description
+and every field description, because a test naming the two fields that were
+wrong would have gone stale exactly as the descriptions did.
+
+**`money.format_amount` does no floating-point arithmetic.** `minor_units /
+100` turns an exact integer into a binary float at the last step of a pipeline
+that exists to keep money integral, and above 2**53 it renders the wrong cent.
+`divmod` on the absolute value, with the sign placed ahead of the symbol —
+`divmod(-1, 100)` is `(-1, 99)`, which writes one cent below zero as `-1.99`.
+Raised in review on PR #9.
+
+**A corrective retry that asks for a tool is dispatched, not replaced.**
+`GuardedClient`'s `CORRECTION` ends by telling the model to call a tool for the
+right figure, and a tool-call reply normally carries no text — so accepting the
+retry only when `retry.content` was truthy meant the one behaviour the
+correction asked for could never satisfy it, and the customer got the fallback
+instead of the looked-up number. A retry is checked by the same rule as a first
+attempt: tool calls are not a final answer. The guard also reads
+`money.WORDS` now, because "190 euros" is an unambiguous claim about money that
+carries no symbol and no decimals, and a bypass reachable by writing a word is
+still a bypass. Both raised in review on PR #9.
+
 **Chat Completions, not the Responses API.** Responses keeps conversation state
 on the server, which hides the very loop this project exists to learn.
 

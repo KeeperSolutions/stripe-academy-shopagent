@@ -41,7 +41,7 @@ from sqlalchemy import text
 
 import shopagent.mcp_server.server as server_module
 from shopagent.config import get_settings
-from shopagent.money import SYMBOLS
+from shopagent.money import SYMBOLS, format_amount
 from shopagent.mcp_server.server import (
     SERVER_NAME,
     configure_stderr_logging,
@@ -238,6 +238,47 @@ def test_price_parameters_say_the_unit_is_cents(field):
 
     assert "cent" in description.lower()
     assert symbol in description
+
+
+# Currency names this shop does not sell in. A description that teaches one of
+# them is teaching the model a wrong unit, which is a wrong search it has no
+# way to notice — `max_price_cents` said "passing 100 here means one dollar"
+# for a week after the shop moved to EUR, and every test passed. Raised in
+# review on PR #9.
+OTHER_CURRENCY_WORDS = ("dollar", "pound", "yen", "franc", "rupee", "peso")
+
+
+def test_no_tool_teaches_the_model_a_currency_this_shop_does_not_sell_in():
+    """Swept over every description a model reads, not just the ones changed.
+
+    A test naming the two price fields would have gone stale the same way the
+    description did. This one fails whenever any tool starts talking about a
+    currency the shop does not use, including a tool added later.
+    """
+    tools = call(server.list_tools)
+    texts = []
+    for tool in tools:
+        texts.append(tool.description or "")
+        for field in (tool.input_schema.get("properties") or {}).values():
+            texts.append(field.get("description", ""))
+
+    haystack = " ".join(texts).lower()
+    found = [word for word in OTHER_CURRENCY_WORDS if word in haystack]
+    assert found == [], f"model-facing text names {found}; the shop sells in {get_settings().currency}"
+
+
+def test_the_price_examples_are_generated_from_the_configured_currency():
+    """Not typed beside it, which is how the stale unit survived.
+
+    Asserted through `format_amount` so the check cannot agree with a wrong
+    description by repeating the same literal.
+    """
+    currency = get_settings().currency
+    description = schema_of("search_products")["properties"]["max_price_cents"]["description"]
+
+    assert format_amount(10000, currency) in description
+    assert format_amount(4999, currency) in description
+    assert format_amount(100, currency) in description
 
 
 def test_the_cents_example_is_spelled_out_for_the_upper_bound():

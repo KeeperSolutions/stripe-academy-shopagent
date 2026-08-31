@@ -13,14 +13,17 @@ import json
 import pytest
 from pydantic import BaseModel, Field
 
+from shopagent.config import get_settings
 from shopagent.llm.structured import (
     PRODUCT_QUERY_SCHEMA,
+    SYSTEM_PROMPT,
     ProductQuery,
     StructuredOutputError,
     parse_product_query,
     strict_schema_for,
 )
 from shopagent.llm.usage import CallUsage
+from shopagent.money import format_amount
 
 FULL = {
     "keywords": ["running", "shoes"],
@@ -99,6 +102,41 @@ def test_the_instruction_states_the_cents_rule():
     system = client.seen_messages[0]["content"]
     assert "cent" in system.lower()
     assert "10000" in system, "an example beats a rule the model has to infer"
+
+
+# Currency names this shop does not sell in. The extraction prompt and the
+# `max_price_cents` description both said "dollars" for a week after the shop
+# moved to EUR — the same defect as in `mcp_server/server.py`, found in the
+# same review on PR #9, and neither had a test that could see it.
+OTHER_CURRENCY_WORDS = ("dollar", "pound", "yen", "franc", "rupee", "peso")
+
+
+def test_nothing_the_model_reads_names_a_currency_this_shop_does_not_sell_in():
+    """The prompt and every field description, swept together.
+
+    Both are model-facing text about the same rule, and a test that checked
+    only one would leave the other free to drift.
+    """
+    descriptions = [
+        field.get("description", "")
+        for field in PRODUCT_QUERY_SCHEMA["properties"].values()
+    ]
+    haystack = " ".join([SYSTEM_PROMPT, *descriptions]).lower()
+
+    found = [word for word in OTHER_CURRENCY_WORDS if word in haystack]
+    assert found == [], f"model-facing text names {found}; the shop sells in {get_settings().currency}"
+
+
+def test_the_cents_examples_are_generated_from_the_configured_currency():
+    """Checked through `format_amount`, so the test cannot repeat a wrong literal."""
+    currency = get_settings().currency
+
+    assert format_amount(10000, currency) in SYSTEM_PROMPT
+    assert format_amount(4999, currency) in SYSTEM_PROMPT
+    assert (
+        format_amount(10000, currency)
+        in PRODUCT_QUERY_SCHEMA["properties"]["max_price_cents"]["description"]
+    )
 
 
 # --- money is an integer number of cents --------------------------------

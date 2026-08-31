@@ -33,6 +33,7 @@ from shopagent.tools.http import (
     READ_TIMEOUT_SECONDS,
     CommerceAPI,
     CommerceAPIBroken,
+    CommerceAPIInterrupted,
     CommerceAPIRefused,
     CommerceAPITimeout,
     CommerceAPIUnauthorized,
@@ -153,6 +154,25 @@ _TIMEOUT_WRITE = (
     "customer what you find."
 )
 
+# The same unknown outcome, reached a different way: the connection broke after
+# the request went out. It gets its own pair rather than reusing the timeout's
+# because the timeout's names a number of seconds that did not elapse here, and
+# a message that misdescribes what happened is one the model repeats to a
+# customer. Raised in review on PR #9.
+_INTERRUPTED_READ = (
+    "Error: the connection to the ordering system broke before the answer came "
+    "back. Nothing was changed. You may try this one more time, and if it fails "
+    "again, tell the customer the shop is having trouble right now."
+)
+
+_INTERRUPTED_WRITE = (
+    "Error: the connection to the ordering system broke after the request was "
+    "sent, so it is not known whether this took effect. Do NOT repeat it — "
+    "repeating could do it twice. Call view_cart (or check_order_status, if an "
+    "order was being placed) to see what the true state is, and tell the "
+    "customer what you find."
+)
+
 
 def _reports_failures(*, changes_state: bool) -> Callable[[Callable], Callable]:
     """Turn a transport failure into a `ToolResult` the model can act on.
@@ -185,6 +205,13 @@ def _reports_failures(*, changes_state: bool) -> Callable[[Callable], Callable]:
             except CommerceAPITimeout:
                 content = _TIMEOUT_WRITE if changes_state else _TIMEOUT_READ
                 return ToolResult(ok=False, content=content, error="the ordering system timed out")
+            except CommerceAPIInterrupted:
+                content = _INTERRUPTED_WRITE if changes_state else _INTERRUPTED_READ
+                return ToolResult(
+                    ok=False,
+                    content=content,
+                    error="the connection to the ordering system broke mid-request",
+                )
             except CommerceAPIUnreachable:
                 return ToolResult(
                     ok=False, content=_UNREACHABLE, error="the ordering system is not answering"
@@ -356,8 +383,49 @@ def build_commerce_tools(api: CommerceAPI, state: HoldsCartState) -> list[ToolSp
         # read precisely so nobody else has to.
         return _cart_view(api.request("GET", f"/cart/{state.cart_id}"))
 
+    def _payment_link(order: dict[str, Any]) -> dict[str, Any]:
+        """Start or resume the Stripe checkout for an order that already exists.
+
+        `POST /orders/{id}/checkout` is idempotent by lookup rather than by
+        idempotency key — D7 stores `stripe_checkout_session_id` on the order
+        and returns the session that is already open — so calling it a second
+        time hands back the same payment page rather than making another. That
+        is what lets the refusal below be a resumption instead of a dead end.
+        """
+        checkout = api.request("POST", f"/orders/{order['order_id']}/checkout")
+        return {
+            "order_id": order["order_id"],
+            "status": order["status"],
+            "currency": order["currency"],
+            "total_cents": order["total_cents"],
+            "checkout_url": checkout["checkout_url"],
+            "note": (
+                "Give the customer this checkout_url and ask them to pay there. "
+                "The order is not paid until they do — say it is pending, never "
+                "that it is complete."
+            ),
+        }
+
     @_reports_failures(changes_state=True)
     def create_checkout() -> Any:
+        # An order already placed in this conversation is resumed, not refused.
+        #
+        # The two writes below leave a window: the order exists, the cart id is
+        # gone, and the Stripe call can still fail — a 503 when no Stripe key is
+        # configured, which this project treats as a normal state rather than a
+        # startup error, or a connection that broke after the request went out.
+        # The order is then pending and holding stock, with no payment page and
+        # nothing pointing at it: a second `create_checkout` used to read an
+        # empty cart and tell the customer to add something, so neither paying
+        # nor cancelling was reachable through the agent at all.
+        #
+        # It also covers the ordinary case of a customer who lost the link.
+        # An order that can no longer be paid is refused by the API in its own
+        # words — `paid` and `cancelled` both answer 409 — which is the sentence
+        # the model should be repeating anyway. Raised in review on PR #9.
+        if state.cart_id is None and state.order_id is not None:
+            return _payment_link(api.request("GET", f"/orders/{state.order_id}"))
+
         if state.cart_id is None:
             return _refuse(
                 "there is nothing to check out — the cart is empty. Add at "
@@ -373,19 +441,7 @@ def build_commerce_tools(api: CommerceAPI, state: HoldsCartState) -> list[ToolSp
         state.order_id = str(order["order_id"])
         state.cart_id = None
 
-        checkout = api.request("POST", f"/orders/{state.order_id}/checkout")
-        return {
-            "order_id": order["order_id"],
-            "status": order["status"],
-            "currency": order["currency"],
-            "total_cents": order["total_cents"],
-            "checkout_url": checkout["checkout_url"],
-            "note": (
-                "Give the customer this checkout_url and ask them to pay there. "
-                "The order is not paid until they do — say it is pending, never "
-                "that it is complete."
-            ),
-        }
+        return _payment_link(order)
 
     @_reports_failures(changes_state=False)
     def check_order_status() -> Any:
@@ -444,7 +500,11 @@ def build_commerce_tools(api: CommerceAPI, state: HoldsCartState) -> list[ToolSp
                 "to confirm; if they decline, this call comes back as an error "
                 "saying so and nothing is ordered. Read the result rather than "
                 "assuming it worked. The order is pending, not paid, until the "
-                "customer completes the payment page."
+                "customer completes the payment page. If an order has already "
+                "been placed in this conversation and is still pending, call "
+                "this again to get its payment link back — it returns the same "
+                "page rather than ordering anything a second time. That is how "
+                "a customer who lost the link is helped."
             ),
             args_model=CreateCheckoutArgs,
             fn=create_checkout,

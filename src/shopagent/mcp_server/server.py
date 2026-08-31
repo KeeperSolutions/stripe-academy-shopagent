@@ -64,6 +64,19 @@ from pydantic import Field
 
 from shopagent.catalog import search as catalog
 from shopagent.config import get_settings
+from shopagent.money import format_amount
+
+# The shop's currency, worked into the two price descriptions below rather than
+# spelled into them. Those sentences are the contract the model reads for what
+# a price bound means, and one of them still said "one dollar" a week after the
+# shop moved to EUR — a stale unit in a bound is a wrong search the model has
+# no way to notice. Generated the same way `agent/prompt.py` generates its own
+# worked example, for the same reason. Raised in review on PR #9.
+_CURRENCY = get_settings().currency
+_ONE_MAJOR_UNIT = format_amount(100, _CURRENCY)
+_HUNDRED = format_amount(10000, _CURRENCY)
+_FORTY_NINE_NINETY_NINE = format_amount(4999, _CURRENCY)
+_FIFTY = format_amount(5000, _CURRENCY)
 
 logger = logging.getLogger(__name__)
 
@@ -353,8 +366,9 @@ def search_products(
         int | None,
         Field(
             description=(
-                "Upper price bound in CENTS, not euros. €100 is 10000, €49.99 "
-                "is 4999. Passing 100 here means one dollar and will match "
+                f"Upper price bound in CENTS, not whole {_CURRENCY.upper()}. "
+                f"{_HUNDRED} is 10000, {_FORTY_NINE_NINETY_NINE} is 4999. "
+                f"Passing 100 here means {_ONE_MAJOR_UNIT} and will match "
                 "nothing. Must be 0 or more. Applies to the variant price, so a "
                 "product is returned when at least one of its variants is within "
                 "the bound."
@@ -365,7 +379,8 @@ def search_products(
         int | None,
         Field(
             description=(
-                "Lower price bound in CENTS, not euros. €50 is 5000. Must be 0 "
+                f"Lower price bound in CENTS, not whole {_CURRENCY.upper()}. "
+                f"{_FIFTY} is 5000. Must be 0 "
                 "or more, and not greater than max_price_cents. Use it only when "
                 'the shopper asked for a floor; it is not needed to express "cheap".'
             )

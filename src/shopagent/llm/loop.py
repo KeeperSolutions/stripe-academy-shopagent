@@ -364,15 +364,19 @@ def _ask_to_confirm(summary: str) -> bool:
     """Show what is being bought and wait for a person to answer (D9, step 5).
 
     The summary comes from `agent/guardrails.py`, which built it from a real
-    `view_cart` call — not from anything the model said. This function only
-    prints it and reads a line.
+    `view_cart` or `check_order_status` call — not from anything the model
+    said. This function only prints it and reads a line.
 
     Anything that is not an explicit yes is a no, including end-of-input. A
     piped session, a closed terminal or a stray newline must not buy anything:
     the safe answer to "could not ask" is the same as the answer to "they said
     no", and it is the only one that cannot cost somebody money.
     """
-    print("\n  About to place this order:")
+    # The heading is part of the summary now, not printed here: `create_checkout`
+    # can be placing an order or fetching the payment link of one already
+    # placed, and only `agent/guardrails.py` knows which. A heading fixed in
+    # this function said "About to place this order" over both.
+    print()
     print(summary)
     try:
         answer = input("  Place the order? [y/N] ").strip().lower()
