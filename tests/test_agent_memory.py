@@ -69,20 +69,6 @@ def test_a_new_search_replaces_the_previous_one():
     assert memory.last_search.arguments == {"query": "jackets"}
 
 
-def test_a_reference_into_a_superseded_search_is_refused_in_words():
-    """Never a quiet guess: the wrong shoe is worse than a question."""
-    memory = ConversationMemory()
-    memory.observe(SEARCH_TOOL, {"query": "shoes"}, search_payload("Trail Runner", "Summit Peak"))
-    stale = memory.last_search.search_id
-    memory.observe(SEARCH_TOOL, {"query": "jackets"}, search_payload("Storm Guard"))
-
-    reference = memory.nth_from_last_search(2, search_id=stale)
-
-    assert reference.result is None
-    assert not reference.resolved
-    assert "search again" in reference.message.lower()
-
-
 def test_an_ordinal_beyond_the_end_of_the_list_says_how_long_it_was():
     memory = ConversationMemory()
     memory.observe(SEARCH_TOOL, {"query": "shoes"}, search_payload("Trail Runner", "Summit Peak"))

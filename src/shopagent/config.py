@@ -124,6 +124,15 @@ class Settings(BaseSettings):
     # Same default, because on one machine they do coincide.
     commerce_api_base_url: str = "http://localhost:8000"
 
+    # --- The agent (D9) ---
+    # Who this CLI is shopping as. It is the primary key of `shopper_profiles`,
+    # and the whole of this project's notion of identity: one profile per
+    # identifier, no sessions, no login. Optional and defaulted to nothing on
+    # purpose — a conversation without a profile is an ordinary conversation,
+    # not a degraded one, and a default here would mean every checkout of this
+    # repository shared one profile with whoever ran it last.
+    shopper_id: OptionalStr = None
+
     # --- Stripe (D7-D8) ---
     # Optional, and deliberately not treated the way `shopagent_api_key` is.
     # That key gates every request, so the API refuses to start without it;

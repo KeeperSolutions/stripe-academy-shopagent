@@ -34,9 +34,11 @@ import sys
 from contextlib import ExitStack
 from dataclasses import dataclass
 
+from shopagent.agent import profile as profiles
 from shopagent.agent.memory import ConversationMemory, RememberingRegistry
-from shopagent.agent.prompt import initial_messages
+from shopagent.agent.prompt import PROFILE_LABELS, initial_messages
 from shopagent.config import get_settings
+from shopagent.db import session_scope
 from shopagent.llm.client import LLMClient, Message, ToolCall
 from shopagent.llm.usage import UsageTracker
 from shopagent.mcp_client.client import MCPToolClient
@@ -60,11 +62,16 @@ MAX_SHOWN_RESULT = 300
 
 HELP = """\
 Commands:
-  /cost    cost and call count for this session
-  /reset   clear the conversation history (cost is kept)
-  /tools   the tools available to the model
-  /help    this list
-  /exit    quit"""
+  /cost              cost and call count for this session
+  /reset             clear the conversation history (cost is kept)
+  /tools             the tools available to the model
+  /profile           what the shop remembers about you between conversations
+  /remember k=v      record one field: display_name, shoe_size, clothing_size,
+                     favourite_categories (from: shoes, jackets, bags,
+                     accessories, equipment)
+  /forget k          clear one field
+  /help              this list
+  /exit              quit"""
 
 
 def _shorten(text: str, limit: int = MAX_SHOWN_RESULT) -> str:
@@ -249,7 +256,9 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
     lifetime: everything below runs inside the `ExitStack` that owns the server.
     """
     registry = setup.registry
-    messages = initial_messages(setup.catalog_available)
+    shopper_id = get_settings().shopper_id
+    profile, profile_note = profiles.load_for_session(shopper_id)
+    messages = initial_messages(setup.catalog_available, profile=profile)
     tools = registry.openai_schemas()
 
     print(
@@ -258,6 +267,10 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
     )
     if setup.note:
         print(f"[{setup.note}]")
+    if profile_note:
+        print(f"[{profile_note}]")
+    if profile is not None:
+        print("[profile loaded; /profile to see it]")
 
     while True:
         try:
@@ -279,8 +292,23 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
             print(tracker.summary())
             continue
         if user_input == "/reset":
-            messages = initial_messages(setup.catalog_available)
+            # The profile is re-read rather than reused, so a `/remember` made
+            # during this session takes effect here. It deliberately does not
+            # take effect mid-conversation: rewriting a system message the
+            # model has already been answering from would change the rules
+            # under it without anything in the transcript saying so.
+            profile, _ = profiles.load_for_session(shopper_id)
+            messages = initial_messages(setup.catalog_available, profile=profile)
             print("[conversation history cleared; session cost is kept]")
+            continue
+        if user_input == "/profile":
+            _show_profile(shopper_id, profile)
+            continue
+        if user_input.startswith("/remember"):
+            _remember(shopper_id, user_input.removeprefix("/remember").strip())
+            continue
+        if user_input.startswith("/forget"):
+            _forget(shopper_id, user_input.removeprefix("/forget").strip())
             continue
         if user_input == "/tools":
             for spec in registry.specs():
@@ -322,6 +350,88 @@ def _print_cost(tracker: UsageTracker, calls_before: int) -> None:
             f"· session ${tracker.total_cost_usd:.6f}]"
         )
 
+
+
+# --- the profile commands (D9, step 4) -----------------------------------
+#
+# A CLI command rather than a tool, and that is the security decision of this
+# step rather than a convenience. A write *tool* would be the eleventh in a
+# list already at ten, and it would be the model deciding what counts as a
+# preference — turning a customer's sentence into stored text, which is
+# precisely the free text this feature is built to not have. A command means a
+# person names the field and the value, and every value is validated against a
+# domain before it can reach a system prompt.
+
+
+def _require_shopper(shopper_id: str | None) -> bool:
+    if shopper_id:
+        return True
+    print(
+        "[no SHOPPER_ID is configured, so there is nothing to remember against. "
+        "Set it in .env — see .env.example.]"
+    )
+    return False
+
+
+def _show_profile(shopper_id: str | None, injected) -> None:
+    """What is stored, and whether the running conversation has it yet.
+
+    Read from the database rather than from the copy loaded at startup: the
+    question `/profile` asks is what the shop remembers, and a `/remember`
+    made a minute ago has changed that. The copy in the prompt is a different
+    thing and deliberately does not move mid-conversation, so the two are
+    reported separately rather than one being passed off as the other.
+    """
+    stored, note = profiles.load_for_session(shopper_id)
+    if note:
+        print(f"[{note}]")
+        return
+    if stored is None:
+        print("[nothing is remembered about you yet; /remember k=v to record something]")
+        return
+
+    for name, label in PROFILE_LABELS.items():
+        value = getattr(stored, name, None)
+        if value:
+            text = ", ".join(value) if isinstance(value, tuple) else value
+            print(f"  {label}: {text}")
+    if stored != injected:
+        print("[this conversation is still running on the profile it started with; "
+              "/reset to pick up the change]")
+
+
+def _remember(shopper_id: str | None, argument: str) -> None:
+    if not _require_shopper(shopper_id):
+        return
+    field_name, separator, value = argument.partition("=")
+    if not separator:
+        print('[usage: /remember field=value, for example /remember shoe_size=42]')
+        return
+    try:
+        with session_scope() as session:
+            profiles.remember(session, shopper_id, field_name.strip(), value.strip())
+    except profiles.ProfileFieldError as refused:
+        # The refusal is read by a person, so it is printed as it was written
+        # rather than turned into a stack trace.
+        print(f"[not recorded: {refused}]")
+    except Exception as exc:  # noqa: BLE001 - a failed write must not end the session
+        print(f"[not recorded: {type(exc).__name__}: {exc}]")
+    else:
+        print(f"[recorded; it reaches the assistant on /reset or the next run]")
+
+
+def _forget(shopper_id: str | None, field_name: str) -> None:
+    if not _require_shopper(shopper_id):
+        return
+    try:
+        with session_scope() as session:
+            profiles.forget(session, shopper_id, field_name.strip())
+    except profiles.ProfileFieldError as refused:
+        print(f"[not cleared: {refused}]")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[not cleared: {type(exc).__name__}: {exc}]")
+    else:
+        print("[cleared; it reaches the assistant on /reset or the next run]")
 
 if __name__ == "__main__":
     main()

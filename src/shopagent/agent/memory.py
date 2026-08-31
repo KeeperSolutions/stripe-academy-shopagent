@@ -74,7 +74,6 @@ VARIANT_ID_KEY = "variant_id"
 class LastSearch:
     """One search, in the order the tool returned it."""
 
-    search_id: int
     tool: str
     arguments: Any
     results: list[dict]
@@ -116,7 +115,6 @@ class ConversationMemory:
 
     _last_search: LastSearch | None = None
     _seen_variant_ids: set[int] = field(default_factory=set)
-    _searches: int = 0
 
     # --- reading ---------------------------------------------------------
 
@@ -134,18 +132,23 @@ class ConversationMemory:
         """
         return frozenset(self._seen_variant_ids)
 
-    def nth_from_last_search(self, position: int, search_id: int | None = None) -> Reference:
+    def nth_from_last_search(self, position: int) -> Reference:
         """The nth row of the most recent search, counting from one.
 
         From one because the customer says "the second one" and means the
         second, and an off-by-one here is not a crash — it is the wrong
         product, bought.
 
-        `search_id` is how a caller says which list it meant. Passing the id of
-        a search that has since been replaced is refused rather than answered
-        from the current list, because those are different lists and only the
-        caller knows it was looking at the older one. Nothing calls this yet;
-        step 5 decides whether an ordinal reaches a tool at all.
+        Only the most recent list can be counted in, and there is no way to ask
+        for an older one. A `search_id` argument existed for one step so a
+        caller could name the list it meant and be refused if that list had
+        been replaced — it came out again because the measurement said the
+        function it was serving does not exist: the model resolves "the second
+        one" from the message history by itself, twice measured, and no tool
+        takes an ordinal. Surface for a caller nobody has is surface to get
+        wrong. It comes back the day step 5 asks for it.
+
+        Nothing calls this yet.
         """
         if self._last_search is None:
             return Reference(
@@ -153,16 +156,6 @@ class ConversationMemory:
                     f"No search has been run in this conversation yet, so there is no "
                     f"list to count in. Call {SEARCH_TOOL} first, then refer to a "
                     f"result from it."
-                )
-            )
-
-        if search_id is not None and search_id != self._last_search.search_id:
-            return Reference(
-                message=(
-                    "That refers to an earlier list of results, which has been "
-                    "replaced by a newer search. Do not guess which product was "
-                    f"meant — search again with {SEARCH_TOOL} and refer to the new "
-                    "results, or ask the customer which product they mean."
                 )
             )
 
@@ -197,9 +190,7 @@ class ConversationMemory:
         self._seen_variant_ids.update(_variant_ids_in(payload))
 
         if tool == SEARCH_TOOL:
-            self._searches += 1
             self._last_search = LastSearch(
-                search_id=self._searches,
                 tool=tool,
                 arguments=arguments,
                 results=list(_results_in(payload)),
