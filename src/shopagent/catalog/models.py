@@ -32,6 +32,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from shopagent.config import get_settings
+
 # Dimension of text-embedding-3-small, the model in `settings.embedding_model`.
 # Hard-coded rather than read from settings: the number is baked into the
 # column type at CREATE TABLE time, so changing the setting later cannot change
@@ -178,10 +180,21 @@ class Price(Base):
     variant_id: Mapped[int] = mapped_column(
         ForeignKey("variants.id", ondelete="CASCADE"), index=True
     )
-    # ISO-4217, lowercase, matching what Stripe sends and expects ("usd").
-    currency: Mapped[str] = mapped_column(String(3), default="usd")
+    # ISO-4217, lowercase, matching what Stripe sends and expects ("eur").
+    #
+    # The default is read from configuration rather than written here. It used
+    # to be the literal "usd", which made the shop's currency two facts that
+    # happened to agree: `CURRENCY` decided what `seed.py` wrote, and this line
+    # decided what any other caller got. Changing one and not the other is a
+    # database holding two currencies with a partial unique index that permits
+    # exactly that — one active price per variant *per currency* — so the same
+    # sku would reach the model twice at two prices, which is the failure the
+    # index exists to prevent and would not catch.
+    currency: Mapped[str] = mapped_column(
+        String(3), default=lambda: get_settings().currency
+    )
     # INTEGER, spelled out rather than inferred, because this is the one column
-    # in the schema where the type is the whole point. Minor units: $89.99 is
+    # in the schema where the type is the whole point. Minor units: €89.99 is
     # 8999. See the module docstring.
     amount_cents: Mapped[int] = mapped_column(Integer)
     active: Mapped[bool] = mapped_column(Boolean, default=True)

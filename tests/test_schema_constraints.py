@@ -361,3 +361,119 @@ def test_migrations_are_numbered_so_their_order_is_readable():
 
     numbers = [path.name[:4] for path in migrations]
     assert len(numbers) == len(set(numbers)), f"duplicate migration numbers: {numbers}"
+
+
+# --- every model module has to be imported, or its table does not exist ---
+
+
+def _modules_declaring_tables():
+    """Modules under `src/shopagent` that define a mapped class.
+
+    Found by walking the AST rather than by importing everything: importing is
+    what this test is checking has been arranged, so an import here would be
+    the test performing the thing it is meant to detect the absence of.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "src" / "shopagent"
+    found = []
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        declares = any(
+            isinstance(node, ast.ClassDef)
+            and any(isinstance(base, ast.Name) and base.id == "Base" for base in node.bases)
+            for node in ast.walk(tree)
+        )
+        if declares:
+            found.append(".".join(path.relative_to(root.parent).with_suffix("").parts))
+    return found
+
+
+def _modules_imported_by(source: str) -> set[str]:
+    """Every module one file imports, whichever spelling it used.
+
+    `import a.b.c` and `from a.b import c` name the same module and share no
+    substring, which is why this reads the AST instead of the text: the first
+    version of this test matched on the dotted path and failed against every
+    existing import in the repository, all of which use the second form.
+    """
+    import ast
+
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            found.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            found.add(node.module)
+            found.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return found
+
+
+@pytest.mark.parametrize("importer", ["scripts/create_schema.py", "tests/conftest.py"])
+def test_every_model_module_is_imported_where_the_schema_is_built(importer):
+    """A table joins `Base.metadata` when its class is imported, and not before.
+
+    CLAUDE.md states this and both call sites already import
+    `shopagent.api.models` for the side effect alone. D9 added a third module —
+    `agent/profile.py` — and the cost of forgetting it is the failure that rule
+    warns about: a schema that looks complete until the first missing relation,
+    with `create_all` cheerfully reporting every table it *did* know about as
+    present.
+
+    Enforced by reading the file rather than by remembering, the same way
+    `test_lifecycle.py` walks the AST to prove nothing calls `transition()`
+    outside `apply_transition`. A fourth model module fails this test on the
+    day it is written.
+    """
+    import pathlib
+
+    source = (pathlib.Path(__file__).resolve().parents[1] / importer).read_text()
+    imported = _modules_imported_by(source)
+    modules = _modules_declaring_tables()
+
+    assert modules, "no model modules found — the AST walk is broken, not the imports"
+    for module in modules:
+        assert module in imported, (
+            f"{importer} does not import {module}, so the tables it declares "
+            f"are absent from Base.metadata when the schema is built"
+        )
+
+
+def test_the_recorded_migration_creates_the_table_day_9_added():
+    """`shopper_profiles` holds what a person typed about themselves.
+
+    No script regenerates it, so it is on the commerce side of the line and
+    needs a recorded change like every other table there.
+    """
+    import pathlib
+
+    migrations = pathlib.Path(__file__).resolve().parents[1] / "migrations"
+    sql = "\n".join(path.read_text() for path in migrations.glob("*.sql"))
+
+    assert "CREATE TABLE IF NOT EXISTS shopper_profiles" in sql
+
+
+def test_the_day_9_migration_and_the_model_declare_the_same_columns():
+    """Two artifacts describing one table, kept from drifting apart.
+
+    Same check as `0002`, and it matters more here: every width in that file is
+    part of an argument about what can be written into a system prompt, so a
+    column the model declares and the migration does not create is a column
+    that exists with different rules depending on when the database was built.
+    """
+    import pathlib
+
+    from shopagent.agent.profile import ShopperProfile
+
+    sql = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "migrations"
+        / "0003_d9_shopper_profiles.sql"
+    ).read_text()
+
+    for column in ShopperProfile.__table__.columns:
+        assert column.name in sql, (
+            f"the model declares shopper_profiles.{column.name} and migration "
+            "0003 does not create it"
+        )

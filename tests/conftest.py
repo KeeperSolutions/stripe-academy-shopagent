@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 # shared `Base.metadata`, the same reason `scripts/create_schema.py` imports
 # it. Without this the `engine` fixture creates the catalog's four tables and
 # none of D6's, and every commerce test fails on a missing relation.
+from shopagent.agent import profile as agent_profile  # noqa: F401
 from shopagent.api import models as commerce_models  # noqa: F401
 from shopagent.catalog.models import Base
 from shopagent.db import ensure_vector_extension, get_engine

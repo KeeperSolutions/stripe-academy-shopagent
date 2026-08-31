@@ -33,7 +33,10 @@ from shopagent.mcp_client.registration import register_mcp_tools
 from shopagent.tools.basic import REGISTRY as BASIC_REGISTRY
 from shopagent.tools.registry import ToolRegistry, ToolSpec
 
-EXPECTED_TOOLS = {"ping", "search_products", "get_product_details", "check_stock"}
+# `ping` left the server's advertised list on D9 — see MCP_EXPOSE_PING. This
+# set is what a client actually receives, so it follows the server rather
+# than naming what the client would like to see.
+EXPECTED_TOOLS = {"search_products", "get_product_details", "check_stock"}
 
 
 # --- stand-ins, so the adapter is tested against tools it has never seen ---
@@ -273,8 +276,15 @@ def test_an_unknown_product_id_comes_back_as_an_error(client):
 
 @pytest.mark.db
 def test_a_successful_call_is_not_reported_as_an_error(client):
-    """The other half of the flag, so `is_error` is not trivially always true."""
-    assert is_error(client.call_tool("ping", {})) is False
+    """The other half of the flag, so `is_error` is not trivially always true.
+
+    A category browse rather than the `ping` this used before D9 stopped
+    advertising it. No `query`, so nothing is embedded and the call is free —
+    the trap the module docstring in `test_mcp_server.py` names.
+    """
+    result = client.call_tool("search_products", {"category": "shoes", "limit": 1})
+
+    assert is_error(result) is False
 
 
 @pytest.mark.db
@@ -533,13 +543,12 @@ def registry_with_everything(client):
 
 @pytest.mark.db
 def test_the_registry_offers_local_and_remote_tools_together(registry_with_everything):
-    """Six schemas, and the loop cannot tell which two came from a pipe."""
+    """Five schemas, and the loop cannot tell which three came from a pipe."""
     schemas = registry_with_everything.openai_schemas()
 
     assert [entry["function"]["name"] for entry in schemas] == [
         "get_time",
         "calculator",
-        "ping",
         "search_products",
         "get_product_details",
         "check_stock",

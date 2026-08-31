@@ -24,6 +24,19 @@ pip install -r requirements.txt
 
 # 3. env
 cp .env.example .env     # .env is never committed; fill in your keys locally
+#
+# OPENAI_API_KEY and SHOPAGENT_API_KEY are required — nothing starts without
+# them. Three that D9 added, all optional:
+#   COMMERCE_API_BASE_URL   where the agent's cart tools reach the API.
+#                           Defaults to http://localhost:8000; separate from
+#                           APP_BASE_URL, which is the public URL Stripe
+#                           redirects a browser to.
+#   SHOPPER_ID              who the CLI shops as, and the key of the profile it
+#                           remembers between conversations. Blank means no
+#                           long-term memory, which is not an error.
+#   CURRENCY                the shop's currency, `eur` by default. Changing it
+#                           after seeding means a reseed: `prices` rows carry
+#                           the currency they were written with.
 
 # 4. database (Postgres 16 + pgvector)
 docker compose up -d
@@ -47,7 +60,7 @@ python scripts/create_schema.py   # exits 2 if a column or foreign key is missin
 # 7. verify
 docker compose exec db psql -U shopagent -d shopagent \
   -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
-pytest tests/ -v          # 732 tests; add -m network for the 4 that call the API
+pytest tests/ -v          # 932 tests; add -m network for the ones that cost money
 ```
 
 Step 6 matters on any database that predates a schema change: `create_all`
@@ -68,11 +81,27 @@ is preserved.
 
 ## Commands
 
+**The agent needs the commerce API running.** Since D9 the CLI carries cart
+and checkout tools that reach `uvicorn` over HTTP, so start the API in another
+terminal before the agent. Without it the catalog still works and the cart
+tools answer the model with an explanation rather than a traceback, which is
+deliberate — but nothing can be bought.
+
 ```bash
-# the agent
-python -m shopagent.llm.loop            # CLI agent: local tools + the MCP catalog
+# the agent (start `uvicorn` first, see below)
+python -m shopagent.llm.loop            # CLI agent: 10 tools
 MCP_CATALOG_ENABLED=false \
-  python -m shopagent.llm.loop          # same CLI, local tools only, no server
+  python -m shopagent.llm.loop          # same CLI without the catalog: 7 tools
+
+# inside the agent
+#   /tools            the tools the model can call
+#   /profile          what the shop remembers about you between conversations
+#   /remember k=v     record one field: display_name, shoe_size, clothing_size,
+#                     favourite_categories (shoes, jackets, bags, accessories,
+#                     equipment). Needs SHOPPER_ID set.
+#   /forget k         clear one field
+#   /reset            clear the history and re-read the profile
+#   /cost             tokens and dollars for this session
 
 # the catalog MCP server on its own
 python scripts/run_mcp_server.py        # serves on stdio; the agent starts this itself
@@ -106,8 +135,9 @@ python scripts/seed_catalog.py          # 30 products; --reset to rebuild
 python scripts/embed_catalog.py         # vectors + HNSW index; --force to redo
 
 # tests
-pytest tests/ -v                        # 732, offline and database
-pytest tests/ -m network                # the 4 that call the API and cost money
+pytest tests/ -v                        # 932, offline and database
+pytest tests/ -m network                # the 4 embedding tests and the 3 chain runs;
+                                        # these cost money and need uvicorn running
 pytest tests/ -m stripe                 # the 16 that call Stripe in test mode (free)
 ```
 

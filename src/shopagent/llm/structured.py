@@ -1,13 +1,13 @@
 """Turning free text into a validated catalogue query (D2, used from D3).
 
-The user says "running shoes under $100 in size 42"; `catalog/search.py` on D3
+The user says "running shoes under €100 in size 42"; `catalog/search.py` on D3
 wants `keywords`, `category`, `max_price_cents` and `size` as typed fields.
 This module is the seam between the two, and it is a real parser rather than a
 demonstration — D3 and D9 call it.
 
 Two rules it exists to enforce:
 
-**Money is an integer number of cents, converted exactly once.** "under $100"
+**Money is an integer number of cents, converted exactly once.** "under €100"
 becomes `10000`, never `100` and never `100.0`. The rule is stated in the
 system prompt below and enforced by the model's own strict field type, so no
 other module has to know that dollars were ever involved. A float here is a
@@ -25,7 +25,19 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
+from shopagent.config import get_settings
 from shopagent.llm.client import LLMClient, Message
+from shopagent.money import format_amount
+
+# Worked examples generated from the shop's currency rather than typed against
+# it. These sentences say what a price bound means, and they said "dollars" for
+# a week after the shop moved to EUR — a unit the model is taught wrongly is a
+# search it runs wrongly, silently. Same idiom as `agent/prompt.py` and
+# `mcp_server/server.py`. Raised in review on PR #9.
+_CURRENCY = get_settings().currency
+_HUNDRED = format_amount(10000, _CURRENCY)
+_FORTY_NINE_NINETY_NINE = format_amount(4999, _CURRENCY)
+_TWENTY = format_amount(2000, _CURRENCY)
 
 # Only two of these are actually enforced by the API today — a schema missing
 # `additionalProperties: false` is rejected with "Invalid schema for
@@ -51,7 +63,7 @@ class ProductQuery(BaseModel):
             "The words to search the catalogue with. The search matches on this "
             "list, so an empty list finds nothing. Include the product noun "
             "itself, even when that same word also fills the category field: "
-            "'blue jacket under $80' is ['jacket'], not []. When the text "
+            "'blue jacket under €80' is ['jacket'], not []. When the text "
             "describes what is wanted without naming a product, use the "
             "describing words: 'something warm for winter' is "
             "['warm', 'winter']. Leave out prices, sizes and colours, which "
@@ -71,9 +83,10 @@ class ProductQuery(BaseModel):
         strict=True,
         ge=0,
         description=(
-            "Upper price bound as a whole number of CENTS, never dollars and "
-            "never a decimal: '$100' is 10000, '$49.99' is 4999. Null if the "
-            "user set no upper bound."
+            "Upper price bound as a whole number of CENTS, never whole "
+            f"{_CURRENCY.upper()} and never a decimal: '{_HUNDRED}' is 10000, "
+            f"'{_FORTY_NINE_NINETY_NINE}' is 4999. Null if the user set no "
+            "upper bound."
         ),
     )
     min_price_cents: int | None = Field(
@@ -138,9 +151,10 @@ SYSTEM_PROMPT = (
     "Fill only what the text actually states. Any field the text does not "
     "state is null — never guess a category, colour or size, and never use 0 "
     "for a price that was not mentioned, because 0 means free. "
-    "Prices are whole numbers of CENTS, never dollars and never decimals: "
-    "'under $100' is max_price_cents 10000, '$49.99' is 4999, "
-    "'at least $20' is min_price_cents 2000."
+    f"Prices are whole numbers of CENTS, never whole {_CURRENCY.upper()} and "
+    f"never decimals: 'under {_HUNDRED}' is max_price_cents 10000, "
+    f"'{_FORTY_NINE_NINETY_NINE}' is 4999, "
+    f"'at least {_TWENTY}' is min_price_cents 2000."
 )
 
 

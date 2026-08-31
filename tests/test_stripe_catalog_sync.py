@@ -17,9 +17,20 @@ import uuid
 
 import pytest
 
+from shopagent.config import get_settings
 from shopagent.catalog.models import Inventory, Price, Product, Variant
 from shopagent.payments import catalog_sync, stripe_svc
 from shopagent.payments.catalog_sync import build_plan, run_sync
+
+
+# The shop's currency, read rather than written. A test that creates a price
+# row in a literal currency and then asks a service to find it is testing its
+# own literal: the service filters on `settings.currency`, so the two have to
+# agree by construction, and the day they stopped agreeing is the day 125 of
+# them failed at once. What a specific currency *is* still gets pinned, in the
+# tests that are actually about that — `format_amount`, and the two that prove
+# a foreign currency is treated as foreign.
+CURRENCY = get_settings().currency
 
 
 def make_product(
@@ -29,7 +40,7 @@ def make_product(
     name: str = "Sync Fixture",
     amount_cents: int = 4200,
     active: bool = True,
-    currency: str = "usd",
+    currency: str = CURRENCY,
 ) -> Product:
     product = Product(
         name=f"{name} {sku}",
@@ -75,7 +86,7 @@ def test_a_local_product_maps_onto_the_stripe_fields(session):
     (price,) = prices
     # The whole point of storing minor units since D3: no conversion here.
     assert price.amount_cents == 9950
-    assert price.currency == "usd"
+    assert price.currency == CURRENCY
     assert price.sku == "SYNC-MAP"
 
 
@@ -86,7 +97,7 @@ def test_an_inactive_price_is_not_what_gets_synced(session):
     session.add(
         Price(
             variant_id=product.variants[0].id,
-            currency="usd",
+            currency=CURRENCY,
             amount_cents=9999,
             active=False,
         )
@@ -119,12 +130,20 @@ def test_a_variant_with_no_active_price_is_skipped_and_reported(session):
 
 @pytest.mark.db
 def test_a_price_in_another_currency_does_not_count(session):
-    product = make_product(session, sku="SYNC-EUR", currency="eur")
+    """A currency that is not the shop's, whatever the shop's happens to be.
+
+    This said `eur` until D9, when `eur` became the shop's own currency and the
+    test would have asserted the reverse of its name — passing or failing for a
+    reason unrelated to the rule. `gbp` is foreign to both, and the assertion
+    below is what makes that explicit rather than assumed.
+    """
+    assert CURRENCY != "gbp", "this test needs a currency the shop does not use"
+    product = make_product(session, sku="SYNC-GBP", currency="gbp")
 
     plan = build_plan(session)
 
     assert not [p for p in plan.prices if p.product_id == product.id]
-    assert any(s.sku == "SYNC-EUR" for s in plan.skipped)
+    assert any(s.sku == "SYNC-GBP" for s in plan.skipped)
 
 
 @pytest.mark.db
@@ -288,13 +307,13 @@ def test_creating_a_product_and_price_in_test_mode_and_cleaning_up():
         price = stripe_svc.create_price(
             product_id=product.id,
             unit_amount_cents=4242,
-            currency="usd",
+            currency=CURRENCY,
             sku=f"TEST-{marker}",
             idempotency_key=f"shopagent-test-price-{marker}",
         )
         assert price.id.startswith("price_")
         assert price.unit_amount == 4242
-        assert price.currency == "usd"
+        assert price.currency == CURRENCY
         assert price.product == product.id
         assert price.livemode is False
 

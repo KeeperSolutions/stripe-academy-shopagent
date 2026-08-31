@@ -1,7 +1,14 @@
-"""The catalog MCP server (D4).
+"""The catalog MCP server (D4, narrowed on D9).
 
-Four tools: a diagnostic `ping` and three thin wrappers over
-`catalog/search.py`. No search logic lives here — no filtering, no SQL, no
+Three tools, all thin wrappers over `catalog/search.py`, and a fourth the
+server keeps to itself. `ping` is a diagnostic with no business meaning, and
+D5 recorded the cost of advertising it: it sat in the model's tool list beside
+the three that mean something, and the list is what the model reads to work
+out what it can do. The same entry named the only place the fix belongs —
+here, by not publishing it, rather than in a name check inside `mcp_client/`,
+which registers whatever a server lists and must go on doing so. It is still a
+tool, still callable, and `MCP_EXPOSE_PING=true` puts it back in `tools/list`
+for whoever is debugging. No search logic lives here — no filtering, no SQL, no
 reshaping of an individual product. Every question about *what* the catalog
 returns is settled in `catalog/`, which is what lets D5 swap the transport
 without touching search.
@@ -57,6 +64,19 @@ from pydantic import Field
 
 from shopagent.catalog import search as catalog
 from shopagent.config import get_settings
+from shopagent.money import format_amount
+
+# The shop's currency, worked into the two price descriptions below rather than
+# spelled into them. Those sentences are the contract the model reads for what
+# a price bound means, and one of them still said "one dollar" a week after the
+# shop moved to EUR — a stale unit in a bound is a wrong search the model has
+# no way to notice. Generated the same way `agent/prompt.py` generates its own
+# worked example, for the same reason. Raised in review on PR #9.
+_CURRENCY = get_settings().currency
+_ONE_MAJOR_UNIT = format_amount(100, _CURRENCY)
+_HUNDRED = format_amount(10000, _CURRENCY)
+_FORTY_NINE_NINETY_NINE = format_amount(4999, _CURRENCY)
+_FIFTY = format_amount(5000, _CURRENCY)
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +291,7 @@ def _reject_impossible_price_range(min_price_cents: int | None, max_price_cents:
         if value is not None and value < 0:
             raise ValueError(
                 f"{field} was {value}, but a price cannot be negative. Prices are "
-                f"in cents, so $100 is 10000 and $49.99 is 4999. Re-send with a "
+                f"in cents, so €100 is 10000 and €49.99 is 4999. Re-send with a "
                 f"value of 0 or more, or leave {field} out to search without that "
                 f"bound."
             )
@@ -285,7 +305,6 @@ def _reject_impossible_price_range(min_price_cents: int | None, max_price_cents:
         )
 
 
-@server.tool()
 def ping() -> str:
     """Check that the catalog server is reachable.
 
@@ -298,8 +317,18 @@ def ping() -> str:
 
     Returns the string "pong". It says nothing whatsoever about the catalog,
     and a successful call is not evidence that any product exists.
+
+    **Not registered by default** — see MCP_EXPOSE_PING and this module's
+    docstring. The switch decides one `add_tool` call below, which is also why
+    turning it on is not a different code path: the tool a debugger reaches is
+    the same object, registered the same way, and the only thing that changed
+    is whether the model was told about it.
     """
     return "pong"
+
+
+if get_settings().mcp_expose_ping:
+    server.add_tool(ping)
 
 
 @server.tool()
@@ -337,8 +366,9 @@ def search_products(
         int | None,
         Field(
             description=(
-                "Upper price bound in CENTS, not dollars. $100 is 10000, $49.99 "
-                "is 4999. Passing 100 here means one dollar and will match "
+                f"Upper price bound in CENTS, not whole {_CURRENCY.upper()}. "
+                f"{_HUNDRED} is 10000, {_FORTY_NINE_NINETY_NINE} is 4999. "
+                f"Passing 100 here means {_ONE_MAJOR_UNIT} and will match "
                 "nothing. Must be 0 or more. Applies to the variant price, so a "
                 "product is returned when at least one of its variants is within "
                 "the bound."
@@ -349,7 +379,8 @@ def search_products(
         int | None,
         Field(
             description=(
-                "Lower price bound in CENTS, not dollars. $50 is 5000. Must be 0 "
+                f"Lower price bound in CENTS, not whole {_CURRENCY.upper()}. "
+                f"{_FIFTY} is 5000. Must be 0 "
                 "or more, and not greater than max_price_cents. Use it only when "
                 'the shopper asked for a floor; it is not needed to express "cheap".'
             )

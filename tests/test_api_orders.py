@@ -25,9 +25,20 @@ import pytest
 from sqlalchemy import event, func, select
 from sqlalchemy.engine import Engine
 
+from shopagent.config import get_settings
 from shopagent.api.models import Cart, CartStatus, Order, OrderItem
 from shopagent.api.services import orders as order_service
 from shopagent.catalog.models import Inventory, Price, Product, Variant
+
+
+# The shop's currency, read rather than written. A test that creates a price
+# row in a literal currency and then asks a service to find it is testing its
+# own literal: the service filters on `settings.currency`, so the two have to
+# agree by construction, and the day they stopped agreeing is the day 125 of
+# them failed at once. What a specific currency *is* still gets pinned, in the
+# tests that are actually about that — `format_amount`, and the two that prove
+# a foreign currency is treated as foreign.
+CURRENCY = get_settings().currency
 
 pytestmark = pytest.mark.db
 
@@ -54,7 +65,7 @@ def make_variant(
                 size="42",
                 color="blue",
                 sku=sku,
-                prices=[Price(currency="usd", amount_cents=amount_cents, active=True)],
+                prices=[Price(currency=CURRENCY, amount_cents=amount_cents, active=True)],
                 inventory=Inventory(quantity=quantity, reserved=reserved),
             )
         ],
@@ -125,7 +136,7 @@ def test_placing_an_order_is_201_and_mirrors_the_cart(authed_client, session):
     body = response.json()
     assert body["cart_id"] == cart_id
     assert body["status"] == "pending"
-    assert body["currency"] == "usd"
+    assert body["currency"] == CURRENCY
     assert body["created_at"]
     assert uuid.UUID(body["order_id"])
 
@@ -278,7 +289,7 @@ def test_the_order_keeps_the_name_and_price_it_was_placed_at(authed_client, sess
         .values(active=False)
     )
     session.add(
-        Price(variant_id=variant.id, currency="usd", amount_cents=1, active=True)
+        Price(variant_id=variant.id, currency=CURRENCY, amount_cents=1, active=True)
     )
     session.commit()
 

@@ -23,6 +23,7 @@ from sqlalchemy.exc import OperationalError
 # `Base.metadata` when its class is defined, so `create_all` builds only what
 # has been imported. Importing `Base` alone would silently create the four
 # catalog tables and none of the commerce ones.
+from shopagent.agent import profile as agent_profile  # noqa: F401
 from shopagent.api import models as commerce_models  # noqa: F401
 from shopagent.catalog import models as catalog_models  # noqa: F401
 from shopagent.catalog.models import Base

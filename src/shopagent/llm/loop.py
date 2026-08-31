@@ -13,6 +13,11 @@ deltas is bookkeeping that would obscure the chaining this file is meant to
 show. `LLMClient.stream_chat` is unchanged and still works; it is simply not
 what the CLI drives now.
 
+D9 took the system prompt out to `agent/prompt.py`. This file is a mechanism
+— a `while`, a message list, a dispatch — and what it says to the model is
+policy; keeping them apart is what lets a sentence about quoting prices be
+edited without opening the loop that D2 and D5 both claimed had not changed.
+
 D5 added the catalog, and the shape of that change is the point. `run_tool_loop`
 below is byte-for-byte what D2 left: it takes a registry and a list of schemas
 and does not care where either came from. Everything D5 needed happens before
@@ -26,49 +31,24 @@ either paid off or did not.
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 
+from shopagent.agent import profile as profiles
+from shopagent.agent.guardrails import GuardedClient, GuardedRegistry
+from shopagent.agent.memory import ConversationMemory
+from shopagent.agent.prompt import PROFILE_LABELS, initial_messages
 from shopagent.config import get_settings
+from shopagent.db import session_scope
 from shopagent.llm.client import LLMClient, Message, ToolCall
 from shopagent.llm.usage import UsageTracker
 from shopagent.mcp_client.client import MCPToolClient
 from shopagent.mcp_client.registration import register_mcp_tools
 from shopagent.tools.basic import REGISTRY
+from shopagent.tools.commerce import register_commerce_tools
+from shopagent.tools.http import CommerceAPI
 from shopagent.tools.registry import ToolRegistry, ToolResult
-
-SYSTEM_PROMPT = (
-    "You are ShopAgent, an online shopping assistant. "
-    "Always reply in English, regardless of the language of the question. "
-    "Keep answers short and concrete, with no preamble and no restating of "
-    "the question. If you do not know something or lack the data, say so "
-    "plainly — never guess. "
-    "Use the tools for anything they cover: you have no clock, so never state "
-    "a time from memory, and never do arithmetic in your head."
-)
-
-# What the catalog tools are for, not how they work. Each one already carries a
-# description written for a model to read, and repeating that here would give
-# the same contract two authors and let them drift. This says only when to
-# reach for them, and what is never allowed to come from memory.
-CATALOG_PROMPT = (
-    " The product catalogue is available through tools. Every product name, "
-    "price, size, colour and stock level you state must have come from a tool "
-    "result in this conversation — never from memory, and never inferred from "
-    "what a product sounds like. When the user asks about products, search "
-    "first and answer from what comes back. If a search returns a count of 0, "
-    "say plainly that nothing matched and suggest a broader search; do not "
-    "offer a product that was not in a result."
-)
-
-# Said when the catalog server could not be reached, so the model does not
-# apologise for its own memory when the real answer is that a tool is missing.
-NO_CATALOG_PROMPT = (
-    " The product catalogue is NOT available in this session: the tools that "
-    "search it could not be loaded. If the user asks about products, prices or "
-    "stock, say the catalogue is unavailable right now. Do not answer from "
-    "memory and do not invent products."
-)
 
 # One user input may legitimately need several rounds: a tool call, a look at
 # the result, another call. Eight leaves room for the D9 chain (search, check
@@ -84,16 +64,16 @@ MAX_SHOWN_RESULT = 300
 
 HELP = """\
 Commands:
-  /cost    cost and call count for this session
-  /reset   clear the conversation history (cost is kept)
-  /tools   the tools available to the model
-  /help    this list
-  /exit    quit"""
-
-
-def _initial_messages(catalog_available: bool = True) -> list[Message]:
-    extra = CATALOG_PROMPT if catalog_available else NO_CATALOG_PROMPT
-    return [{"role": "system", "content": SYSTEM_PROMPT + extra}]
+  /cost              cost and call count for this session
+  /reset             clear the conversation history (cost is kept)
+  /tools             the tools available to the model
+  /profile           what the shop remembers about you between conversations
+  /remember k=v      record one field: display_name, shoe_size, clothing_size,
+                     favourite_categories (from: shoes, jackets, bags,
+                     accessories, equipment)
+  /forget k          clear one field
+  /help              this list
+  /exit              quit"""
 
 
 def _shorten(text: str, limit: int = MAX_SHOWN_RESULT) -> str:
@@ -178,6 +158,12 @@ class ToolSetup:
     registry: ToolRegistry
     catalog_available: bool
     note: str | None = None
+    # Everything this conversation holds outside its message list (D9, step
+    # 3): the cart and order ids the model is never shown, the last search in
+    # the order it came back, and every variant id that has appeared in a
+    # result. Exposed here because the CLI and the tests are the only things
+    # that can see it — nothing is put in front of the model.
+    memory: ConversationMemory | None = None
 
 
 def build_tool_setup(
@@ -185,6 +171,7 @@ def build_tool_setup(
     *,
     catalog_enabled: bool | None = None,
     client_factory: type[MCPToolClient] = MCPToolClient,
+    confirm: Callable[[str], bool] | None = None,
 ) -> ToolSetup:
     """Assemble the registry this session will use.
 
@@ -199,9 +186,29 @@ def build_tool_setup(
 
     `client_factory` exists so a test can inject a client that fails to start.
     """
-    registry = ToolRegistry()
+    # The registry is the one thing every tool call passes through, which is
+    # what makes it the place a conversation's memory is filled: nothing in the
+    # loop has to remember to record anything, and a tool added later is
+    # remembered because of where it is registered rather than because whoever
+    # added it knew to.
+    memory = ConversationMemory()
+    registry = GuardedRegistry(memory, confirm=confirm)
     for spec in REGISTRY.specs():
         registry.register(spec)
+
+    # The commerce tools go in unconditionally, and before the catalog is even
+    # considered. They reach a different service over a different protocol, so
+    # `MCP_CATALOG_ENABLED` has no business deciding whether a cart exists —
+    # and a session that can list a basket but not search is a comprehensible
+    # state, where a switch that turned off both would make one failure look
+    # like the other.
+    #
+    # Nothing here can fail the way the catalog can: building the client opens
+    # no connection, so an API that is down is discovered at the first call and
+    # answered by the tool itself, in words written for the model. The stack
+    # owns the client for the same reason it owns the MCP subprocess — whatever
+    # ends the session closes the sockets.
+    register_commerce_tools(registry, stack.enter_context(CommerceAPI()), memory)
 
     if catalog_enabled is None:
         catalog_enabled = get_settings().mcp_catalog_enabled
@@ -210,6 +217,7 @@ def build_tool_setup(
         return ToolSetup(
             registry=registry,
             catalog_available=False,
+            memory=memory,
             note="catalog disabled (MCP_CATALOG_ENABLED=false)",
         )
 
@@ -224,10 +232,11 @@ def build_tool_setup(
         return ToolSetup(
             registry=registry,
             catalog_available=False,
+            memory=memory,
             note=f"catalog unavailable ({type(exc).__name__}: {exc})",
         )
 
-    return ToolSetup(registry=registry, catalog_available=True)
+    return ToolSetup(registry=registry, catalog_available=True, memory=memory)
 
 
 def main() -> None:
@@ -239,7 +248,7 @@ def main() -> None:
         raise SystemExit(1) from exc
 
     with ExitStack() as stack:
-        setup = build_tool_setup(stack)
+        setup = build_tool_setup(stack, confirm=_ask_to_confirm)
         _run_session(client, tracker, setup)
 
 
@@ -250,7 +259,14 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
     lifetime: everything below runs inside the `ExitStack` that owns the server.
     """
     registry = setup.registry
-    messages = _initial_messages(setup.catalog_available)
+    # The client is wrapped, not replaced: `run_tool_loop` below is the
+    # unmodified D2 function and still takes a client, a registry, a message
+    # list and a list of schemas. What changed is that one of those four checks
+    # the answer before handing it back.
+    client = GuardedClient(client, setup.memory)
+    shopper_id = get_settings().shopper_id
+    profile, profile_note = profiles.load_for_session(shopper_id)
+    messages = initial_messages(setup.catalog_available, profile=profile)
     tools = registry.openai_schemas()
 
     print(
@@ -259,6 +275,10 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
     )
     if setup.note:
         print(f"[{setup.note}]")
+    if profile_note:
+        print(f"[{profile_note}]")
+    if profile is not None:
+        print("[profile loaded; /profile to see it]")
 
     while True:
         try:
@@ -280,8 +300,23 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
             print(tracker.summary())
             continue
         if user_input == "/reset":
-            messages = _initial_messages(setup.catalog_available)
+            # The profile is re-read rather than reused, so a `/remember` made
+            # during this session takes effect here. It deliberately does not
+            # take effect mid-conversation: rewriting a system message the
+            # model has already been answering from would change the rules
+            # under it without anything in the transcript saying so.
+            profile, _ = profiles.load_for_session(shopper_id)
+            messages = initial_messages(setup.catalog_available, profile=profile)
             print("[conversation history cleared; session cost is kept]")
+            continue
+        if user_input == "/profile":
+            _show_profile(shopper_id, profile)
+            continue
+        if user_input.startswith("/remember"):
+            _remember(shopper_id, user_input.removeprefix("/remember").strip())
+            continue
+        if user_input.startswith("/forget"):
+            _forget(shopper_id, user_input.removeprefix("/forget").strip())
             continue
         if user_input == "/tools":
             for spec in registry.specs():
@@ -306,10 +341,34 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
             print(f"\n[error] {type(exc).__name__}: {exc}")
             del messages[history_length:]
 
+        # After the answer, and outside the try: a tool that ran before a
+        # failure still placed the order, and the customer still needs its
+        # payment page.
+        _print_payment_link(setup.memory)
         _print_cost(tracker, calls_before)
 
     print()
     print(tracker.summary())
+
+
+def _print_payment_link(memory: ConversationMemory | None) -> None:
+    """Show the Stripe payment page, in the bytes the shop issued.
+
+    Printed here rather than relayed by the model, and the difference is not
+    stylistic. A Checkout Session URL is 475 opaque characters; asked twice for
+    the same session, the model reproduced it once and changed one character
+    the second time, which Stripe answers with a 401. The customer sees a
+    payment page that does not work and has nothing to compare it against.
+
+    So the link never enters the conversation: `tools/commerce.py` puts it on
+    the memory and this prints it. The same answer D9 gave for `cart_id`, for
+    the same reason, and it is code rather than an instruction to copy
+    carefully — which the model could not have followed reliably anyway.
+    """
+    url = memory.take_checkout_url() if memory is not None else None
+    if url:
+        print("\n  Pay here:")
+        print(f"  {url}")
 
 
 def _print_cost(tracker: UsageTracker, calls_before: int) -> None:
@@ -323,6 +382,114 @@ def _print_cost(tracker: UsageTracker, calls_before: int) -> None:
             f"· session ${tracker.total_cost_usd:.6f}]"
         )
 
+
+
+def _ask_to_confirm(summary: str) -> bool:
+    """Show what is being bought and wait for a person to answer (D9, step 5).
+
+    The summary comes from `agent/guardrails.py`, which built it from a real
+    `view_cart` or `check_order_status` call — not from anything the model
+    said. This function only prints it and reads a line.
+
+    Anything that is not an explicit yes is a no, including end-of-input. A
+    piped session, a closed terminal or a stray newline must not buy anything:
+    the safe answer to "could not ask" is the same as the answer to "they said
+    no", and it is the only one that cannot cost somebody money.
+    """
+    # The heading is part of the summary now, not printed here: `create_checkout`
+    # can be placing an order or fetching the payment link of one already
+    # placed, and only `agent/guardrails.py` knows which. A heading fixed in
+    # this function said "About to place this order" over both.
+    print()
+    print(summary)
+    try:
+        answer = input("  Place the order? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  [not confirmed]")
+        return False
+    return answer in {"y", "yes"}
+
+
+# --- the profile commands (D9, step 4) -----------------------------------
+#
+# A CLI command rather than a tool, and that is the security decision of this
+# step rather than a convenience. A write *tool* would be the eleventh in a
+# list already at ten, and it would be the model deciding what counts as a
+# preference — turning a customer's sentence into stored text, which is
+# precisely the free text this feature is built to not have. A command means a
+# person names the field and the value, and every value is validated against a
+# domain before it can reach a system prompt.
+
+
+def _require_shopper(shopper_id: str | None) -> bool:
+    if shopper_id:
+        return True
+    print(
+        "[no SHOPPER_ID is configured, so there is nothing to remember against. "
+        "Set it in .env — see .env.example.]"
+    )
+    return False
+
+
+def _show_profile(shopper_id: str | None, injected) -> None:
+    """What is stored, and whether the running conversation has it yet.
+
+    Read from the database rather than from the copy loaded at startup: the
+    question `/profile` asks is what the shop remembers, and a `/remember`
+    made a minute ago has changed that. The copy in the prompt is a different
+    thing and deliberately does not move mid-conversation, so the two are
+    reported separately rather than one being passed off as the other.
+    """
+    stored, note = profiles.load_for_session(shopper_id)
+    if note:
+        print(f"[{note}]")
+        return
+    if stored is None:
+        print("[nothing is remembered about you yet; /remember k=v to record something]")
+        return
+
+    for name, label in PROFILE_LABELS.items():
+        value = getattr(stored, name, None)
+        if value:
+            text = ", ".join(value) if isinstance(value, tuple) else value
+            print(f"  {label}: {text}")
+    if stored != injected:
+        print("[this conversation is still running on the profile it started with; "
+              "/reset to pick up the change]")
+
+
+def _remember(shopper_id: str | None, argument: str) -> None:
+    if not _require_shopper(shopper_id):
+        return
+    field_name, separator, value = argument.partition("=")
+    if not separator:
+        print('[usage: /remember field=value, for example /remember shoe_size=42]')
+        return
+    try:
+        with session_scope() as session:
+            profiles.remember(session, shopper_id, field_name.strip(), value.strip())
+    except profiles.ProfileFieldError as refused:
+        # The refusal is read by a person, so it is printed as it was written
+        # rather than turned into a stack trace.
+        print(f"[not recorded: {refused}]")
+    except Exception as exc:  # noqa: BLE001 - a failed write must not end the session
+        print(f"[not recorded: {type(exc).__name__}: {exc}]")
+    else:
+        print(f"[recorded; it reaches the assistant on /reset or the next run]")
+
+
+def _forget(shopper_id: str | None, field_name: str) -> None:
+    if not _require_shopper(shopper_id):
+        return
+    try:
+        with session_scope() as session:
+            profiles.forget(session, shopper_id, field_name.strip())
+    except profiles.ProfileFieldError as refused:
+        print(f"[not cleared: {refused}]")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[not cleared: {type(exc).__name__}: {exc}]")
+    else:
+        print("[cleared; it reaches the assistant on /reset or the next run]")
 
 if __name__ == "__main__":
     main()

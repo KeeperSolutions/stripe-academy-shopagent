@@ -18,17 +18,27 @@ from typing import Any
 import pytest
 
 from shopagent.llm.client import LLMClient
-from shopagent.llm.loop import (
-    CATALOG_PROMPT,
-    NO_CATALOG_PROMPT,
-    _initial_messages,
-    build_tool_setup,
-    run_tool_loop,
-)
+from shopagent.agent.prompt import CATALOG_PROMPT, NO_CATALOG_PROMPT, initial_messages
+from shopagent.agent.memory import ConversationMemory
+from shopagent.llm.loop import _print_payment_link, build_tool_setup, run_tool_loop
 from shopagent.mcp_client.client import MCPToolClient
 
 LOCAL_TOOLS = ["get_time", "calculator"]
-CATALOG_TOOLS = ["ping", "search_products", "get_product_details", "check_stock"]
+# D9 put five more in every session, from a third source. They are listed here
+# rather than folded into LOCAL_TOOLS because the distinction these tests are
+# about is where a tool comes from: `MCP_CATALOG_ENABLED` moves the middle
+# group and nothing else.
+COMMERCE_TOOLS = [
+    "add_to_cart",
+    "view_cart",
+    "remove_from_cart",
+    "create_checkout",
+    "check_order_status",
+]
+# Three since D9 — `ping` is no longer advertised by the server. The list is
+# the interface, so it is pinned in order and by name: this fails when one
+# disappears and equally when one appears that nobody meant to publish.
+CATALOG_TOOLS = ["search_products", "get_product_details", "check_stock"]
 
 
 # --- a catalog that refuses to open --------------------------------------
@@ -52,11 +62,16 @@ class FailsOnHandshake:
 
 
 def test_the_catalog_switch_off_leaves_only_the_local_tools():
-    """The proof the D5 demo rests on: same binary, two tools instead of six."""
+    """The proof the D5 demo rests on: same binary, the catalog tools gone.
+
+    Not "two tools" any more — D9 adds five that reach a different service, and
+    the claim was never about the count. What the switch has to do is remove
+    the four the catalog server publishes and touch nothing else.
+    """
     with ExitStack() as stack:
         setup = build_tool_setup(stack, catalog_enabled=False)
 
-    assert setup.registry.names() == LOCAL_TOOLS
+    assert setup.registry.names() == LOCAL_TOOLS + COMMERCE_TOOLS
     assert setup.catalog_available is False
     assert "disabled" in setup.note
 
@@ -66,7 +81,7 @@ def test_a_client_that_cannot_start_does_not_stop_the_session():
     with ExitStack() as stack:
         setup = build_tool_setup(stack, client_factory=ExplodingClient)
 
-    assert setup.registry.names() == LOCAL_TOOLS
+    assert setup.registry.names() == LOCAL_TOOLS + COMMERCE_TOOLS
     assert setup.catalog_available is False
     assert "OSError" in setup.note
 
@@ -76,7 +91,7 @@ def test_a_client_that_fails_while_connecting_is_handled_the_same_way():
     with ExitStack() as stack:
         setup = build_tool_setup(stack, client_factory=FailsOnHandshake)
 
-    assert setup.registry.names() == LOCAL_TOOLS
+    assert setup.registry.names() == LOCAL_TOOLS + COMMERCE_TOOLS
     assert setup.catalog_available is False
     assert "handshake timed out" in setup.note
 
@@ -95,7 +110,7 @@ def test_the_local_tools_still_work_when_the_catalog_is_missing():
 
 
 def test_the_system_prompt_gains_the_catalog_rules_when_it_is_available():
-    (message,) = _initial_messages(catalog_available=True)
+    (message,) = initial_messages(catalog_available=True)
 
     assert CATALOG_PROMPT in message["content"]
     assert NO_CATALOG_PROMPT not in message["content"]
@@ -103,7 +118,7 @@ def test_the_system_prompt_gains_the_catalog_rules_when_it_is_available():
 
 def test_the_system_prompt_says_so_when_the_catalog_is_missing():
     """Otherwise the model apologises for its memory instead of naming the cause."""
-    (message,) = _initial_messages(catalog_available=False)
+    (message,) = initial_messages(catalog_available=False)
 
     assert NO_CATALOG_PROMPT in message["content"]
     assert CATALOG_PROMPT not in message["content"]
@@ -120,26 +135,34 @@ def test_the_catalog_rules_forbid_answering_from_memory():
 
 @pytest.mark.db
 def test_the_catalog_switch_on_adds_the_server_tools(engine):
-    """Six tools, local first, then whatever the server listed."""
+    """Ten tools: the local two, D9's five, then the three the server lists."""
     with ExitStack() as stack:
         setup = build_tool_setup(stack, catalog_enabled=True)
         names = setup.registry.names()
         available = setup.catalog_available
 
-    assert names == LOCAL_TOOLS + CATALOG_TOOLS
-    assert len(names) == 6
+    assert names == LOCAL_TOOLS + COMMERCE_TOOLS + CATALOG_TOOLS
+    assert len(names) == 10
+    assert "ping" not in names
     assert available is True
 
 
 @pytest.mark.db
 def test_the_server_process_is_released_with_the_stack(engine):
-    """The catalog's lifetime is the session's, and `main` relies on it."""
+    """The catalog's lifetime is the session's, and `main` relies on it.
+
+    The probe used to be `ping`, which D9 stopped advertising. A category
+    browse replaces it for the same reason it does in `test_mcp_client.py`: it
+    always succeeds against the seed and, carrying no `query`, embeds nothing
+    and costs nothing.
+    """
+    browse = {"category": "shoes", "limit": 1}
     with ExitStack() as stack:
         setup = build_tool_setup(stack, catalog_enabled=True)
-        assert setup.registry.dispatch("ping", {}).ok is True
+        assert setup.registry.dispatch("search_products", browse).ok is True
 
     # Outside the stack the client is closed, so the tool can no longer run.
-    assert setup.registry.dispatch("ping", {}).ok is False
+    assert setup.registry.dispatch("search_products", browse).ok is False
 
 
 # --- the loop, unmodified, driving an MCP tool ---------------------------
@@ -200,7 +223,7 @@ def test_a_full_round_trip_through_the_unmodified_loop(engine, capsys):
             )]),
             FakeReply(content="Here are two pairs of shoes."),
         ])
-        messages: list[Any] = _initial_messages(setup.catalog_available)
+        messages: list[Any] = initial_messages(setup.catalog_available)
         messages.append({"role": "user", "content": "show me shoes"})
 
         run_tool_loop(client, setup.registry, messages, setup.registry.openai_schemas())
@@ -213,8 +236,8 @@ def test_a_full_round_trip_through_the_unmodified_loop(engine, capsys):
     assert payload["count"] >= 1
     assert all(product["category"] == "shoes" for product in payload["results"])
 
-    # The model was offered all six, and the terminal showed the call.
-    assert len(client.seen_tools[0]) == 6
+    # The model was offered all ten, and the terminal showed the call.
+    assert len(client.seen_tools[0]) == 10
     assert "search_products" in capsys.readouterr().out
 
 
@@ -231,3 +254,160 @@ def test_the_loop_signature_still_takes_a_registry_and_schemas():
     assert parameters == ["client", "registry", "messages", "tools"]
     assert LLMClient is not None  # imported for the type it documents
     assert MCPToolClient is not None
+
+
+# --- the commerce tools (D9, step 1) -------------------------------------
+#
+# `build_tool_setup` is where a session's tools are decided, so it is where
+# "the agent can actually buy something" is asserted. These stay next to the
+# MCP tests rather than in `test_commerce_tools.py` because what they check is
+# the assembly, not the tools: the same function, one more source.
+
+
+COMMERCE_TOOLS = [
+    "add_to_cart",
+    "view_cart",
+    "remove_from_cart",
+    "create_checkout",
+    "check_order_status",
+]
+
+
+def test_the_commerce_tools_are_in_every_session():
+    """Even with the catalog off — they reach a different service.
+
+    `MCP_CATALOG_ENABLED=false` is the catalog's off switch and nothing else.
+    A session without product search can still show a cart and a payment link,
+    and folding the two sources into one switch would make an unrelated
+    failure look like this one.
+    """
+    with ExitStack() as stack:
+        setup = build_tool_setup(stack, catalog_enabled=False)
+
+    assert [name for name in setup.registry.names() if name in COMMERCE_TOOLS] == COMMERCE_TOOLS
+
+
+def test_a_session_holds_one_memory_across_its_commerce_tools():
+    """Two tools, one basket — the state that is deliberately not global."""
+    with ExitStack() as stack:
+        first = build_tool_setup(stack, catalog_enabled=False)
+        second = build_tool_setup(stack, catalog_enabled=False)
+
+    assert first.memory is not None
+    assert first.memory is not second.memory
+
+
+# --- the whole list, offline (D9, step 2) --------------------------------
+
+
+@dataclass
+class FakeCatalogTool:
+    name: str
+    description: str = "a catalog tool"
+    input_schema: dict = field(default_factory=lambda: {"type": "object", "properties": {}})
+
+
+class FakeCatalogClient:
+    """A catalog server that lists what the real one lists, without starting one.
+
+    The composition of the tool list is the agent's whole interface, so it is
+    worth an assertion that runs on every `pytest tests/` rather than only when
+    Postgres happens to be up. What this cannot check is that the real server
+    publishes these three names — `test_the_catalog_switch_on_adds_the_server_tools`
+    does that, against the real process, and would fail if the two drifted.
+    """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def list_tools(self):
+        return [FakeCatalogTool(name) for name in CATALOG_TOOLS]
+
+    def call_tool(self, name: str, arguments=None):  # pragma: no cover - never called
+        raise AssertionError("this fake is for listing only")
+
+
+def test_the_model_is_offered_exactly_these_ten_tools():
+    """Named and ordered, so it fails on a disappearance and on an arrival.
+
+    The same shape as D6's hand-written table of foreign-key expectations: a
+    check derived from whatever the code happens to register would pass on the
+    day something is published by accident. `ping` is the reason this exists —
+    it sat in the list from D5 to D9 and no test objected, because no test said
+    what the list was supposed to be.
+    """
+    with ExitStack() as stack:
+        setup = build_tool_setup(
+            stack, catalog_enabled=True, client_factory=FakeCatalogClient
+        )
+
+    assert setup.registry.names() == [
+        "get_time",
+        "calculator",
+        "add_to_cart",
+        "view_cart",
+        "remove_from_cart",
+        "create_checkout",
+        "check_order_status",
+        "search_products",
+        "get_product_details",
+        "check_stock",
+    ]
+    assert len(setup.registry.names()) == 10
+    assert "ping" not in setup.registry.names()
+
+
+# --- the payment link the CLI prints (PR #9) ------------------------------
+#
+# A Checkout Session URL is 475 opaque characters, and the end-to-end run for
+# PR #9 measured what happens when the model relays one: asked twice for the
+# same session, it reproduced the URL correctly once and changed a single
+# character the second time (`TlZQ` to `TlVQ`, position 329). Stripe answers
+# 401 for that, so the customer gets a payment page that does not work.
+#
+# The link therefore never enters the conversation. `tools/commerce.py` puts it
+# on the memory and the CLI prints it. These tests are about that last step.
+
+
+def test_the_cli_prints_the_link_exactly_as_the_shop_issued_it(capsys):
+    url = (
+        "https://checkout.stripe.com/c/pay/cs_test_a1lat7VO5sgjzwy5bFZM4N4mqoDv7c6"
+        "#fidnandhYHdWcXxpYCc%2FJ2FgY2RwaXEnKSdicGRmZGhqaWBTZHdsZGtxJz8nZmprcXdqaSc"
+    )
+    memory = ConversationMemory(checkout_url=url)
+
+    _print_payment_link(memory)
+
+    printed = capsys.readouterr().out
+    assert url in printed, "the link must appear byte-for-byte"
+    assert "Pay here" in printed
+
+
+def test_a_turn_that_produced_no_link_prints_nothing(capsys):
+    """Otherwise every answer in the conversation carries a payment page."""
+    _print_payment_link(ConversationMemory())
+
+    assert capsys.readouterr().out == ""
+
+
+def test_the_link_is_printed_once_and_not_under_every_later_answer(capsys):
+    """A payment page shown again beneath "your order is paid" is one somebody clicks."""
+    memory = ConversationMemory(checkout_url="https://checkout.stripe.com/c/pay/cs_test_1")
+
+    _print_payment_link(memory)
+    first = capsys.readouterr().out
+    _print_payment_link(memory)
+    second = capsys.readouterr().out
+
+    assert "cs_test_1" in first
+    assert second == ""
+
+
+def test_a_session_with_no_memory_at_all_does_not_crash(capsys):
+    """`ToolSetup.memory` is optional, and a missing one is not a reason to fail a turn."""
+    _print_payment_link(None)
+
+    assert capsys.readouterr().out == ""

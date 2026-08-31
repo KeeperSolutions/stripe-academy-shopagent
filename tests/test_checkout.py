@@ -18,6 +18,8 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
+from shopagent.config import get_settings
+from shopagent.money import format_amount
 from shopagent.api.lifecycle import OrderStatus
 from shopagent.api.models import Order, OrderItem
 from shopagent.catalog.models import Inventory, Price, Product, Variant
@@ -29,6 +31,16 @@ from shopagent.payments.checkout import (
     build_line_items,
     create_checkout_session,
 )
+
+
+# The shop's currency, read rather than written. A test that creates a price
+# row in a literal currency and then asks a service to find it is testing its
+# own literal: the service filters on `settings.currency`, so the two have to
+# agree by construction, and the day they stopped agreeing is the day 125 of
+# them failed at once. What a specific currency *is* still gets pinned, in the
+# tests that are actually about that — `format_amount`, and the two that prove
+# a foreign currency is treated as foreign.
+CURRENCY = get_settings().currency
 
 pytestmark = pytest.mark.db
 
@@ -66,7 +78,7 @@ def make_variant(session, *, sku: str, amount_cents: int = 2500) -> Variant:
                 size="42",
                 color="blue",
                 sku=sku,
-                prices=[Price(currency="usd", amount_cents=amount_cents, active=True)],
+                prices=[Price(currency=CURRENCY, amount_cents=amount_cents, active=True)],
                 inventory=Inventory(quantity=20, reserved=0),
             )
         ],
@@ -101,7 +113,7 @@ def test_line_items_come_from_the_snapshot(authed_client, session):
     first, second = lines
     assert first["quantity"] == 2
     assert first["price_data"]["unit_amount"] == 2500
-    assert first["price_data"]["currency"] == "usd"
+    assert first["price_data"]["currency"] == CURRENCY
     assert "Checkout Fixture CHK-A" in first["price_data"]["product_data"]["name"]
     assert first["price_data"]["product_data"]["metadata"]["sku"] == "CHK-A"
     assert second["price_data"]["unit_amount"] == 999
@@ -633,7 +645,7 @@ def test_the_success_page_says_the_order_is_not_paid_yet(api_client, monkeypatch
         status = "complete"
         payment_status = "paid"
         amount_total = 4200
-        currency = "usd"
+        currency = CURRENCY
 
         class metadata:
             _data = {"order_id": "abc-123"}
@@ -646,10 +658,14 @@ def test_the_success_page_says_the_order_is_not_paid_yet(api_client, monkeypatch
     assert "Payment received" in response.text
     assert "has not been marked paid yet" in response.text
     assert "abc-123" in response.text
-    # Formatted for a person, not echoed in minor units: `4200 USD` reads as
-    # four thousand dollars to the shopper who just paid forty-two.
-    assert "42.00 USD" in response.text
-    assert "4200 USD" not in response.text
+    # Formatted for a person, not echoed in minor units: `4200` reads as four
+    # thousand to the shopper who just paid forty-two. Rendered through
+    # `shopagent.money.format_amount`, which is the same function the system
+    # prompt teaches the model to imitate — `tests/test_money.py` pins what it
+    # produces, and `test_the_prompt_and_the_checkout_page_share_one_formatter`
+    # pins that these two surfaces cannot drift apart.
+    assert format_amount(4200, CURRENCY) in response.text
+    assert "4200" not in response.text
 
 
 def test_the_success_page_does_not_change_the_order(authed_client, session, monkeypatch):
@@ -661,7 +677,7 @@ def test_the_success_page_does_not_change_the_order(authed_client, session, monk
         status = "complete"
         payment_status = "paid"
         amount_total = 900
-        currency = "usd"
+        currency = CURRENCY
 
         class metadata:
             _data = {"order_id": order_id}
@@ -732,25 +748,6 @@ def test_stripe_accepts_payment_intent_data_on_a_real_session(authed_client, ses
 
 
 # --- what review on PR #7 turned up --------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("minor_units", "currency", "expected"),
-    [
-        (28497, "usd", "284.97 USD"),
-        (4200, "usd", "42.00 USD"),
-        (100, "usd", "1.00 USD"),
-        (0, "usd", "0.00 USD"),
-        # Zero-decimal: the smallest unit *is* the unit, so dividing invents a
-        # decimal part the currency does not have.
-        (5000, "jpy", "5,000 JPY"),
-        (None, "usd", "—"),
-    ],
-)
-def test_amounts_are_rendered_for_a_person(minor_units, currency, expected):
-    from shopagent.api.routers.checkout_pages import format_amount
-
-    assert format_amount(minor_units, currency) == expected
 
 
 def test_an_unreadable_session_does_not_claim_nothing_was_charged(

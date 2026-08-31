@@ -49,6 +49,12 @@ SNAPSHOT_PATH = REPO_ROOT / ".manual-test-state.json"
 
 # The tables a manual run writes to. Ordered so deletes respect the foreign
 # keys: children before parents.
+# `shopper_profiles` is deliberately not here, and adding it would be a bug
+# rather than an omission. This script undoes a manual test run: carts, orders
+# and webhook deliveries are what such a run creates and what nobody wants
+# left behind. A profile is what a person typed about themselves, on purpose,
+# and it is supposed to outlive every run — restoring it away would delete the
+# one table here whose whole point is that it persists.
 COMMERCE_TABLES = ["order_items", "orders", "cart_items", "carts", "processed_events"]
 
 

@@ -40,6 +40,8 @@ from rich.logging import RichHandler
 from sqlalchemy import text
 
 import shopagent.mcp_server.server as server_module
+from shopagent.config import get_settings
+from shopagent.money import SYMBOLS, format_amount
 from shopagent.mcp_server.server import (
     SERVER_NAME,
     configure_stderr_logging,
@@ -50,7 +52,14 @@ from shopagent.mcp_server.server import (
 # The tool names the model sees. They are pinned as a list because the set of
 # tools *is* the interface: D5 loads them dynamically, so a rename here is a
 # silent change to what the agent can do.
-EXPECTED_TOOLS = ["ping", "search_products", "get_product_details", "check_stock"]
+#
+# `ping` left this list on D9. It is a diagnostic with no business meaning, and
+# it sat among the three that mean something for four days — the Known gaps
+# entry that tracked it also named the only correct place to fix it, which is
+# here rather than in a name check on the client side. It is still a tool and
+# still reachable; the server simply does not advertise it unless asked. See
+# MCP_EXPOSE_PING.
+EXPECTED_TOOLS = ["search_products", "get_product_details", "check_stock"]
 
 # What `search_products` exposes, and nothing else. `session`, `mode` and
 # `query_embedding` are deliberately absent — see the module docstring in
@@ -129,6 +138,39 @@ def test_server_name_is_the_recognisable_one():
     assert SERVER_NAME == "shopagent-catalog"
 
 
+@pytest.fixture
+def ping_exposed():
+    """The server as `MCP_EXPOSE_PING=true` builds it.
+
+    Registering it here rather than reloading the module with the variable set:
+    the flag decides one `add_tool` call, and this makes the same call. What
+    that leaves untested is the reading of the setting itself, which
+    `test_the_switch_is_what_decides_whether_ping_is_registered` covers by
+    asserting the branch is the only thing between the two states.
+    """
+    server.add_tool(ping)
+    try:
+        yield
+    finally:
+        server.remove_tool("ping")
+
+
+def test_ping_is_not_advertised_to_the_model():
+    """Closed on D9: a diagnostic does not belong in a shopper's tool list.
+
+    The cost of it being there was never that the model called it — across
+    every demo scenario it never did. It is that the list is what the model
+    reads to decide what it can do, and every name in it that means nothing is
+    a name it has to rule out first.
+    """
+    assert "ping" not in [tool.name for tool in call(server.list_tools)]
+
+
+def test_the_switch_is_what_decides_whether_ping_is_registered(ping_exposed):
+    """With the switch on, it is an ordinary tool again."""
+    assert "ping" in [tool.name for tool in call(server.list_tools)]
+
+
 def test_ping_is_callable_without_the_server():
     """The tool is a plain function; the decorator only registers it.
 
@@ -143,7 +185,7 @@ def test_every_tool_is_registered_under_its_expected_name():
     assert [tool.name for tool in call(server.list_tools)] == EXPECTED_TOOLS
 
 
-def test_ping_advertises_a_schema_with_no_arguments():
+def test_ping_advertises_a_schema_with_no_arguments(ping_exposed):
     """An argument-free tool still needs a schema, and it must not invent one."""
     schema = schema_of("ping")
 
@@ -179,16 +221,64 @@ def test_search_products_takes_no_required_arguments():
 
 @pytest.mark.parametrize("field", ["max_price_cents", "min_price_cents"])
 def test_price_parameters_say_the_unit_is_cents(field):
-    """The likeliest expensive mistake a model can make here is dollars.
+    """The likeliest expensive mistake a model can make here is major units.
 
-    `$100` is `10000`, and a model that passes `100` silently searches for
-    something under a dollar and reports an empty shop. The schema has to say
+    `€100` is `10000`, and a model that passes `100` silently searches for
+    something under one euro and reports an empty shop. The schema has to say
     so in the one place the model reads.
+
+    The contrast is asserted through the shop's own currency symbol rather
+    than the word "dollar", which is what this said until D9 — and it kept
+    passing for a week after the shop moved to EUR, because a description
+    teaching dollars still contains the word. A check derived from `CURRENCY`
+    cannot go stale that way.
     """
+    symbol = SYMBOLS[get_settings().currency]
     description = schema_of("search_products")["properties"][field]["description"]
 
     assert "cent" in description.lower()
-    assert "dollar" in description.lower()
+    assert symbol in description
+
+
+# Currency names this shop does not sell in. A description that teaches one of
+# them is teaching the model a wrong unit, which is a wrong search it has no
+# way to notice — `max_price_cents` said "passing 100 here means one dollar"
+# for a week after the shop moved to EUR, and every test passed. Raised in
+# review on PR #9.
+OTHER_CURRENCY_WORDS = ("dollar", "pound", "yen", "franc", "rupee", "peso")
+
+
+def test_no_tool_teaches_the_model_a_currency_this_shop_does_not_sell_in():
+    """Swept over every description a model reads, not just the ones changed.
+
+    A test naming the two price fields would have gone stale the same way the
+    description did. This one fails whenever any tool starts talking about a
+    currency the shop does not use, including a tool added later.
+    """
+    tools = call(server.list_tools)
+    texts = []
+    for tool in tools:
+        texts.append(tool.description or "")
+        for field in (tool.input_schema.get("properties") or {}).values():
+            texts.append(field.get("description", ""))
+
+    haystack = " ".join(texts).lower()
+    found = [word for word in OTHER_CURRENCY_WORDS if word in haystack]
+    assert found == [], f"model-facing text names {found}; the shop sells in {get_settings().currency}"
+
+
+def test_the_price_examples_are_generated_from_the_configured_currency():
+    """Not typed beside it, which is how the stale unit survived.
+
+    Asserted through `format_amount` so the check cannot agree with a wrong
+    description by repeating the same literal.
+    """
+    currency = get_settings().currency
+    description = schema_of("search_products")["properties"]["max_price_cents"]["description"]
+
+    assert format_amount(10000, currency) in description
+    assert format_amount(4999, currency) in description
+    assert format_amount(100, currency) in description
 
 
 def test_the_cents_example_is_spelled_out_for_the_upper_bound():
@@ -210,7 +300,7 @@ def test_id_parameters_are_required_and_described(tool_name, field):
     assert schema["properties"][field]["description"]
 
 
-def test_ping_description_comes_from_the_docstring():
+def test_ping_description_comes_from_the_docstring(ping_exposed):
     """The docstring is the contract the model reads; MCP derives it from here.
 
     Asserting the first line rather than the whole string keeps this from
@@ -224,7 +314,7 @@ def test_ping_description_comes_from_the_docstring():
     assert description.startswith("Check that the catalog server is reachable.")
 
 
-def test_ping_over_the_in_memory_transport_returns_pong():
+def test_ping_over_the_in_memory_transport_returns_pong(ping_exposed):
     """The end-to-end path a stdio client takes, minus the pipe."""
     result = call_over_transport("ping", {})
 
