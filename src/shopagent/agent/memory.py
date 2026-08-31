@@ -69,6 +69,20 @@ SEARCH_TOOL = "search_products"
 # rather than four bespoke readers that would each need updating.
 VARIANT_ID_KEY = "variant_id"
 
+# Every amount in this project ends in `_cents`, in every result the model can
+# see: `price_cents` from the catalog, `unit_price_cents`, `line_total_cents`
+# and `total_cents` from carts and orders. That is not a coincidence to lean on
+# lightly — it is the naming rule CLAUDE.md draws between a column
+# (`amount_cents`) and what a reader gets (`price_cents`), and it means the set
+# of amounts the model has been shown can be collected without knowing which
+# tool produced them.
+#
+# Collected rather than every integer, which would be the easy version and the
+# wrong one: variant ids, quantities, sizes and stock counts are integers too,
+# and a set holding 86263 would quietly support a claim of "€862.63". Step 5
+# reads this set to decide whether an amount in an answer came from anywhere.
+AMOUNT_SUFFIX = "_cents"
+
 
 @dataclass(frozen=True)
 class LastSearch:
@@ -115,12 +129,24 @@ class ConversationMemory:
 
     _last_search: LastSearch | None = None
     _seen_variant_ids: set[int] = field(default_factory=set)
+    _seen_amount_cents: set[int] = field(default_factory=set)
 
     # --- reading ---------------------------------------------------------
 
     @property
     def last_search(self) -> LastSearch | None:
         return self._last_search
+
+    @property
+    def seen_amount_cents(self) -> frozenset[int]:
+        """Every amount, in minor units, that a tool has shown the model here.
+
+        Cumulative for the whole conversation, for the same reason
+        `seen_variant_ids` is: a price quoted four messages ago is still a
+        price this shop gave, and a customer asking "what was that one again"
+        is asking about it.
+        """
+        return frozenset(self._seen_amount_cents)
 
     @property
     def seen_variant_ids(self) -> frozenset[int]:
@@ -187,7 +213,9 @@ class ConversationMemory:
         except (ValueError, TypeError):
             return
 
-        self._seen_variant_ids.update(_variant_ids_in(payload))
+        found_ids, found_amounts = _numbers_in(payload)
+        self._seen_variant_ids.update(found_ids)
+        self._seen_amount_cents.update(found_amounts)
 
         if tool == SEARCH_TOOL:
             self._last_search = LastSearch(
@@ -213,25 +241,36 @@ def _results_in(payload: Any) -> list[dict]:
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
-def _variant_ids_in(payload: Any) -> set[int]:
-    """Every `variant_id` anywhere in a decoded result.
+def _numbers_in(payload: Any) -> tuple[set[int], set[int]]:
+    """Every variant id and every amount anywhere in a decoded result.
 
-    Recursive rather than shape-aware: the four results that carry variant ids
-    nest them at three different depths, and a reader written per shape is
-    four places to update the day a fifth arrives.
+    One walk for both, because they are found the same way and at the same
+    depths: the results that carry them nest them differently — a search puts
+    variants two levels down, `check_stock` puts one at the top, a cart line
+    carries both — and a reader written per shape is a place to update the day
+    a fifth shape arrives.
+
+    `bool` is excluded explicitly. It is a subclass of `int` in Python, so
+    `in_stock: true` would otherwise be recorded as the amount 1 and quietly
+    support a claim of "€0.01".
     """
-    found: set[int] = set()
+    ids: set[int] = set()
+    amounts: set[int] = set()
     stack = [payload]
     while stack:
         node = stack.pop()
         if isinstance(node, dict):
-            value = node.get(VARIANT_ID_KEY)
-            if isinstance(value, int) and not isinstance(value, bool):
-                found.add(value)
+            for key, value in node.items():
+                if not isinstance(value, int) or isinstance(value, bool):
+                    continue
+                if key == VARIANT_ID_KEY:
+                    ids.add(value)
+                elif key.endswith(AMOUNT_SUFFIX):
+                    amounts.add(value)
             stack.extend(node.values())
         elif isinstance(node, list):
             stack.extend(node)
-    return found
+    return ids, amounts
 
 
 class RememberingRegistry(ToolRegistry):

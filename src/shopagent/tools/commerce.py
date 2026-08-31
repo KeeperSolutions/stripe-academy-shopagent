@@ -439,12 +439,12 @@ def build_commerce_tools(api: CommerceAPI, state: HoldsCartState) -> list[ToolSp
             description=(
                 "Turn the current cart into an order and return a payment link "
                 "for it. Takes no arguments. This is the point of no return: "
-                "the cart is closed, the stock is reserved and the customer is "
-                "asked for money, so only call it when the customer has said "
-                "clearly that they want to buy what is in the cart. Show them "
-                "the cart with view_cart and get an explicit yes first. The "
-                "order is pending, not paid, until they complete the payment "
-                "page."
+                "the cart is closed and the stock is reserved. Before it runs, "
+                "the shop shows the customer what they are buying and asks them "
+                "to confirm; if they decline, this call comes back as an error "
+                "saying so and nothing is ordered. Read the result rather than "
+                "assuming it worked. The order is pending, not paid, until the "
+                "customer completes the payment page."
             ),
             args_model=CreateCheckoutArgs,
             fn=create_checkout,

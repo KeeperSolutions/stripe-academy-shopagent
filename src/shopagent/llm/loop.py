@@ -31,11 +31,13 @@ either paid off or did not.
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 
 from shopagent.agent import profile as profiles
-from shopagent.agent.memory import ConversationMemory, RememberingRegistry
+from shopagent.agent.guardrails import GuardedClient, GuardedRegistry
+from shopagent.agent.memory import ConversationMemory
 from shopagent.agent.prompt import PROFILE_LABELS, initial_messages
 from shopagent.config import get_settings
 from shopagent.db import session_scope
@@ -169,6 +171,7 @@ def build_tool_setup(
     *,
     catalog_enabled: bool | None = None,
     client_factory: type[MCPToolClient] = MCPToolClient,
+    confirm: Callable[[str], bool] | None = None,
 ) -> ToolSetup:
     """Assemble the registry this session will use.
 
@@ -189,7 +192,7 @@ def build_tool_setup(
     # remembered because of where it is registered rather than because whoever
     # added it knew to.
     memory = ConversationMemory()
-    registry = RememberingRegistry(memory)
+    registry = GuardedRegistry(memory, confirm=confirm)
     for spec in REGISTRY.specs():
         registry.register(spec)
 
@@ -245,7 +248,7 @@ def main() -> None:
         raise SystemExit(1) from exc
 
     with ExitStack() as stack:
-        setup = build_tool_setup(stack)
+        setup = build_tool_setup(stack, confirm=_ask_to_confirm)
         _run_session(client, tracker, setup)
 
 
@@ -256,6 +259,11 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
     lifetime: everything below runs inside the `ExitStack` that owns the server.
     """
     registry = setup.registry
+    # The client is wrapped, not replaced: `run_tool_loop` below is the
+    # unmodified D2 function and still takes a client, a registry, a message
+    # list and a list of schemas. What changed is that one of those four checks
+    # the answer before handing it back.
+    client = GuardedClient(client, setup.memory)
     shopper_id = get_settings().shopper_id
     profile, profile_note = profiles.load_for_session(shopper_id)
     messages = initial_messages(setup.catalog_available, profile=profile)
@@ -350,6 +358,28 @@ def _print_cost(tracker: UsageTracker, calls_before: int) -> None:
             f"· session ${tracker.total_cost_usd:.6f}]"
         )
 
+
+
+def _ask_to_confirm(summary: str) -> bool:
+    """Show what is being bought and wait for a person to answer (D9, step 5).
+
+    The summary comes from `agent/guardrails.py`, which built it from a real
+    `view_cart` call — not from anything the model said. This function only
+    prints it and reads a line.
+
+    Anything that is not an explicit yes is a no, including end-of-input. A
+    piped session, a closed terminal or a stray newline must not buy anything:
+    the safe answer to "could not ask" is the same as the answer to "they said
+    no", and it is the only one that cannot cost somebody money.
+    """
+    print("\n  About to place this order:")
+    print(summary)
+    try:
+        answer = input("  Place the order? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  [not confirmed]")
+        return False
+    return answer in {"y", "yes"}
 
 
 # --- the profile commands (D9, step 4) -----------------------------------

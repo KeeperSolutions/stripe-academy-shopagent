@@ -22,15 +22,14 @@ variants *it* meant". So the script comes in two versions, identical except for
 that one turn: `ambiguous` says "add it", `named` names the product. A test
 that only ran the first would keep producing a result with two explanations.
 
-**The chain ends at turn 4 until step 5, and that is expected.** Run B named
-the product on turn 3 and every tool fired up to `view_cart`; on "yes, order
-it" the model called `view_cart` again and asked the customer to confirm,
-because the `create_checkout` description tells it to "get an explicit yes
-first" and never says the previous message can be that yes. The sentence stays
-until step 5 replaces it with a gate in code that can see who said yes —
-removing a weak instruction before the strong one exists is the wrong order —
-so this test is expected to fail on turn 5 in the meantime, and its failure
-says which turn rather than that something is wrong.
+**Turn 5 needs a confirmer, since step 5.** Run B stopped there: the
+`create_checkout` description asked for "an explicit yes first" and never said
+the customer's previous message could be that yes, so the model showed the cart
+and asked again. Step 5 removed the sentence and replaced it with a gate in
+code — `agent/guardrails.py` intercepts the call, shows a person what they are
+buying at a total read from `view_cart`, and asks. A registry built without a
+`confirm` callable refuses the purchase, which is the safe default and is what
+this test gets unless it passes one. Step 6 is the run that means something.
 
 **Marking.** `network` and `db`, and the running API is a skip rather than a
 third marker. A marker decides whether a test is *selected*, and selection in
