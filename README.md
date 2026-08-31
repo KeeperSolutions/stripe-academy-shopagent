@@ -217,6 +217,12 @@ python -m shopagent.llm.loop            # CLI agent: 10 tools
 MCP_CATALOG_ENABLED=false \
   python -m shopagent.llm.loop          # same CLI without the catalog: 7 tools
 
+# the same agent in a browser (D11). Same registry, same loop, same guardrails
+# — `ui/app.py` renders and `ui/session.py` decides. Chat is the whole
+# interface: search results appear as cards inside the conversation, and there
+# is no catalog to browse around the agent.
+streamlit run src/shopagent/ui/app.py   # on :8501
+
 # inside the agent
 #   /tools            the tools the model can call
 #   /profile          what the shop remembers about you between conversations
