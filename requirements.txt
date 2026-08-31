@@ -14,6 +14,13 @@ uvicorn[standard]>=0.32
 stripe>=11.0
 httpx>=0.28
 rich>=13.9
-langfuse>=2.53
+# Pinned to the v4 line deliberately. The placeholder here read `>=2.53`
+# until D10 used it, and 4.x is a different library: v2's `trace()` /
+# `span()` API was replaced by OpenTelemetry observations, which is the
+# API `obs/tracing.py` is written against. A range that admits v2 would
+# resolve to something this code cannot call, on a machine where nothing
+# is installed yet — and the first symptom would be an AttributeError in
+# the module whose whole job is to never break a conversation.
+langfuse>=4.0,<5
 streamlit>=1.40
 pytest>=8.3

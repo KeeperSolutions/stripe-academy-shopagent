@@ -23,6 +23,14 @@ at a total that came from the shop rather than from the model. There is no
 `confirmed` argument, deliberately: an argument the model sets is a suggestion
 with a type annotation.
 
+D10 made that question non-blocking and changed nothing else about it. The gate
+parks the summary and returns; somebody answers between turns; the next call
+spends the answer. The reason is in `agent/confirmation.py` — an eval runner
+and a browser both answer in a different turn from the one that asked, and a
+protocol built on blocking cannot be adapted to either. The total a person
+approves still comes from `view_cart` and never from the model's prose, which
+is the property the whole gate exists for.
+
 **No amount reaches a customer that no tool produced.** One retry with a
 correction, then a fallback that names the figure it could not trace. Not a
 third attempt, because regeneration is billed; not silence, because a blocked
@@ -47,12 +55,13 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
 from typing import Any
 
+from shopagent.agent.confirmation import PendingConfirmation
 from shopagent.agent.memory import ConversationMemory, RememberingRegistry
 from shopagent.config import get_settings
 from shopagent.money import WORDS, ZERO_DECIMAL_CURRENCIES, SYMBOLS, format_amount
+from shopagent.obs.tracing import Tracer
 from shopagent.tools.registry import ToolResult
 
 # The calls that spend money. A set rather than a check inside the tool,
@@ -80,6 +89,36 @@ ADD_TOOL = "add_to_cart"
 # to add the indentation itself.
 PLACING = "  About to place this order:"
 RESUMING = "  That order is already placed. This only fetches its payment link again:"
+
+# What the model is told while a person is being asked (D10, step 1). The gate
+# no longer blocks for an answer, so this is the result of the *first*
+# `create_checkout` in a conversation: the question has been put, and the tool
+# has not run.
+#
+# It says three things and each is there because of a way the model could
+# otherwise fill the gap. That nothing was ordered, because a result the model
+# cannot read as success or failure is one it guesses about. That it must not
+# ask for the confirmation itself, because the shop is already asking and two
+# questions about one purchase is how a customer ends up answering the wrong
+# one. And that the answer arrives later, because a model told only "not yet"
+# retries.
+AWAITING_ANSWER = (
+    "The customer is being asked to confirm this purchase right now: the shop "
+    "is showing them the order and its total and waiting for their answer. "
+    "Nothing has been ordered and nothing has been charged. Do not call "
+    "create_checkout again and do not ask them to confirm yourself — the shop "
+    "is asking them directly. Say briefly that you are waiting for their "
+    "confirmation and stop there. Their answer will reach you next."
+)
+
+BASKET_CHANGED = (
+    "The basket is not the one the customer approved — it changed after they "
+    "said yes, so their approval does not cover it and nothing has been "
+    "ordered or charged. The shop is now showing them the new total and "
+    "waiting for a fresh answer. Do not call create_checkout again and do not "
+    "ask them to confirm yourself. Say briefly that the order changed and you "
+    "are waiting for their confirmation, and stop there."
+)
 
 
 # --- amounts -------------------------------------------------------------
@@ -246,11 +285,26 @@ class GuardedClient:
     Only a *final* answer is checked. A turn that is still asking for tools is
     narration on the way to an answer, and the numbers it mentions may be about
     to arrive.
+
+    `tracer` is optional and defaults to one that records nothing. It is here
+    rather than outside because this is the only place that knows the amount
+    rule fired: the retry and the fallback both leave the loop looking like an
+    ordinary answer, and the alternative — a wrapper further out sniffing for
+    `FALLBACK_PREFIX` in the text — would make a guard's visibility depend on
+    matching a sentence somebody may rewrite. D9's other two guardrails need
+    nothing like this: the gate and the unknown-variant refusal both come back
+    as a failed `ToolResult`, which `obs/instrumentation.py` already sees.
     """
 
-    def __init__(self, client: Any, memory: ConversationMemory) -> None:
+    def __init__(
+        self,
+        client: Any,
+        memory: ConversationMemory,
+        tracer: Tracer | None = None,
+    ) -> None:
         self._client = client
         self._memory = memory
+        self._tracer = tracer or Tracer()
 
     def __getattr__(self, name: str) -> Any:
         # Everything else — `model`, `stream_chat`, the tracker — is the real
@@ -266,6 +320,9 @@ class GuardedClient:
         if not bad:
             return reply
 
+        self._tracer.guardrail(
+            name="untraceable_amount", outcome="retried with a correction", detail=bad
+        )
         retry = self._client.chat_with_tools(
             [
                 *messages,
@@ -291,6 +348,9 @@ class GuardedClient:
         # has produced the same untraceable figure twice is not one round away
         # from tracing it.
         still_bad = unsupported_amounts(retry.content or "", self._memory) or bad
+        self._tracer.guardrail(
+            name="untraceable_amount", outcome="answered with the fallback", detail=still_bad
+        )
         return type(reply)(
             content=FALLBACK.format(amounts=", ".join(still_bad)),
             tool_calls=[],
@@ -306,20 +366,23 @@ class GuardedRegistry(RememberingRegistry):
     the guards read, so splitting them would mean wiring the same object into
     two wrappers and hoping they stayed in the same order.
 
-    `confirm` is a callable taking the summary a person reads and returning
-    whether they said yes. `None` means nobody can be asked, and a purchase is
-    then refused rather than allowed — a gate that cannot reach a person is not
+    `can_confirm` says whether anybody can be reached at all. False refuses a
+    purchase rather than allowing it — a gate that cannot reach a person is not
     a gate, and defaulting the other way would make every non-interactive
-    caller an exception to the rule.
+    caller an exception to the rule. That was D9's rule and it has not moved;
+    what moved is that this is a fact rather than a callable.
+
+    D9 held the confirmer here and called it from inside `dispatch`. It does
+    not any more, and the boolean is the honest shape of what is left: this
+    class needs to know that somebody exists, and holding a callable it never
+    invokes would read as a bug to everyone after the first reader. The
+    confirmer belongs to whatever is presenting the conversation, which is the
+    only thing that knows how to reach a person — see `agent/confirmation.py`.
     """
 
-    def __init__(
-        self,
-        memory: ConversationMemory,
-        confirm: Callable[[str], bool] | None = None,
-    ) -> None:
+    def __init__(self, memory: ConversationMemory, can_confirm: bool = False) -> None:
         super().__init__(memory)
-        self._confirm = confirm
+        self._can_confirm = can_confirm
 
     def dispatch(self, name: str, raw_args: Any = None) -> ToolResult:
         if name == ADD_TOOL:
@@ -377,9 +440,42 @@ class GuardedRegistry(RememberingRegistry):
         The summary is built from a real `view_cart` call rather than from
         anything the model said. A person approving a figure the model invented
         is worse than no gate at all: it launders the invention through a human
-        and leaves a record saying they agreed to it.
+        and leaves a record saying they agreed to it. That property is the one
+        thing D10 was not allowed to lose while making the gate non-blocking,
+        and it is unchanged: the same `view_cart` dispatch, the same
+        `_summarise`, the same `money.format_amount`.
+
+        What changed is when the answer arrives. The question is parked and the
+        call returns; a person answers it between turns; the *next* call
+        through here spends that answer. Three outcomes, and each is a branch
+        below: answered yes, answered no, and nothing answered yet.
         """
-        if self._confirm is None:
+        answered = self.memory.take_confirmation(name)
+        if answered is not None:
+            if answered.answer:
+                return self._spend(name, answered)
+            return ToolResult(
+                ok=False,
+                content=(
+                    "Error: the customer did not confirm the purchase, so no "
+                    "order was placed and nothing was charged. Acknowledge "
+                    "that, and do not call create_checkout again unless they "
+                    "ask for it in a later message."
+                ),
+                error="the customer declined the purchase",
+            )
+
+        parked = self.memory.pending_confirmation
+        if parked is not None and parked.tool == name:
+            # Asked already, in this same turn, and nobody has answered yet.
+            # Repeat the sentence rather than reading the cart and asking a
+            # second time: a person is looking at one question, and a second
+            # summary would be a second thing to approve.
+            return ToolResult(
+                ok=False, content=AWAITING_ANSWER, error="waiting for the customer to confirm"
+            )
+
+        if not self._can_confirm:
             return ToolResult(
                 ok=False,
                 content=(
@@ -390,6 +486,64 @@ class GuardedRegistry(RememberingRegistry):
                 error="no confirmation is possible in this session",
             )
 
+        summary = self._describe()
+        if isinstance(summary, ToolResult) or summary is None:
+            return summary
+
+        self.memory.park_confirmation(name, summary)
+        return ToolResult(
+            ok=False, content=AWAITING_ANSWER, error="waiting for the customer to confirm"
+        )
+
+    def _spend(self, name: str, approved: PendingConfirmation) -> ToolResult | None:
+        """Let the checkout run, but only against what the person actually saw.
+
+        A person approves a basket, not a tool name. The turn that carries
+        their answer back is a whole `run_tool_loop` with every tool available,
+        so the model can call `add_to_cart` between the yes and the checkout —
+        and an approval bound to the name alone would spend a yes given for
+        €189.98 on a basket that is now €569.94. That is the same laundering
+        `_summarise` exists to prevent, one step later in the protocol: a
+        record saying somebody agreed to a figure they were never shown.
+
+        The comparison is against the summary itself rather than a separate
+        fingerprint, because the summary already *is* the thing they approved —
+        every line, every quantity, every price and the total, rendered through
+        `money.format_amount`. A second representation would be a second record
+        of one fact, and the first symptom would be the two disagreeing about
+        what "the same basket" means.
+
+        A change is not an error and is not a refusal: it is a new question.
+        The new summary is parked, the customer is asked about what the basket
+        is *now*, and — because `_settle_confirmation` drives exactly one
+        follow-up turn — that question lapses at their next message rather than
+        driving a loop the model controls. Raised by review on PR #10.
+        """
+        current = self._describe()
+        if isinstance(current, ToolResult) or current is None:
+            # Unreadable, or nothing left to buy. Both are already answered
+            # above: the first is a sentence about the cart, and the second
+            # lets the tool say "the cart is empty" in its own words.
+            return current
+        if current == approved.summary:
+            # The one path on which a checkout runs.
+            return None
+
+        self.memory.park_confirmation(name, current)
+        return ToolResult(
+            ok=False, content=BASKET_CHANGED, error="the basket changed after it was approved"
+        )
+
+    def _describe(self) -> ToolResult | str | None:
+        """What a person would be shown right now, read from the shop.
+
+        Three answers, and each is a different thing for the caller to do: a
+        string is the summary, `None` means there is nothing to confirm and the
+        tool should answer in its own words, and a `ToolResult` is the cart
+        being unreadable. One function because parking a question and spending
+        its answer have to describe the basket the same way — two renderers
+        would be two opinions about whether it changed.
+        """
         cart = super().dispatch(CART_TOOL, {})
         if not cart.ok:
             return ToolResult(
@@ -403,33 +557,19 @@ class GuardedRegistry(RememberingRegistry):
             )
 
         if _has_lines(cart.content):
-            summary = f"{PLACING}\n{_summarise(cart.content)}"
-        else:
-            # An empty cart here is not a mistake: `create_checkout` clears the
-            # cart when it places the order, so this is what a resume looks
-            # like. Summarise the order instead — the alternative is asking a
-            # person to approve a total of zero for a purchase that is real.
-            order = super().dispatch(ORDER_TOOL, {})
-            if not order.ok or not _has_lines(order.content):
-                # Nothing to confirm at all. Let the tool answer: "the cart is
-                # empty, add something" is its sentence and a better one than
-                # any question this gate could ask about nothing.
-                return None
-            summary = f"{RESUMING}\n{_summarise(order.content)}"
+            return f"{PLACING}\n{_summarise(cart.content)}"
 
-        if self._confirm(summary):
+        # An empty cart here is not a mistake: `create_checkout` clears the
+        # cart when it places the order, so this is what a resume looks like.
+        # Summarise the order instead — the alternative is asking a person to
+        # approve a total of zero for a purchase that is real.
+        order = super().dispatch(ORDER_TOOL, {})
+        if not order.ok or not _has_lines(order.content):
+            # Nothing to confirm at all. Let the tool answer: "the cart is
+            # empty, add something" is its sentence and a better one than any
+            # question this gate could ask about nothing.
             return None
-
-        return ToolResult(
-            ok=False,
-            content=(
-                "Error: the customer did not confirm the purchase, so no order "
-                "was placed and nothing was charged. Acknowledge that, and do "
-                "not call create_checkout again unless they ask for it in a "
-                "later message."
-            ),
-            error="the customer declined the purchase",
-        )
+        return f"{RESUMING}\n{_summarise(order.content)}"
 
 
 def _as_dict(raw_args: Any) -> dict[str, Any] | None:

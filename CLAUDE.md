@@ -49,7 +49,13 @@ tracked.
 | `agent/memory.py` | D9 | one conversation's state outside the message list |
 | `agent/profile.py` | D9 | what the shop remembers about a customer |
 | `agent/guardrails.py` | D9 | the confirmation gate and output validation |
-| `obs/` | D10 | Langfuse tracing |
+| `agent/confirmation.py` | D10 | the two-phase protocol the gate asks through |
+| `obs/redaction.py` | D10 | what must not leave this machine |
+| `obs/tracing.py` | D10 | Langfuse, behind a facade that cannot raise |
+| `obs/instrumentation.py` | D10 | the two wrappers that read what exists |
+| `evals/spec.py` | D10 | what a scenario is, and what it may claim |
+| `evals/expectations.py` | D10 | one function per claim the YAML can make |
+| `evals/runner.py` | D10 | drive, report, and undo by id |
 
 Search logic belongs in `catalog/`, never inside the MCP server. The server is
 a thin wrapper, which is what lets D5 swap transports without touching logic.
@@ -781,12 +787,102 @@ An instruction that states a precondition without stating how it is satisfied
 cannot be satisfied — it is not weak, it is unsatisfiable. The sentence is
 gone and `agent/guardrails.py` intercepts the call instead, shows a person what
 they are buying, and asks. There is no `confirmed` argument on purpose: an
-argument the model sets is a suggestion with a type annotation.
+argument the model sets is a suggestion with a type annotation. *How* it asks
+changed on D10 — it parks the question rather than blocking on the answer — and
+what it asks about did not; see the two-phase entry below.
 
 The same reasoning closed D2's older debt. The prompt said never do arithmetic
 in your head; the model did it anyway and was right, silently. So an amount in
 an answer is now checked against the amounts tools produced, with one retry and
 then a fallback that names the figure it could not trace.
+
+**The gate parks its question; it never blocks for the answer.** D9 called a
+`confirm` callable from inside `GuardedRegistry.dispatch`, which in the CLI
+meant a tool call suspended on `input()`. That was the right rule in the wrong
+shape, and two callers arriving after it could not use it at all: D10's eval
+runner has nobody at a keyboard, and D11's browser answers in a *later HTTP
+request* than the one that asked, so there is no callable that could block for
+it. Adapting a blocking protocol to either is not possible, so it was replaced
+once, before anything was built on it.
+
+`create_checkout` meets the gate, the cart is read through `view_cart`, the
+summary is *parked* on `ConversationMemory` and a `ToolResult` says a
+confirmation has been requested. The tool has not run. Whatever is presenting
+the conversation reads `memory.pending_confirmation`, puts it to whoever it can
+reach, records the answer, and drives one more turn carrying a system note; the
+next `create_checkout` spends that answer or is refused by it. Parking state
+the model never sees is the same answer `checkout_url` and `cart_id` already
+got, and this is the fourth piece.
+
+**The total a person approves still comes from `view_cart` and never from the
+model's prose.** That is the property D9 paid for and the one thing this
+rewrite was not allowed to lose. A person approving a figure the model invented
+is worse than no gate at all — it launders the invention through a human and
+leaves a record saying they agreed. `GuardedRegistry` therefore still dispatches
+`view_cart` itself and renders it through `money.format_amount`, and the test
+that holds it makes the model say a different number and checks the summary
+does not move.
+
+The visible cost is one sentence. The turn ends before anybody is asked, so the
+model answers first — "waiting for your confirmation" — and the summary and the
+`[y/N]` prompt follow it. That is a change to what the CLI prints and it was
+accepted deliberately; the alternative was reaching into `run_tool_loop`.
+
+**An approval is spendable on exactly one turn, and any customer message drops
+it.** The failure this is set against was seen in another codebase: a
+classifier deciding "did they say yes" from the *shape* of the word will read a
+"yes" aimed at some other question as authorisation to spend money. This gate
+never had that defect, because it asks the question itself and reads the answer
+to that question and no other — but a pending approval that outlives its turn
+hands the immunity back, since it is then an answer sitting apart from what it
+answered. `ConversationMemory.begin_turn(from_customer=True)` is what kills it,
+and it is load-bearing rather than decorative: a customer message advances to
+exactly the turn number the approval was good for, so the counter alone would
+let it through. `test_an_approval_given_but_never_carried_back_dies_on_the_next_message`
+is what fails without it.
+
+**An approval is for a basket, not for a tool name.** The turn that carries an
+answer back is a whole `run_tool_loop` with every tool available, so the model
+can call `add_to_cart` between the yes and the `create_checkout` that spends it.
+Binding the approval to the name alone spent a yes given for €189.98 on a
+basket that had become €569.94 — the same laundering `_summarise` exists to
+prevent, one step later in the protocol and with a record saying somebody
+agreed to a figure they were never shown. `_spend` re-reads the shop through
+`_describe` and compares against `PendingConfirmation.summary`.
+
+The comparison is against that summary rather than a separate fingerprint,
+because the summary already *is* what was approved — every line, quantity and
+price, rendered through `money.format_amount`. A second representation would be
+two records of one fact, and the first symptom would be the two disagreeing
+about what "the same basket" means. `_describe` is one function for the same
+reason: parking a question and spending its answer have to render the basket
+identically, and two renderers would be two opinions about whether it changed.
+
+A change is not a refusal but a new question — the new summary is parked and
+the customer is asked about what the basket is now. That cannot loop, because
+`_settle_confirmation` drives exactly one follow-up turn and the new question
+lapses at the customer's next message. This binds the model and not the shop,
+like the rest of the gate: another client holding the API key can still change
+a cart, which is the boundary the entry below draws. Raised in review on PR
+#10.
+
+`spendable_on_turn` is the single record of "answered, and for which turn".
+A `not pending.answered` check stood beside it for one round and was deleted:
+mutating it away failed nothing, because an unanswered question can never be in
+the window either. Two spellings of one fact, which is what this document
+refuses everywhere else — and the mutation surviving is how it was found rather
+than reasoned about.
+
+**`GuardedRegistry` takes `can_confirm: bool`, not a callable.** It no longer
+asks anybody, so holding a confirmer it never invokes would read as a bug to
+every reader after the first. What it still needs is D9's rule unchanged —
+nobody reachable means refuse, because a gate that cannot reach a person is not
+a gate — and that is a fact, not a function. The confirmer belongs to whatever
+is presenting the conversation, which is the only layer that knows how to reach
+a person: `_ask_to_confirm` in `llm/loop.py` prints and reads a line,
+`ScriptedConfirmer` answers from a rule for the runner, and D11's will do
+neither. **Nothing below the CLI may print or read one**, which is the check on
+whether the boundary is in the right place.
 
 **The gate binds the model, not the shop, and the boundary is deliberate.**
 `tools/commerce.py` holds plain functions anybody can import and the commerce
@@ -923,6 +1019,93 @@ attempt: tool calls are not a final answer. The guard also reads
 carries no symbol and no decimals, and a bypass reachable by writing a word is
 still a bypass. Both raised in review on PR #9.
 
+**A trace is the MCP log's question again, one step worse, and the repository
+was answering them differently.** `MCP_LOG_REDACT_QUERY` replaces `query` with a
+salted digest in a log that stays on this disk. A trace carries the same
+arguments *plus* the profile name, the amounts, the order id and the whole
+conversation to a third party, over the network — and would have redacted
+nothing. The stricter rule was on the weaker path, and that is the contradiction
+D10 had to settle before a single trace was sent.
+
+**`query` cannot be decided on its own, and that is the finding.** It is not the
+only free text in a trace and it is not even the first: the customer's message
+is what produced it, the model's answer quotes it back, and the system prompt
+carries `display_name` from the profile — measured rather than feared, in the
+D10 step 1 live run, where the model opened its answer with the customer's first
+name. Redacting the tool argument while sending the sentence it came from is
+theatre. So there is **one rule and one switch** covering every field a person
+wrote: `TRACE_REDACT_TEXT`, default true.
+
+Redacted: the `query` argument, user message content, assistant message
+content, the system prompt, and `SHOPPER_ID`. Not redacted: tool names, every
+other tool argument, tool results, amounts, order ids, product names, tokens,
+cost, latency, and which guardrail refused what. None of the second list is
+anybody's personal data — it is this shop's own data and this process's own
+measurements, and it is the whole reason a trace is worth having.
+
+The cost is stated rather than hidden: **with the switch on, a trace cannot
+answer "what did the customer say".** It answers what the plan asks of it —
+what the conversation cost, which tools ran in what order, which guardrail
+fired, where the time went. Turning it off on your own machine gives the rest
+back, the same bargain and the same default as `MCP_LOG_REDACT_QUERY`: the safe
+setting must not be the one somebody has to remember to type.
+
+`obs/redaction.py` is a **sibling** of `mcp_server`'s `redact_arguments()` and
+deliberately not an import of it. The server runs in its own process, so its
+per-process salt is a different secret and sharing the function would not share
+it; and `mcp_server/` is a thin protocol wrapper by rule, so giving it a
+dependency on this project's observability to save eight lines would invert the
+one direction that module may point in.
+
+**A tool result passes into a trace uncensored, and the boundary is worth
+naming.** It is the shop's own data — a catalogue row, a price, a stock count —
+and it is most of what makes a trace readable. But `view_cart` and
+`check_order_status` are not only that: their results carry the `order_id`, the
+amounts and what this customer chose, and today all three pass on the argument
+that none of them is a personal detail. That argument is about the fields those
+tools return *now*. The rule as written admits a field added later — an email
+on an order, a delivery address on a cart — and would pass it silently, because
+nothing in `redact_messages` looks at a `tool` message at all. This is a
+sentence rather than a guard on purpose: a filter would have to know which
+fields are which, and this project has no such list. What it means concretely
+is that adding a customer's own data to a commerce response is a change that has
+to reach `obs/redaction.py` in the same commit.
+
+**Tracing attaches around, never inside, and `run_tool_loop` is why.** Its
+source hashes to `161bdc1c…9d00` on `main` and on the D10 branch. Instrumentation
+is the easiest thing in this project to justify putting inside that `while`, and
+it is the one that would prove the claim was only ever true because nothing had
+wanted it enough. So `TracedClient` and `TracedRegistry` are the shape
+`GuardedClient` already is — forward by `__getattr__`, intercept the one method
+that matters.
+
+**`TracedClient` goes inside `GuardedClient`, and the order is load-bearing.**
+The amount guardrail can send a second, corrected request, and that request is
+really billed. Wrapped the other way round, the trace records one call where two
+happened and reports half the cost of every corrected turn. `TracedRegistry` is a
+forwarding wrapper rather than a fourth `ToolRegistry` subclass: `RememberingRegistry`
+and `GuardedRegistry` subclass because each *changes what dispatch does*, and
+this one only watches — extending the chain would tie tracing to guarding.
+
+**Nothing is measured twice.** `llm/usage.py` already computes tokens and cost;
+`ToolResult` already carries an outcome. The wrappers read those and add the one
+thing neither has, which is how long it took. `cost_details` carries our own
+number because Langfuse prices none of the `gpt-5.6-*` family and would report a
+confident $0.00 beside a CLI saying cents — and sending it means the two can be
+compared, which is the check that catches this layer double-counting a retry.
+
+**Tracing may not raise, and unconfigured is a normal state.** Missing keys mean
+no trace and nothing else changes — the call `stripe_secret_key` already gets,
+because a cart that cannot be browsed for want of an observability vendor is the
+wrong failure. Every SDK call is caught; the first failure warns once and the
+tracer goes inert for the session, because a diagnostic must not cause the
+outage it describes and a transcript carrying one stack trace per turn is one
+nobody reads to the end. **There is no structured-log fallback**, on purpose:
+the CLI already prints every tool call and cost and the MCP server already logs
+every call with its arguments, so a fallback would be a third rendering of the
+same facts kept in step by hand. The one thing it would add over those two is
+the *nesting*, and a flat log line cannot carry it.
+
 **Chat Completions, not the Responses API.** Responses keeps conversation state
 on the server, which hides the very loop this project exists to learn.
 
@@ -1019,6 +1202,55 @@ ends the conversation.
 name the field, state what was expected and say what to do next. The model is
 their only reader, and its next turn depends on them.
 
+**The eval suite's criterion is tool calls and database state, not text.**
+`evals/scenarios.yaml` says what this shop is claimed to do and
+`scripts/run_evals.py` settles it. The shape is D9's chain test rather than
+anything new, for the reason that test exists: an implementation producing a
+plausible final sentence while calling nothing at all satisfies every assertion
+about the words. `answer_matches` appears exactly once, in the scenario where
+the text *is* the measurement — an ambiguous request has to produce a question,
+and no tool log can show that.
+
+**There is no threshold that allows N failures in M runs, and there will not
+be.** D9 measured two identical runs producing eight and nine model calls, so
+the vocabulary in `evals/spec.py` can express only the invariants — which tools
+ran, the order of the ones where the order is causal, what they answered, what
+the database holds afterwards, whether a guardrail fired — and deliberately
+cannot express the variance: how many times a tool ran, how many model calls a
+turn took, or the exact words. `tools_in_order` is a *subsequence* for that
+reason. A threshold is a number somebody tunes until the suite is green; if a
+claim is not deterministic, the claim is wrong.
+
+That cuts both ways, and the first run proved it. The gate scenario ended at
+`say: place the order`, and the model answered by asking for confirmation
+itself instead of calling `create_checkout` — so no purchase was attempted, the
+gate never decided, and the scenario measured nothing. The fix is a second turn
+that carries the conversation past the model's own question, which is harmless
+in the branch where it does not ask. **The claim did not move; the conversation
+was made able to test it.** Widening an expectation to accept both outcomes
+would have been the other thing, and is what a threshold looks like before
+anyone calls it one.
+
+**The runner enters the loop by the door the CLI uses.** It calls
+`build_tool_setup` and hands `run_tool_loop` the registry that comes back, so
+the gate, the memory, the guardrails, the traced wrappers and the MCP catalog
+are the ones a customer gets; a confirmation is answered through
+`resolve_pending` and a follow-up turn, which is the D10 protocol and not a
+back door into the memory. `tests/test_evals.py` walks the runner's AST and
+fails if it constructs a registry of its own — the same mechanism
+`tests/test_lifecycle.py` uses for `transition()`, and for the same reason: a
+runner measuring a shop nobody uses would pass every behavioural test it had.
+
+**A scenario undoes itself by id, and a paid one is refunded rather than
+deleted.** Never a truncate, which would take the rows of whatever else was
+running. `paid -> cancelled` is not in the transition table, so scenario 10 —
+which pays with a signed `checkout.session.completed` — is undone with a signed
+`charge.refunded`: `apply_transition` moves it `paid -> refunded` and releases
+exactly the units it held. Nothing in `evals/` touches `inventory.reserved`,
+which is asserted rather than intended. Anything that could not be undone is
+named in the report and makes the scenario a failure, and the D10 collection
+guard stops the next `pytest` run if a row survives anyway.
+
 **Tests come in three kinds, and the marker says which.** Unmarked tests reach
 nothing outside the process — that is the default and the rule below. `db`
 tests connect to the local Postgres, because a schema and a seed are claims
@@ -1060,10 +1292,50 @@ back. The override is a plain function, not a generator — FastAPI closes
 generator dependencies, and closing that session would leave the test holding a
 dead one after its first request.
 
-Those tests also assume `orders` is empty. A real order left behind by a manual
-run fails them, and `--reset`'s RESTRICT then blocks `tests/test_seed.py` as
-well — correct behaviour from the guard, and a reminder to clean up after
-driving the API by hand.
+Those tests also assume `orders` is empty, and `tests/test_webhooks.py` assumes
+the same of `processed_events`. A real order left behind by a manual run fails
+them, and `--reset`'s RESTRICT then blocks `tests/test_seed.py` as well —
+correct behaviour from the guard, and a reminder to clean up after driving the
+API by hand.
+
+**That assumption is checked before the first test rather than discovered
+twenty-nine failures later.** It went wrong five times, and each time the
+failures appeared a long way from their cause — the shape of defect D8 recorded
+for `InFailedSqlTransaction`. `pytest_collection_modifyitems` in
+`tests/conftest.py` counts `orders` and `processed_events` when the run collects
+any `db` test, and stops it with one sentence naming the counts and the cleanup
+command. It **stops** rather than skipping: a skip reports success in green, and
+a green summary over a database that will make the suite lie is the exact trap
+D9 recorded when `452 passed, 380 skipped` was correct in every detail and
+unreadable. A run with no `db` test never opens a connection, so
+`pytest tests/test_money.py` stays free and offline.
+
+Cleaning up is `python scripts/manual_test_state.py restore`, which undoes rows
+created since the last snapshot. Anything older goes by hand, and an order
+holds stock: decrement `inventory.reserved` by its lines rather than zeroing the
+column — `catalog/seed.py` ships `FF-TRLGTX-42-BLK` with `reserved=2`
+deliberately, which is the mistake `manual_test_state.py` exists to document.
+
+**A fixture that omits a field the real object always has is a blind spot with
+the shape of coverage.** It has cost this project twice, in the same way both
+times: the test looks thorough, the assertion is real, and the defect is in the
+half the fixture never built.
+
+- D8: `refunded_event` carried no `payment_intent`, so no test could have
+  noticed that refunds were attributed by `metadata.order_id` rather than by the
+  PaymentIntent — and a refund of a superseded session's duplicate charge would
+  have driven a real order terminal.
+- D10: the tracing tests built messages with `content` and no `tool_calls`, so
+  none of them saw that a tool call's `arguments` are replayed verbatim into
+  every later generation's input. A live trace carried eighteen plaintext copies
+  of a search query beside a span that showed a digest.
+
+The rule that follows: **build a fixture from the shape the real object always
+has, not from the shape the assertion needs.** When a field is dropped for
+brevity, the thing being asserted has to be one that field cannot affect — and
+if that is not obvious, it is not true. The cheapest check is to read a real
+payload once and diff it against the fixture; both misses above are visible in
+ten seconds that way.
 
 **Tests reach no network and call no SDK method.** Importing `openai` is fine —
 `tests/test_client.py` imports `LLMClient`, which pulls it in — but the client

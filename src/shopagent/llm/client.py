@@ -14,6 +14,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
 from openai import OpenAI
 
 from shopagent.config import get_settings
@@ -91,7 +92,30 @@ class LLMClient:
         # api_key MUST be passed explicitly: the key deliberately never reaches
         # os.environ (config.py is the sole reader of the environment), so a
         # bare OpenAI() would always fail with "Missing credentials".
-        self._client = OpenAI(api_key=settings.openai_api_key)
+        # The timeout is configured rather than left to the SDK, and that is a
+        # bugfix rather than tidiness. `OpenAI(api_key=...)` defaults to
+        # `read=600s` with two retries, so a connection the peer has dropped
+        # stalls a turn for up to thirty minutes with nothing printed — which
+        # is exactly what a D10 eval pass did before it was killed. `connect`
+        # is short because failing to reach a host is quick to know; `read` is
+        # long because a completion legitimately takes seconds. See
+        # `config.py` for the worst case this multiplies out to.
+        #
+        # `write` and `pool` take the read value rather than the SDK's own, so
+        # every phase is bounded by something this project chose. A pool
+        # timeout matters here for the reason the outage did: the stalled
+        # sockets were in CLOSE_WAIT, and waiting for one to free up is its own
+        # way to hang.
+        self._client = OpenAI(
+            api_key=settings.openai_api_key,
+            timeout=httpx.Timeout(
+                connect=settings.openai_connect_timeout_seconds,
+                read=settings.openai_read_timeout_seconds,
+                write=settings.openai_read_timeout_seconds,
+                pool=settings.openai_read_timeout_seconds,
+            ),
+            max_retries=settings.openai_max_retries,
+        )
         self.model = settings.openai_model
         self.embedding_model = settings.embedding_model
         self.reasoning_effort = settings.openai_reasoning_effort

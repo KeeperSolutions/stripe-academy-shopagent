@@ -412,3 +412,127 @@ def test_embed_refuses_an_empty_batch_without_calling_the_api(embedding_client):
 
     assert calls == []
     assert embedding_client.tracker.calls == []
+
+
+# --- the request timeout (D10, step 4) ------------------------------------
+#
+# `OpenAI(api_key=...)` defaults to `read=600s` with two retries, which is not
+# a default anybody chose: a connection the peer has dropped stalls a turn for
+# up to thirty minutes with nothing printed. That is not hypothetical — a D10
+# eval pass sat there for ten minutes before it was killed, with `lsof` showing
+# no open socket to OpenAI and four in CLOSE_WAIT.
+
+
+def test_the_client_carries_the_configured_timeout_and_retries():
+    """Read from the client, not from a constant this file wrote.
+
+    The same shape as D7's `STRIPE_API_VERSION` pin: asserting that a module
+    constant equals itself proves nothing about the object that was built.
+    """
+    from shopagent.config import get_settings
+
+    settings = get_settings()
+    built = LLMClient()._client
+
+    assert built.timeout.connect == settings.openai_connect_timeout_seconds
+    assert built.timeout.read == settings.openai_read_timeout_seconds
+    assert built.timeout.write == settings.openai_read_timeout_seconds
+    assert built.timeout.pool == settings.openai_read_timeout_seconds
+    assert built.max_retries == settings.openai_max_retries
+
+
+def test_every_phase_is_bounded_by_something_this_project_chose():
+    """`write` and `pool` too, and `pool` for the reason the outage happened.
+
+    The stalled sockets were in CLOSE_WAIT, and waiting for one of those to
+    free up is its own way to hang — a bound on `read` alone would have left
+    that path open.
+    """
+    timeout = LLMClient()._client.timeout
+
+    assert None not in (timeout.connect, timeout.read, timeout.write, timeout.pool)
+
+
+def test_the_timeout_is_not_the_sdk_default():
+    """The half of the claim the test above cannot make.
+
+    D7 recorded why: comparing a client's effective value against the constant
+    proves nothing on its own, because a client that was never configured
+    resolves to *some* value too. What says this project chose it is that it
+    differs from what the SDK would have used.
+    """
+    from openai._constants import DEFAULT_TIMEOUT
+
+    from shopagent.config import get_settings
+
+    assert get_settings().openai_read_timeout_seconds < DEFAULT_TIMEOUT.read
+    assert LLMClient()._client.timeout.read < DEFAULT_TIMEOUT.read
+
+
+def test_a_dead_connection_is_given_up_on_inside_five_minutes():
+    """The number nobody derives while reading three separate fields.
+
+    `(connect + read) x (1 + retries)` is what a person waits when the
+    connection has *stopped* — nothing arriving, which is the outage this
+    setting exists for. It is the criterion the values were chosen against, so
+    it is asserted rather than left in a comment: raising `read` to the SDK's
+    600 fails here with the reason attached.
+
+    **It is not a request deadline, and the name says stall rather than wait
+    for that reason.** `httpx.Timeout` is per phase and measures inactivity, so
+    a response arriving slowly can outlast `read` legitimately, and the SDK's
+    backoff between retries adds more. Asserting a total bound would mean
+    building one — a deadline around the call — which is a change this project
+    has not made and should not pretend to have. Raised by review on PR #10.
+
+    The dominant term is the retries: lowering `OPENAI_MAX_RETRIES` shortens
+    this at the cost of recovering from a transient 5xx, where lowering the
+    read timeout starts cutting off answers that were going to arrive.
+    """
+    from shopagent.config import get_settings
+
+    settings = get_settings()
+    worst_case = (
+        settings.openai_connect_timeout_seconds + settings.openai_read_timeout_seconds
+    ) * (1 + settings.openai_max_retries)
+
+    assert worst_case == 300.0
+    assert worst_case <= 300.0, f"a dead connection would stall a turn for {worst_case}s"
+
+
+def test_a_timed_out_turn_reaches_the_customer_as_a_sentence(monkeypatch, capsys):
+    """A timeout that prints a traceback is half a fix.
+
+    `_run_session` already catches, rolls the broken turn back and prints one
+    line; this pins that the timeout arrives there rather than escaping. The
+    message is terse — "APITimeoutError: Request timed out." — but it is a
+    message, the prompt comes back, and the conversation is not corrupted.
+    """
+    import builtins
+    from contextlib import ExitStack
+
+    import httpx
+    import openai
+
+    from shopagent.agent import profile as profiles
+    from shopagent.llm.loop import _run_session, build_tool_setup
+
+    class TimesOut:
+        model = "gpt-5.6-luna"
+
+        def chat_with_tools(self, messages, tools=None):
+            raise openai.APITimeoutError(
+                request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+            )
+
+    typed = iter(["what is in my cart?", "/exit"])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(typed))
+    monkeypatch.setattr(profiles, "load_for_session", lambda shopper_id: (None, None))
+
+    with ExitStack() as stack:
+        setup = build_tool_setup(stack, catalog_enabled=False)
+        _run_session(TimesOut(), UsageTracker(), setup)
+
+    printed = capsys.readouterr().out
+    assert "[error] APITimeoutError" in printed
+    assert "Traceback" not in printed

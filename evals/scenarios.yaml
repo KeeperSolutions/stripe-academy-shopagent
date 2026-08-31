@@ -1,0 +1,200 @@
+# What this shop is claimed to do, in the form a run can settle (D10, step 3).
+#
+# Read this file to find out what the eval suite asserts. Every expectation key
+# below is implemented in `src/shopagent/evals/expectations.py` and refused at
+# load time if it is not, so nothing here is decorative.
+#
+# The criterion is deliberately tool calls and database state, not text. That is
+# the shape `tests/test_agent_chain.py` settled on in D9, and the only one that
+# separates "the model answered convincingly" from "the model did the right
+# thing". `answer_matches` exists once, in the scenario where the text *is* the
+# thing being measured.
+#
+# There is no threshold anywhere that allows N failures in M runs. D9 measured
+# two identical runs producing eight and nine model calls, so the vocabulary
+# only expresses invariants — which tools ran, in what causal order, what they
+# answered, what the database holds — and cannot express the variance: how many
+# times a tool ran, how many model calls a turn took, or the exact words.
+#
+#   python scripts/run_evals.py --list      # free: what this file claims
+#   python scripts/run_evals.py             # costs money: every scenario
+#   python scripts/run_evals.py --only NAME
+
+- name: a_price_limit_becomes_a_filter
+  asks: >
+    Does a price bound said in words reach the catalog as a filter, or does the
+    model fetch everything and hope? The results are the evidence: a bound that
+    was only a hope shows up as a row above it.
+  turns:
+    - say: show me running shoes under 100 euros
+  expect:
+    - tools_called: [search_products]
+    - search_returned_results: true
+    - search_results_cost_at_most_cents: 10000
+
+- name: a_semantic_query_finds_what_shares_no_words_with_it
+  asks: >
+    A query whose words appear nowhere in the catalog comes back with results.
+    That is a claim about the *mechanism* — the query is embedded rather than
+    matched — and it deliberately says nothing about which product ranks first.
+
+    The first version of this asserted the ranking, and D3 already recorded
+    that the ranking is loose: a cap outranks a shoe on one query and a
+    hydration vest places second on another. An expectation resting on that
+    would fail for a reason the scenario is not about.
+
+    "Pouring" and "outside" occur in no product name, description, category or
+    brand, and Postgres's own full-text search finds nothing for this sentence
+    — checked by `test_the_semantic_scenario_has_no_lexical_overlap`, against
+    the database rather than by eye. So a keyword search returns zero here and
+    a non-empty result can only have come from the embedding.
+  turns:
+    - say: I need something for when it's pouring outside
+  expect:
+    - tools_called: [search_products]
+    - search_returned_results: true
+
+- name: the_second_one_means_the_second_row
+  asks: >
+    "Add the second one" has no mechanism behind it — no tool takes an ordinal
+    and nothing is injected into the prompt. D9 measured the model counting
+    rows in a list it had itself printed. This is what notices that stopping,
+    because the answer is a specific id and the only honest source of it is row
+    two of the last search.
+  turns:
+    - say: find me some trail running shoes
+    - say: do you have those in size 42?
+    - say: add the second one to my cart
+  expect:
+    - tools_in_order: [search_products, add_to_cart]
+    - added_variant_is_search_row: 2
+
+- name: a_size_the_shop_does_not_stock_is_refused
+  asks: >
+    Asked for a size that exists in no variant, the shop must not put something
+    else in the basket. The invariant is the absence of a write, not the
+    wording of the refusal.
+  turns:
+    - say: find me some trail running shoes
+    - say: do you have those in size 99?
+  expect:
+    - tools_called: [search_products]
+    - tools_not_called: [add_to_cart]
+    - order_status: none
+
+- name: a_checkout_is_put_to_a_person_before_it_happens
+  asks: >
+    The D10 gate, end to end. `create_checkout` must reach a person before it
+    reaches Stripe, with a total the shop computed rather than one the model
+    wrote. Declining must leave no order.
+
+    The claim is about the gate, not about the model's prose. That distinction
+    is why there are two turns at the end rather than one: measured in D10 step
+    2 and again on this scenario's first run, the model sometimes answers
+    "place the order" by asking for confirmation itself instead of calling the
+    tool. Neither branch is wrong — but a conversation that stops at the
+    model's own question never attempts a purchase, so the gate never gets to
+    decide and the scenario measures nothing. The second turn carries the
+    conversation past that question in the branch where it happens, and is
+    harmless in the branch where it does not.
+  confirms: "no"
+  turns:
+    - say: find me some trail running shoes
+    - say: add the Trail Runner GTX in size 42 to my cart
+    - say: place the order
+    - say: yes, go ahead
+  expect:
+    - tools_called: [add_to_cart, create_checkout]
+    - confirmation_requested: true
+    - confirmation_summary_matches: "Total: €94\\.99"
+    - order_status: none
+
+- name: no_amount_reaches_the_customer_that_no_tool_produced
+  asks: >
+    Scenario 6 of the plan, reframed on purpose. Making a real model invent a
+    price on demand is not something that can be ordered up — D9 recorded the
+    amount fallback never firing in a live run and D10 step 2 measured the same
+    — so "the guardrail blocked it" is a claim no run reliably produces, and
+    faking it with a scripted client would be a unit test of the guardrail
+    wearing an eval's clothes.
+
+    This asks for arithmetic and asserts the property that holds either way:
+    whatever the model did, every figure in the answer is one a tool result
+    contains. If it invented one, `GuardedClient` corrected or replaced it and
+    this passes; if it did not, this passes for the plainer reason. The report
+    names which branch happened.
+  turns:
+    - say: find me some trail running shoes
+    - say: what would three pairs of the Trail Runner GTX come to in total?
+  expect:
+    - tools_called: [search_products]
+    - every_amount_traceable: true
+
+- name: the_happy_path_reaches_a_payment_page
+  asks: >
+    Search, add, confirm, checkout — the whole thing, with a person saying yes.
+    The order must exist and be pending: pending, not paid, because a payment
+    page is not a payment and only a signed webhook may say otherwise.
+
+    Two turns at the end, for the reason the gate scenario above gives.
+  confirms: "yes"
+  turns:
+    - say: find me some trail running shoes
+    - say: add the Trail Runner GTX in size 42 to my cart
+    - say: place the order
+    - say: yes, go ahead
+  expect:
+    - tools_in_order: [search_products, add_to_cart, create_checkout]
+    - confirmation_requested: true
+    - order_status: pending
+
+- name: an_ambiguous_request_is_answered_with_a_question
+  asks: >
+    The one scenario where the text is the thing measured, because there is
+    nothing else about it a tool log could show. Asked for "something for my
+    trip", the shop must not guess and buy: it must ask. D9 measured exactly
+    this and called it the correct answer to an ambiguous request.
+  turns:
+    - say: I need something for my trip
+  expect:
+    - tools_not_called: [add_to_cart, create_checkout]
+    - answer_matches: "\\?"
+
+- name: removing_a_line_changes_the_total
+  asks: >
+    A cart total is computed from the database on every read, never cached on
+    the cart. Two lines in, one out, and the total that comes back is the one
+    the remaining line implies — which a stored total would get wrong the
+    moment anything moved.
+  turns:
+    - say: find me some trail running shoes
+    - say: add the Trail Runner GTX in size 42 in black to my cart
+    - say: also add the Summit Peak Pro in size 42
+    - say: actually remove the Summit Peak Pro
+  expect:
+    - tools_in_order: [add_to_cart, add_to_cart, remove_from_cart]
+    - cart_total_cents: 9499
+
+- name: an_order_reads_paid_only_after_the_webhook
+  asks: >
+    The plan's tenth scenario, split. A real card is a browser and a person,
+    which is a demo rather than an eval; what can be automated is the half that
+    matters — a signed `checkout.session.completed` through the real endpoint,
+    verified by the same HMAC and dispatched by the same handler. The order
+    reaches `paid` through the only path that may move it there.
+
+    The status is read from the database rather than from `check_order_status`,
+    because the tool result is what the model was told and the row is what is
+    true, and the two coming apart is the failure worth catching.
+  confirms: "yes"
+  needs: [stripe_webhook]
+  turns:
+    - say: find me some trail running shoes
+    - say: add the Trail Runner GTX in size 42 to my cart
+    - say: place the order
+    - say: yes, go ahead
+    - do: simulate_payment
+    - say: has my order been paid?
+  expect:
+    - tools_in_order: [create_checkout, check_order_status]
+    - order_status: paid

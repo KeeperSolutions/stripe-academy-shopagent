@@ -55,6 +55,39 @@ class Settings(BaseSettings):
     # Completions on purpose. Blank means the parameter is not sent at all,
     # which is what a model that does not know it needs (e.g. gpt-4o-mini).
     openai_reasoning_effort: OptionalStr = "none"
+    # How long one request to the model may take, and how many times the SDK
+    # may try again. Configured because the default is not a default anybody
+    # chose: `OpenAI(api_key=...)` ships `read=600s` with two retries, so a
+    # connection the peer has dropped stalls a turn for up to thirty minutes
+    # with nothing printed. Measured, not argued — a D10 eval pass hung there
+    # for ten minutes and was killed, and `lsof` showed no open socket to
+    # OpenAI and four in CLOSE_WAIT.
+    #
+    # **A dead connection is given up on within (connect + read) x (1 +
+    # retries) = (10 + 90) x 3 = 300 seconds.** That is the number to know, and
+    # it is spelled out because nobody derives it while reading three separate
+    # fields.
+    #
+    # It bounds a *stall*, not a request. `httpx.Timeout` is per phase and
+    # measures inactivity: `read=90` means ninety seconds with no byte
+    # arriving, not ninety seconds in total, so a response that trickles can
+    # legitimately outlast it, and the SDK's backoff between retries is on top.
+    # Bounding total wall clock would need a deadline around the call — a real
+    # change, deliberately not made, because the failure being fixed here is a
+    # connection that has stopped rather than one that is slow. Raised by
+    # review on PR #10, which was right about the semantics.
+    #
+    # The dominant term is the retries, not the read: whoever wants a shorter
+    # worst case should lower `OPENAI_MAX_RETRIES` first, which costs only the
+    # recovery from a transient 5xx, where lowering the read timeout starts
+    # cutting off answers that were going to arrive.
+    #
+    # 90 seconds is roughly forty times the slowest completion this project has
+    # measured (2.3s, in the D10 traces), which is headroom for a longer prompt
+    # and a bad afternoon rather than a guess.
+    openai_connect_timeout_seconds: float = Field(default=10.0, gt=0)
+    openai_read_timeout_seconds: float = Field(default=90.0, gt=0)
+    openai_max_retries: int = Field(default=2, ge=0)
 
     # --- MCP (D4-D5) ---
     # The off switch for the catalog. The agent loop registers the MCP tools
@@ -133,6 +166,30 @@ class Settings(BaseSettings):
     # repository shared one profile with whoever ran it last.
     shopper_id: OptionalStr = None
 
+    # --- Observability (D10) ---
+    # Both keys optional, and for the reason `stripe_secret_key` is rather than
+    # the reason `shopagent_api_key` is not: observability is one part of this
+    # system, not a precondition for the rest. A shop that cannot be traced is
+    # a shop with a gap in its instrumentation; a shop that will not start
+    # because nobody configured a trace exporter is a worse failure than the
+    # one it was trying to prevent. Missing keys mean tracing quietly does not
+    # happen — see `obs/tracing.py`.
+    langfuse_public_key: OptionalStr = None
+    langfuse_secret_key: OptionalStr = None
+    langfuse_host: str = "https://cloud.langfuse.com"
+    # Whether free text is replaced with a salted digest before a trace leaves
+    # this process. Default true, the same shape and the same argument as
+    # `mcp_log_redact_query` — and a stronger version of it, because that log
+    # stays on this disk while a trace goes to a third party over the network.
+    #
+    # It covers every field a person wrote, not only `query`: the customer's
+    # messages, the model's prose and the system prompt, which carries
+    # `display_name` from the profile. Redacting the tool argument while
+    # sending the sentence it came from would be theatre. What it costs is the
+    # ability to read a trace as a conversation; what it keeps is every
+    # question the trace exists to answer. See `obs/redaction.py`.
+    trace_redact_text: bool = True
+
     # --- Stripe (D7-D8) ---
     # Optional, and deliberately not treated the way `shopagent_api_key` is.
     # That key gates every request, so the API refuses to start without it;
@@ -210,12 +267,6 @@ class Settings(BaseSettings):
                 "prints, or read it from the endpoint's page in the dashboard."
             )
         return value
-
-    # --- Langfuse (D10) --- same, only populated on D10
-    langfuse_public_key: OptionalStr = None
-    langfuse_secret_key: OptionalStr = None
-    langfuse_host: str = "https://cloud.langfuse.com"
-
 
     @property
     def success_url(self) -> str:

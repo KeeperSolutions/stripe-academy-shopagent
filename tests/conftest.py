@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
 # Imported for the side effect of registering the commerce tables on the
@@ -28,11 +28,103 @@ from shopagent.catalog.models import Base
 from shopagent.db import ensure_vector_extension, get_engine
 
 
+# --- the state a manual run leaves behind (D10, step 1) ------------------
+#
+# The tables a manual run writes to and that some tests assume are empty. Not
+# `carts`: five of them can sit in this database with nothing failing, and a
+# guard that stops the suite over rows nothing reads would be a guard people
+# learn to work around.
+DIRTY_TABLES = ("orders", "processed_events")
+
+CLEAN_UP_COMMAND = "python scripts/manual_test_state.py restore"
+
+
+def pytest_collection_modifyitems(config, items):
+    """Stop before the first test if the database still holds commerce rows.
+
+    Five times now, a leftover order has turned ~29 tests red for a reason with
+    nothing to do with what changed: `test_api_orders` and
+    `test_commerce_models` assert `orders` is empty, `test_seed` then dies on
+    the `ON DELETE RESTRICT` that stops a reset taking order history with it,
+    and `test_webhooks` asserts the same thing about `processed_events`. The
+    defect appears a long way from its cause, which is the shape of failure D8
+    already recorded for `InFailedSqlTransaction`.
+
+    **Not a skip.** A skip reports "nothing to see here" in green, and D9
+    measured what that costs: a run that said `452 passed, 380 skipped` in
+    green while the Docker daemon was down, correct in every detail and
+    unreadable. A dirty database is not a reason to report success.
+
+    **Not twenty-nine failures.** That is the thing being removed.
+
+    **Not one failure plus twenty-eight skips**, which would read best of all
+    and needs a marker on twenty-nine tests across four files — a refactor, and
+    a second record in `conftest.py` of which tests assume what. A partly green
+    run over a database known to be lying is also a worse report than one that
+    did not start.
+
+    So the run stops with one sentence naming the counts and the command. It is
+    deliberately broader than the tests that actually assert emptiness: it fires
+    whenever *any* `db` test is collected, because narrowing it means listing
+    those four modules here, and that list goes stale the first time somebody
+    writes a fifth. The cost of being broad is one command; the cost of being
+    stale is this paragraph again.
+
+    **A row is not proof that somebody drove the API by hand.** `stripe listen`
+    forwards deliveries for as long as it runs, so an event from an earlier
+    session — a Checkout Session expiring half an hour later, a refund settling
+    — lands in `processed_events` while nobody is doing anything at all. That
+    happened on D10: the guard fired after an eval pass whose own rows had all
+    been cleaned up, on one genuine `checkout.session.expired`. The message
+    says so, because the first encounter otherwise reads as the guard being
+    broken rather than as it working.
+    """
+    if not any(item.get_closest_marker("db") for item in items):
+        # Nothing collected touches Postgres — do not even connect. This is
+        # what keeps `pytest tests/test_money.py` free and offline.
+        return
+
+    engine = get_engine()
+    try:
+        with engine.connect() as connection:
+            leftovers = {
+                table: connection.execute(
+                    text(f"SELECT count(*) FROM {table}")  # noqa: S608 - a literal from DIRTY_TABLES
+                ).scalar_one()
+                for table in DIRTY_TABLES
+            }
+    except (OperationalError, ProgrammingError):
+        # Unreachable, or the schema is not built yet. Both are already handled
+        # — the `engine` fixture skips with its own explanation — and neither is
+        # this guard's business.
+        return
+
+    dirty = {table: count for table, count in leftovers.items() if count}
+    if not dirty:
+        return
+
+    counts = ", ".join(f"{count} {table}" for table, count in dirty.items())
+    pytest.exit(
+        f"\nThe database still holds rows these tests assume are not there: {counts}.\n"
+        f"This is not a regression — around 29 db tests assert these tables are "
+        f"empty and would fail for that reason alone.\n"
+        f"Usually a manual run through /docs or the CLI. It can also be a real "
+        f"Stripe delivery: `stripe listen` keeps forwarding for as long as it "
+        f"runs, so a session expiring or a refund settling from an earlier "
+        f"session records an event here with nobody at the keyboard.\n"
+        f"Clean up with:  {CLEAN_UP_COMMAND}\n"
+        f"(That deletes rows created since the last snapshot. Anything older "
+        f"has to go by hand, and an order holds stock: decrement "
+        f"inventory.reserved by its lines rather than zeroing the column.)",
+        returncode=1,
+    )
+
+
 @pytest.fixture(autouse=True)
 def no_accidental_api_calls(request, monkeypatch):
     """Make an unmarked test that reaches a paid or external API fail loudly.
 
-    Two providers, one mechanism: replace the module attribute every call has
+    Three providers, one mechanism: replace the module attribute every call has
     to pass through with something that raises, unless the test carries the
     marker that says it meant it.
 
@@ -81,6 +173,33 @@ def no_accidental_api_calls(request, monkeypatch):
         monkeypatch.setattr(
             "stripe._api_requestor._APIRequestor.request_async", refuse_stripe
         )
+
+    # Langfuse, because D10 introduces a third way out of the process — and the
+    # only one that carries the *conversation* rather than a query or an
+    # amount. The seam is the OTLP exporter, which is where span data actually
+    # leaves: building a Langfuse client is free and the tests below build real
+    # ones with an in-memory exporter, exactly as an offline test legitimately
+    # builds a Stripe client to read back the pinned API version.
+    #
+    # No escape marker, and that asymmetry is deliberate. `network` and
+    # `stripe` exist because some tests have a real reason to reach those APIs —
+    # whether the embedding model is any good is a question no fake can answer.
+    # No test in this project has a reason to reach Langfuse: the SDK is
+    # exercised through a capturing exporter and the live check is a manual run.
+    # A guard with a door nobody uses is a door somebody eventually props open;
+    # the marker gets added on the day a test needs it.
+    def refuse_langfuse(*args, **kwargs):
+        raise AssertionError(
+            "this test tried to send spans to Langfuse. Traces carry the "
+            "conversation off this machine — build the client with "
+            "span_exporter=InMemorySpanExporter() instead, the way "
+            "tests/test_tracing.py does."
+        )
+
+    monkeypatch.setattr(
+        "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter.export",
+        refuse_langfuse,
+    )
 
 
 @pytest.fixture(scope="session")

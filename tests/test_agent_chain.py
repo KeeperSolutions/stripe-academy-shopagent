@@ -31,6 +31,15 @@ buying at a total read from `view_cart`, and asks. A registry built without a
 `confirm` callable refuses the purchase, which is the safe default and is what
 this test gets unless it passes one. Step 6 is the run that means something.
 
+**D10 made that gate non-blocking, and this file had to be told.** The gate no
+longer calls anybody in the middle of a dispatch: it parks the question and the
+caller answers it between turns. So the driver below does what the CLI's
+`_settle_confirmation` does — `resolve_pending`, then one more `run_tool_loop`
+carrying the answer — and turn 5 is now two model calls rather than one. That
+is a change to what this test costs and to what its transcript looks like, not
+to what it measures: the tool the model reaches for is still recorded under the
+turn that prompted it. Adapted without being run; D10 step 4 is the run.
+
 **Marking.** `network` and `db`, and the running API is a skip rather than a
 third marker. A marker decides whether a test is *selected*, and selection in
 this project turns on what a run costs — `network` spends tokens, `stripe`
@@ -66,6 +75,7 @@ import httpx
 import pytest
 from sqlalchemy import text
 
+from shopagent.agent import confirmation
 from shopagent.config import REPO_ROOT, get_settings
 from shopagent.llm.client import LLMClient
 from shopagent.agent.prompt import initial_messages
@@ -246,23 +256,18 @@ def test_the_model_holds_the_five_tool_chain(name, commerce_api, engine, capsys)
     trace = Trace()
     record_replies(client, trace)
 
-    confirmations = []
-
-    def confirm(summary: str) -> bool:
-        """A test saying yes on a person's behalf, and saying so out loud.
-
-        The gate refuses when there is nobody to ask, which is what a chain run
-        without this argument would hit — correctly, and uninformatively. What
-        this measurement is about is whether the model reaches the gate, so the
-        harness answers it and records the summary it was shown, and the
-        assertion below is that a person would have been shown a real cart
-        rather than a total the model made up.
-        """
-        confirmations.append(summary)
-        return True
+    # A test saying yes on a person's behalf, and keeping what it was shown.
+    #
+    # The gate refuses when there is nobody to ask, which is what a chain run
+    # without this argument would hit — correctly, and uninformatively. What
+    # this measurement is about is whether the model reaches the gate, so the
+    # harness answers it and records the summary it was shown, and the
+    # assertion below is that a person would have been shown a real cart rather
+    # than a total the model made up.
+    confirmer = confirmation.ScriptedConfirmer(answer=True)
 
     with ExitStack() as stack:
-        setup = build_tool_setup(stack, catalog_enabled=True, confirm=confirm)
+        setup = build_tool_setup(stack, catalog_enabled=True, confirm=confirmer)
         if not setup.catalog_available:
             pytest.skip(f"the catalog server did not start: {setup.note}")
 
@@ -273,8 +278,25 @@ def test_the_model_holds_the_five_tool_chain(name, commerce_api, engine, capsys)
         try:
             for index, (prompt, _) in enumerate(turns, start=1):
                 trace.turn = index
+                setup.memory.begin_turn(from_customer=True)
                 messages.append({"role": "user", "content": prompt})
                 run_tool_loop(client, registry, messages, schemas)
+
+                # The second half of D10's protocol, driven here rather than
+                # imported from `llm/loop.py`: what the CLI does is these two
+                # calls, and a test that had to reach into the CLI to exercise
+                # the gate would be evidence the protocol is not one. The turn
+                # number is left alone, so a `create_checkout` that only runs
+                # after the answer is still attributed to the turn that asked
+                # for it.
+                answered = confirmation.resolve_pending(setup.memory, confirmer)
+                if answered is not None:
+                    setup.memory.begin_turn(from_customer=False)
+                    messages.append({
+                        "role": "system",
+                        "content": confirmation.follow_up_note(answered),
+                    })
+                    run_tool_loop(client, registry, messages, schemas)
         finally:
             leftovers = clean_up(commerce_api, setup.memory, engine)
             path = write_transcript(name, turns, trace, tracker, leftovers)
@@ -297,8 +319,8 @@ def test_the_model_holds_the_five_tool_chain(name, commerce_api, engine, capsys)
     # The gate was reached and a person was shown the cart, not a figure the
     # model produced. Without this the test would pass on a chain that called
     # `create_checkout` through a gate that had been quietly disabled.
-    assert confirmations, "create_checkout ran without anybody being asked"
-    assert "Total:" in confirmations[-1]
+    assert confirmer.asked, "create_checkout ran without anybody being asked"
+    assert "Total:" in confirmer.asked[-1]
 
 
 # --- taking the rows back out --------------------------------------------

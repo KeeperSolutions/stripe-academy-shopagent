@@ -46,6 +46,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from shopagent.agent.confirmation import (
+    CONFIRMATION_LIFETIME_TURNS,
+    PendingConfirmation,
+)
 from shopagent.tools.registry import ToolRegistry, ToolResult
 
 # The tool whose result *is* the list a customer is looking at.
@@ -134,6 +138,16 @@ class ConversationMemory:
     # of it. Measured on PR #9.
     checkout_url: str | None = None
 
+    # The fourth piece of state the model never sees, and the only one that is
+    # a question rather than a value: what a person has been asked to approve,
+    # and what they said. Parked here by `agent/guardrails.py` and read by
+    # whatever is presenting this conversation — see `agent/confirmation.py`
+    # for why the gate stopped asking anybody itself.
+    _pending: PendingConfirmation | None = None
+    # Counted so an approval cannot outlive the turn it was given for. Every
+    # turn a caller drives increments it; nothing else does.
+    _turn: int = 0
+
     _last_search: LastSearch | None = None
     _seen_variant_ids: set[int] = field(default_factory=set)
     _seen_amount_cents: set[int] = field(default_factory=set)
@@ -219,6 +233,101 @@ class ConversationMemory:
             )
 
         return Reference(result=self._last_search.results[position - 1])
+
+    # --- the confirmation a person has been asked for (D10, step 1) ------
+    #
+    # This module records and refuses nothing, which is still true: what a
+    # person was asked and what they answered are facts about this
+    # conversation, and the rule that reads them lives in
+    # `agent/guardrails.py`. What is here beyond storage is the *lifetime*,
+    # because a lifetime cannot be enforced by a reader — it has to be enforced
+    # by whatever advances time, and that is `begin_turn`.
+
+    @property
+    def turn(self) -> int:
+        """How many turns a caller has driven in this conversation."""
+        return self._turn
+
+    @property
+    def pending_confirmation(self) -> PendingConfirmation | None:
+        """What a person has been asked to approve, if anything."""
+        return self._pending
+
+    def begin_turn(self, *, from_customer: bool) -> None:
+        """Advance to the next turn, and expire an approval that has aged out.
+
+        `from_customer` is the whole point of the parameter list. A turn the
+        caller drives to carry an answer back to the model is a continuation of
+        the question; a turn that starts because the customer typed something
+        else is not, and it drops the pending confirmation whether or not it
+        was answered.
+
+        The failure this prevents is an approval read as an answer to a
+        question it was not given for — the shape of defect that appears
+        wherever a "yes" is recognised by its wording rather than by what it
+        replies to. This gate asks explicitly, so it never had that defect;
+        letting an approval survive a turn would hand it back.
+        """
+        self._turn += 1
+        pending = self._pending
+        if pending is None:
+            return
+        if from_customer:
+            self._pending = None
+        elif pending.spendable_on_turn != self._turn:
+            # Either nobody answered it, or it was answered and the turn it was
+            # good for has been and gone.
+            self._pending = None
+
+    def park_confirmation(self, tool: str, summary: str) -> PendingConfirmation:
+        """Record that a person is being asked about `tool`, showing `summary`.
+
+        Replaces whatever was parked. There is only ever one question in front
+        of a person at a time, and a second one arriving means the first was
+        never answered — keeping it would leave an unanswered approval to be
+        found later by something looking for one.
+        """
+        self._pending = PendingConfirmation(
+            tool=tool, summary=summary, raised_on_turn=self._turn
+        )
+        return self._pending
+
+    def answer_confirmation(self, answer: bool) -> PendingConfirmation | None:
+        """Record what the person said. Returns what they answered, or `None`.
+
+        `None` when there was nothing parked or it had already been answered —
+        a caller resolving the same confirmation twice is a bug in the caller,
+        and the honest answer is that its second attempt changed nothing rather
+        than an exception in the middle of a conversation.
+        """
+        pending = self._pending
+        if pending is None or pending.answered:
+            return None
+        pending.answer = bool(answer)
+        pending.spendable_on_turn = self._turn + CONFIRMATION_LIFETIME_TURNS
+        return pending
+
+    def take_confirmation(self, tool: str) -> PendingConfirmation | None:
+        """The answer to `tool`'s question, if there is one to spend now.
+
+        Clears as it reads, for the reason `take_checkout_url` does: an
+        approval that stays put is one that can be spent twice, and the second
+        purchase would be one nobody was asked about.
+        """
+        pending = self._pending
+        if pending is None or pending.tool != tool:
+            return None
+        if pending.spendable_on_turn != self._turn:
+            # One check for two refusals, because `spendable_on_turn` is one
+            # record of both facts: it is `None` until somebody answers, and it
+            # names a single turn once they have. A separate `not answered`
+            # test beside it looked like a second guard and was not one —
+            # mutating it away failed nothing, because an unanswered question
+            # can never be in the window either. Two spellings of one fact,
+            # which is the thing this repository refuses everywhere else.
+            return None
+        self._pending = None
+        return pending
 
     # --- writing ---------------------------------------------------------
 
