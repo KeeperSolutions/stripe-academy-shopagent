@@ -50,7 +50,9 @@ tracked.
 | `agent/profile.py` | D9 | what the shop remembers about a customer |
 | `agent/guardrails.py` | D9 | the confirmation gate and output validation |
 | `agent/confirmation.py` | D10 | the two-phase protocol the gate asks through |
-| `obs/` | D10 | Langfuse tracing |
+| `obs/redaction.py` | D10 | what must not leave this machine |
+| `obs/tracing.py` | D10 | Langfuse, behind a facade that cannot raise |
+| `obs/instrumentation.py` | D10 | the two wrappers that read what exists |
 
 Search logic belongs in `catalog/`, never inside the MCP server. The server is
 a thin wrapper, which is what lets D5 swap transports without touching logic.
@@ -988,6 +990,79 @@ attempt: tool calls are not a final answer. The guard also reads
 `money.WORDS` now, because "190 euros" is an unambiguous claim about money that
 carries no symbol and no decimals, and a bypass reachable by writing a word is
 still a bypass. Both raised in review on PR #9.
+
+**A trace is the MCP log's question again, one step worse, and the repository
+was answering them differently.** `MCP_LOG_REDACT_QUERY` replaces `query` with a
+salted digest in a log that stays on this disk. A trace carries the same
+arguments *plus* the profile name, the amounts, the order id and the whole
+conversation to a third party, over the network — and would have redacted
+nothing. The stricter rule was on the weaker path, and that is the contradiction
+D10 had to settle before a single trace was sent.
+
+**`query` cannot be decided on its own, and that is the finding.** It is not the
+only free text in a trace and it is not even the first: the customer's message
+is what produced it, the model's answer quotes it back, and the system prompt
+carries `display_name` from the profile — measured rather than feared, in the
+D10 step 1 live run, where the model opened its answer with the customer's first
+name. Redacting the tool argument while sending the sentence it came from is
+theatre. So there is **one rule and one switch** covering every field a person
+wrote: `TRACE_REDACT_TEXT`, default true.
+
+Redacted: the `query` argument, user message content, assistant message
+content, the system prompt, and `SHOPPER_ID`. Not redacted: tool names, every
+other tool argument, tool results, amounts, order ids, product names, tokens,
+cost, latency, and which guardrail refused what. None of the second list is
+anybody's personal data — it is this shop's own data and this process's own
+measurements, and it is the whole reason a trace is worth having.
+
+The cost is stated rather than hidden: **with the switch on, a trace cannot
+answer "what did the customer say".** It answers what the plan asks of it —
+what the conversation cost, which tools ran in what order, which guardrail
+fired, where the time went. Turning it off on your own machine gives the rest
+back, the same bargain and the same default as `MCP_LOG_REDACT_QUERY`: the safe
+setting must not be the one somebody has to remember to type.
+
+`obs/redaction.py` is a **sibling** of `mcp_server`'s `redact_arguments()` and
+deliberately not an import of it. The server runs in its own process, so its
+per-process salt is a different secret and sharing the function would not share
+it; and `mcp_server/` is a thin protocol wrapper by rule, so giving it a
+dependency on this project's observability to save eight lines would invert the
+one direction that module may point in.
+
+**Tracing attaches around, never inside, and `run_tool_loop` is why.** Its
+source hashes to `161bdc1c…9d00` on `main` and on the D10 branch. Instrumentation
+is the easiest thing in this project to justify putting inside that `while`, and
+it is the one that would prove the claim was only ever true because nothing had
+wanted it enough. So `TracedClient` and `TracedRegistry` are the shape
+`GuardedClient` already is — forward by `__getattr__`, intercept the one method
+that matters.
+
+**`TracedClient` goes inside `GuardedClient`, and the order is load-bearing.**
+The amount guardrail can send a second, corrected request, and that request is
+really billed. Wrapped the other way round, the trace records one call where two
+happened and reports half the cost of every corrected turn. `TracedRegistry` is a
+forwarding wrapper rather than a fourth `ToolRegistry` subclass: `RememberingRegistry`
+and `GuardedRegistry` subclass because each *changes what dispatch does*, and
+this one only watches — extending the chain would tie tracing to guarding.
+
+**Nothing is measured twice.** `llm/usage.py` already computes tokens and cost;
+`ToolResult` already carries an outcome. The wrappers read those and add the one
+thing neither has, which is how long it took. `cost_details` carries our own
+number because Langfuse prices none of the `gpt-5.6-*` family and would report a
+confident $0.00 beside a CLI saying cents — and sending it means the two can be
+compared, which is the check that catches this layer double-counting a retry.
+
+**Tracing may not raise, and unconfigured is a normal state.** Missing keys mean
+no trace and nothing else changes — the call `stripe_secret_key` already gets,
+because a cart that cannot be browsed for want of an observability vendor is the
+wrong failure. Every SDK call is caught; the first failure warns once and the
+tracer goes inert for the session, because a diagnostic must not cause the
+outage it describes and a transcript carrying one stack trace per turn is one
+nobody reads to the end. **There is no structured-log fallback**, on purpose:
+the CLI already prints every tool call and cost and the MCP server already logs
+every call with its arguments, so a fallback would be a third rendering of the
+same facts kept in step by hand. The one thing it would add over those two is
+the *nesting*, and a flat log line cannot carry it.
 
 **Chat Completions, not the Responses API.** Responses keeps conversation state
 on the server, which hides the very loop this project exists to learn.

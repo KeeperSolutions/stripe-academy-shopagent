@@ -780,3 +780,106 @@ def test_the_repl_itself_guards_the_turn_the_gate_created():
         "confirmation created"
     )
     assert client.replies == [], "the correction was never sent"
+
+
+# --- where the tracing attaches (D10, step 2) -----------------------------
+#
+# `_run_session` builds two wrappers around each of the two things the loop is
+# handed, and the *order* of the client's is load-bearing: `TracedClient` goes
+# inside `GuardedClient` so the corrected retry the amount guardrail can send —
+# a second, really billed call — appears as a second generation.
+#
+# Asserted here rather than in `tests/test_tracing.py` because that file builds
+# the order itself and would go on passing over a session that wired it the
+# other way. Mutating the line in `llm/loop.py` survived the whole suite until
+# this existed.
+
+
+def _capture_tracer():
+    """A tracer on a real Langfuse client exporting into memory."""
+    import itertools
+
+    from langfuse import Langfuse
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from shopagent.obs.tracing import Tracer
+
+    exporter = InMemorySpanExporter()
+    key = f"pk-lf-loop-{next(_capture_tracer.keys)}"
+    tracer = Tracer(
+        Langfuse(
+            public_key=key,
+            secret_key="sk-lf-offline",
+            host="http://langfuse.invalid",
+            span_exporter=exporter,
+            flush_at=1,
+        )
+    )
+    return tracer, exporter
+
+
+_capture_tracer.keys = __import__("itertools").count()
+
+
+def _drive_session(setup, client, tracer, typed):
+    """Run the REPL with `input` standing in for a person at the keyboard."""
+    import builtins
+
+    from shopagent.agent import profile as profiles
+    from shopagent.llm.loop import _run_session
+    from shopagent.llm.usage import UsageTracker
+
+    lines = iter(typed)
+    original_input, original_print = builtins.input, builtins.print
+    original_load = profiles.load_for_session
+    builtins.input = lambda prompt="": next(lines)
+    builtins.print = lambda *args, **kwargs: None
+    profiles.load_for_session = lambda shopper_id: (None, None)
+    try:
+        _run_session(client, UsageTracker(), setup, tracer)
+    finally:
+        builtins.input, builtins.print = original_input, original_print
+        profiles.load_for_session = original_load
+
+
+def test_the_session_traces_the_billed_retry_the_amount_guardrail_sends():
+    """`TracedClient` inside `GuardedClient`, proved through the real session.
+
+    Wired the other way round, the trace records one call where two were paid
+    for — and reports half the cost of every corrected turn, which is exactly
+    what the CLI-versus-Langfuse comparison is meant to catch.
+    """
+    tracer, exporter = _capture_tracer()
+    setup = _gated_setup(confirm=lambda summary: True)
+    # An amount from nowhere, twice: the guardrail corrects once and then falls
+    # back, so two requests are really sent.
+    client = ConfirmationClient(
+        _reply("Your total is €5.00."),
+        _reply("Your total is €5.00."),
+    )
+
+    _drive_session(setup, client, tracer, ["what is my total?", "/exit"])
+
+    tracer.flush()
+    names = [span.name for span in exporter.get_finished_spans()]
+    assert names.count("chat") == 2, f"the billed retry is missing from the trace: {names}"
+    assert "untraceable_amount" in names, "the guardrail did not report itself"
+    assert names[-1] == "conversation", "the whole conversation is one trace"
+
+
+def test_the_session_puts_every_span_in_one_trace():
+    tracer, exporter = _capture_tracer()
+    setup = _gated_setup(confirm=lambda summary: True)
+    client = ConfirmationClient(
+        _reply(tool="view_cart"),
+        _reply("Your cart is here."),
+        _reply(tool="view_cart"),
+        _reply("Still there."),
+    )
+
+    _drive_session(setup, client, tracer, ["what is in my cart?", "and now?", "/exit"])
+
+    tracer.flush()
+    spans = exporter.get_finished_spans()
+    assert len({span.context.trace_id for span in spans}) == 1, "two turns, two traces"
+    assert [s.name for s in spans].count("view_cart") == 2

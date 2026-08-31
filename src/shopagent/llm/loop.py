@@ -45,6 +45,8 @@ from shopagent.llm.client import LLMClient, Message, ToolCall
 from shopagent.llm.usage import UsageTracker
 from shopagent.mcp_client.client import MCPToolClient
 from shopagent.mcp_client.registration import register_mcp_tools
+from shopagent.obs.instrumentation import TracedClient, TracedRegistry
+from shopagent.obs.tracing import UNCONFIGURED_NOTE, Tracer, build_tracer
 from shopagent.tools.basic import REGISTRY
 from shopagent.tools.commerce import register_commerce_tools
 from shopagent.tools.http import CommerceAPI
@@ -259,23 +261,43 @@ def main() -> None:
         print(f"[error] could not create the client: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
-    with ExitStack() as stack:
-        setup = build_tool_setup(stack, confirm=_ask_to_confirm)
-        _run_session(client, tracker, setup)
+    tracer = build_tracer()
+    try:
+        with ExitStack() as stack:
+            setup = build_tool_setup(stack, confirm=_ask_to_confirm)
+            _run_session(client, tracker, setup, tracer)
+    finally:
+        # Outside the stack, so a queued span still leaves even when the
+        # session ended on an exception. Tracing must not break a conversation
+        # and must not lose the record of the one that broke.
+        tracer.shutdown()
 
 
-def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> None:
+def _run_session(
+    client: LLMClient,
+    tracker: UsageTracker,
+    setup: ToolSetup,
+    tracer: Tracer | None = None,
+) -> None:
     """The REPL itself, once the tools are decided.
 
     Split out from `main` so the catalog's lifetime is visibly the session's
     lifetime: everything below runs inside the `ExitStack` that owns the server.
     """
-    registry = setup.registry
-    # The client is wrapped, not replaced: `run_tool_loop` below is the
-    # unmodified D2 function and still takes a client, a registry, a message
-    # list and a list of schemas. What changed is that one of those four checks
-    # the answer before handing it back.
-    client = GuardedClient(client, setup.memory)
+    tracer = tracer or Tracer()
+    # Two wrappers around each of the two things the loop is handed, and the
+    # order of the client's is load-bearing. `TracedClient` goes *inside*
+    # `GuardedClient` so the corrected retry the amount guardrail can send —
+    # a second, really billed call — appears as a second generation. Outside
+    # it, the trace would report half the cost of every corrected turn, and the
+    # comparison against the CLI's own total is what would catch it.
+    #
+    # `run_tool_loop` below is still the unmodified D2 function and still takes
+    # a client, a registry, a message list and a list of schemas. Its source
+    # hashes to `161bdc1c…9d00` on `main` and here, which is the claim D5, D9
+    # and now D10 have each leaned on.
+    registry = TracedRegistry(setup.registry, tracer)
+    client = GuardedClient(TracedClient(client, tracer), setup.memory, tracer)
     shopper_id = get_settings().shopper_id
     profile, profile_note = profiles.load_for_session(shopper_id)
     messages = initial_messages(setup.catalog_available, profile=profile)
@@ -291,78 +313,91 @@ def _run_session(client: LLMClient, tracker: UsageTracker, setup: ToolSetup) -> 
         print(f"[{profile_note}]")
     if profile is not None:
         print("[profile loaded; /profile to see it]")
+    if not tracer.enabled:
+        # Said once, at the top, rather than left silent. An untraced session
+        # is a normal state — but demoing one while believing otherwise is not.
+        print(f"[{UNCONFIGURED_NOTE}]")
 
-    while True:
-        try:
-            user_input = input("\nyou> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            # Ctrl+C or Ctrl+D at the prompt means a clean exit.
-            print()
-            break
+    # One trace for the whole conversation, which is the plan's third
+    # requirement taken literally. Langfuse ingests observations as they
+    # arrive rather than waiting for this root to close, and every turn
+    # flushes, so a conversation in progress is watchable while it happens.
+    with tracer.conversation(shopper_id=shopper_id, model=client.model):
+        while True:
+            try:
+                user_input = input("\nyou> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                # Ctrl+C or Ctrl+D at the prompt means a clean exit.
+                print()
+                break
 
-        if not user_input:
-            continue
+            if not user_input:
+                continue
 
-        if user_input == "/exit":
-            break
-        if user_input == "/help":
-            print(HELP)
-            continue
-        if user_input == "/cost":
-            print(tracker.summary())
-            continue
-        if user_input == "/reset":
-            # The profile is re-read rather than reused, so a `/remember` made
-            # during this session takes effect here. It deliberately does not
-            # take effect mid-conversation: rewriting a system message the
-            # model has already been answering from would change the rules
-            # under it without anything in the transcript saying so.
-            profile, _ = profiles.load_for_session(shopper_id)
-            messages = initial_messages(setup.catalog_available, profile=profile)
-            print("[conversation history cleared; session cost is kept]")
-            continue
-        if user_input == "/profile":
-            _show_profile(shopper_id, profile)
-            continue
-        if user_input.startswith("/remember"):
-            _remember(shopper_id, user_input.removeprefix("/remember").strip())
-            continue
-        if user_input.startswith("/forget"):
-            _forget(shopper_id, user_input.removeprefix("/forget").strip())
-            continue
-        if user_input == "/tools":
-            for spec in registry.specs():
-                print(f"  {spec.name}: {spec.description}")
-            continue
+            if user_input == "/exit":
+                break
+            if user_input == "/help":
+                print(HELP)
+                continue
+            if user_input == "/cost":
+                print(tracker.summary())
+                continue
+            if user_input == "/reset":
+                # The profile is re-read rather than reused, so a `/remember` made
+                # during this session takes effect here. It deliberately does not
+                # take effect mid-conversation: rewriting a system message the
+                # model has already been answering from would change the rules
+                # under it without anything in the transcript saying so.
+                profile, _ = profiles.load_for_session(shopper_id)
+                messages = initial_messages(setup.catalog_available, profile=profile)
+                print("[conversation history cleared; session cost is kept]")
+                continue
+            if user_input == "/profile":
+                _show_profile(shopper_id, profile)
+                continue
+            if user_input.startswith("/remember"):
+                _remember(shopper_id, user_input.removeprefix("/remember").strip())
+                continue
+            if user_input.startswith("/forget"):
+                _forget(shopper_id, user_input.removeprefix("/forget").strip())
+                continue
+            if user_input == "/tools":
+                for spec in registry.specs():
+                    print(f"  {spec.name}: {spec.description}")
+                continue
 
-        # Where to rewind to if this turn fails part-way. A turn can append
-        # several messages, and an assistant turn whose tool calls never got
-        # their `tool` messages would make every later request a 400 — so a
-        # broken turn is removed whole rather than patched up.
-        history_length = len(messages)
-        if setup.memory is not None:
-            # A customer message. Anything a person was asked to approve before
-            # it lapses here — see `ConversationMemory.begin_turn`.
-            setup.memory.begin_turn(from_customer=True)
-        messages.append({"role": "user", "content": user_input})
-        calls_before = len(tracker.calls)
+            # Where to rewind to if this turn fails part-way. A turn can append
+            # several messages, and an assistant turn whose tool calls never got
+            # their `tool` messages would make every later request a 400 — so a
+            # broken turn is removed whole rather than patched up.
+            history_length = len(messages)
+            if setup.memory is not None:
+                # A customer message. Anything a person was asked to approve before
+                # it lapses here — see `ConversationMemory.begin_turn`.
+                setup.memory.begin_turn(from_customer=True)
+            messages.append({"role": "user", "content": user_input})
+            calls_before = len(tracker.calls)
 
-        try:
-            run_tool_loop(client, registry, messages, tools)
-            _settle_confirmation(client, registry, messages, tools, setup)
-        except KeyboardInterrupt:
-            # Aborts this answer only — the application stays alive.
-            print("\n[interrupted]")
-            del messages[history_length:]
-        except Exception as exc:
-            print(f"\n[error] {type(exc).__name__}: {exc}")
-            del messages[history_length:]
+            try:
+                run_tool_loop(client, registry, messages, tools)
+                _settle_confirmation(client, registry, messages, tools, setup)
+            except KeyboardInterrupt:
+                # Aborts this answer only — the application stays alive.
+                print("\n[interrupted]")
+                del messages[history_length:]
+            except Exception as exc:
+                print(f"\n[error] {type(exc).__name__}: {exc}")
+                del messages[history_length:]
 
-        # After the answer, and outside the try: a tool that ran before a
-        # failure still placed the order, and the customer still needs its
-        # payment page.
-        _print_payment_link(setup.memory)
-        _print_cost(tracker, calls_before)
+            # After the answer, and outside the try: a tool that ran before a
+            # failure still placed the order, and the customer still needs its
+            # payment page.
+            _print_payment_link(setup.memory)
+            _print_cost(tracker, calls_before)
+            # After the answer, so a turn is in the UI before the next one is
+            # typed. Langfuse batches otherwise and a conversation would appear
+            # only once the process exited.
+            tracer.flush()
 
     print()
     print(tracker.summary())

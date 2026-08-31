@@ -111,7 +111,7 @@ def pytest_collection_modifyitems(config, items):
 def no_accidental_api_calls(request, monkeypatch):
     """Make an unmarked test that reaches a paid or external API fail loudly.
 
-    Two providers, one mechanism: replace the module attribute every call has
+    Three providers, one mechanism: replace the module attribute every call has
     to pass through with something that raises, unless the test carries the
     marker that says it meant it.
 
@@ -160,6 +160,33 @@ def no_accidental_api_calls(request, monkeypatch):
         monkeypatch.setattr(
             "stripe._api_requestor._APIRequestor.request_async", refuse_stripe
         )
+
+    # Langfuse, because D10 introduces a third way out of the process — and the
+    # only one that carries the *conversation* rather than a query or an
+    # amount. The seam is the OTLP exporter, which is where span data actually
+    # leaves: building a Langfuse client is free and the tests below build real
+    # ones with an in-memory exporter, exactly as an offline test legitimately
+    # builds a Stripe client to read back the pinned API version.
+    #
+    # No escape marker, and that asymmetry is deliberate. `network` and
+    # `stripe` exist because some tests have a real reason to reach those APIs —
+    # whether the embedding model is any good is a question no fake can answer.
+    # No test in this project has a reason to reach Langfuse: the SDK is
+    # exercised through a capturing exporter and the live check is a manual run.
+    # A guard with a door nobody uses is a door somebody eventually props open;
+    # the marker gets added on the day a test needs it.
+    def refuse_langfuse(*args, **kwargs):
+        raise AssertionError(
+            "this test tried to send spans to Langfuse. Traces carry the "
+            "conversation off this machine — build the client with "
+            "span_exporter=InMemorySpanExporter() instead, the way "
+            "tests/test_tracing.py does."
+        )
+
+    monkeypatch.setattr(
+        "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter.export",
+        refuse_langfuse,
+    )
 
 
 @pytest.fixture(scope="session")

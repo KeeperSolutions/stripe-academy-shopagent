@@ -133,6 +133,30 @@ class Settings(BaseSettings):
     # repository shared one profile with whoever ran it last.
     shopper_id: OptionalStr = None
 
+    # --- Observability (D10) ---
+    # Both keys optional, and for the reason `stripe_secret_key` is rather than
+    # the reason `shopagent_api_key` is not: observability is one part of this
+    # system, not a precondition for the rest. A shop that cannot be traced is
+    # a shop with a gap in its instrumentation; a shop that will not start
+    # because nobody configured a trace exporter is a worse failure than the
+    # one it was trying to prevent. Missing keys mean tracing quietly does not
+    # happen — see `obs/tracing.py`.
+    langfuse_public_key: OptionalStr = None
+    langfuse_secret_key: OptionalStr = None
+    langfuse_host: str = "https://cloud.langfuse.com"
+    # Whether free text is replaced with a salted digest before a trace leaves
+    # this process. Default true, the same shape and the same argument as
+    # `mcp_log_redact_query` — and a stronger version of it, because that log
+    # stays on this disk while a trace goes to a third party over the network.
+    #
+    # It covers every field a person wrote, not only `query`: the customer's
+    # messages, the model's prose and the system prompt, which carries
+    # `display_name` from the profile. Redacting the tool argument while
+    # sending the sentence it came from would be theatre. What it costs is the
+    # ability to read a trace as a conversation; what it keeps is every
+    # question the trace exists to answer. See `obs/redaction.py`.
+    trace_redact_text: bool = True
+
     # --- Stripe (D7-D8) ---
     # Optional, and deliberately not treated the way `shopagent_api_key` is.
     # That key gates every request, so the API refuses to start without it;

@@ -60,6 +60,7 @@ from typing import Any
 from shopagent.agent.memory import ConversationMemory, RememberingRegistry
 from shopagent.config import get_settings
 from shopagent.money import WORDS, ZERO_DECIMAL_CURRENCIES, SYMBOLS, format_amount
+from shopagent.obs.tracing import Tracer
 from shopagent.tools.registry import ToolResult
 
 # The calls that spend money. A set rather than a check inside the tool,
@@ -274,11 +275,26 @@ class GuardedClient:
     Only a *final* answer is checked. A turn that is still asking for tools is
     narration on the way to an answer, and the numbers it mentions may be about
     to arrive.
+
+    `tracer` is optional and defaults to one that records nothing. It is here
+    rather than outside because this is the only place that knows the amount
+    rule fired: the retry and the fallback both leave the loop looking like an
+    ordinary answer, and the alternative — a wrapper further out sniffing for
+    `FALLBACK_PREFIX` in the text — would make a guard's visibility depend on
+    matching a sentence somebody may rewrite. D9's other two guardrails need
+    nothing like this: the gate and the unknown-variant refusal both come back
+    as a failed `ToolResult`, which `obs/instrumentation.py` already sees.
     """
 
-    def __init__(self, client: Any, memory: ConversationMemory) -> None:
+    def __init__(
+        self,
+        client: Any,
+        memory: ConversationMemory,
+        tracer: Tracer | None = None,
+    ) -> None:
         self._client = client
         self._memory = memory
+        self._tracer = tracer or Tracer()
 
     def __getattr__(self, name: str) -> Any:
         # Everything else — `model`, `stream_chat`, the tracker — is the real
@@ -294,6 +310,9 @@ class GuardedClient:
         if not bad:
             return reply
 
+        self._tracer.guardrail(
+            name="untraceable_amount", outcome="retried with a correction", detail=bad
+        )
         retry = self._client.chat_with_tools(
             [
                 *messages,
@@ -319,6 +338,9 @@ class GuardedClient:
         # has produced the same untraceable figure twice is not one round away
         # from tracing it.
         still_bad = unsupported_amounts(retry.content or "", self._memory) or bad
+        self._tracer.guardrail(
+            name="untraceable_amount", outcome="answered with the fallback", detail=still_bad
+        )
         return type(reply)(
             content=FALLBACK.format(amounts=", ".join(still_bad)),
             tool_calls=[],
