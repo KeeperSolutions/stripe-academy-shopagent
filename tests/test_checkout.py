@@ -620,7 +620,7 @@ def test_the_success_page_needs_no_api_key(api_client):
     response = api_client.get("/checkout/success")
 
     assert response.status_code == 200
-    assert "session_id" in response.text
+    assert "No payment to look up" in response.text
 
 
 def test_the_cancel_page_needs_no_api_key_and_says_nothing_was_charged(api_client):
@@ -628,17 +628,19 @@ def test_the_cancel_page_needs_no_api_key_and_says_nothing_was_charged(api_clien
 
     assert response.status_code == 200
     assert "Nothing was charged" in response.text
-    # The distinction that actually matters to a shopper.
-    assert "/orders/{id}/cancel" in response.text
+    # The distinction that actually matters to a shopper: closing the payment
+    # page is not cancelling the order. Said in words a customer can act on
+    # rather than as the HTTP route that does it, which was the old text.
+    assert "not the same as cancelling the order" in response.text
 
 
-def test_the_success_page_says_the_order_is_not_paid_yet(api_client, monkeypatch):
-    """The claim the whole day is built around, on the page itself.
+def test_the_success_page_says_it_cannot_find_an_unknown_order(api_client, monkeypatch):
+    """An order id from the session that names no row here.
 
-    A redirect is a URL anybody can open. The page reports what Stripe says
-    about the session and states that the order has not moved — because it has
-    not, and because a page that flipped it would be trusting a browser with
-    the shop's money.
+    The page used to answer this case by describing the *session* and asserting
+    the order was still pending, which it had not looked at. Now it says it
+    could not find the order — and, because a charge may still have happened,
+    it refuses to say anything about the money either way.
     """
     class PaidSession:
         id = "cs_test_paid"
@@ -655,8 +657,8 @@ def test_the_success_page_says_the_order_is_not_paid_yet(api_client, monkeypatch
     response = api_client.get("/checkout/success?session_id=cs_test_paid")
 
     assert response.status_code == 200
-    assert "Payment received" in response.text
-    assert "has not been marked paid yet" in response.text
+    assert "could not find that order" in response.text
+    assert "does not say whether a payment went through" in response.text
     assert "abc-123" in response.text
     # Formatted for a person, not echoed in minor units: `4200` reads as four
     # thousand to the shopper who just paid forty-two. Rendered through
@@ -689,6 +691,259 @@ def test_the_success_page_does_not_change_the_order(authed_client, session, monk
     order = session.get(Order, uuid.UUID(order_id))
     session.refresh(order)
     assert order.status is OrderStatus.PENDING
+
+
+# --- what the success page says, once it reads the order (D11 follow-up) ---
+
+
+def _returning_from(order_id: str, amount: int = 900):
+    """A Stripe session as the success page receives one, with an order on it."""
+
+    class Returned:
+        id = "cs_test_back"
+        status = "complete"
+        payment_status = "paid"
+        amount_total = amount
+        currency = CURRENCY
+
+        class metadata:
+            _data = {"order_id": order_id}
+
+    return Returned
+
+
+@pytest.mark.parametrize(
+    "status, expected",
+    [
+        (OrderStatus.PENDING, "being confirmed"),
+        (OrderStatus.PAID, "Payment received"),
+        (OrderStatus.FULFILLED, "Order complete"),
+        (OrderStatus.CANCELLED, "was cancelled"),
+        (OrderStatus.REFUNDED, "was refunded"),
+    ],
+)
+def test_the_success_page_reports_the_status_the_order_actually_has(
+    authed_client, session, monkeypatch, status, expected
+):
+    """The defect this replaced: a fixed sentence that went stale in a second.
+
+    The page used to assert `pending` without looking, and the signed delivery
+    that makes an order `paid` routinely lands before a person finishes
+    reading — so the page contradicted the shop about the shopper's own money.
+    Every status is covered, including the two nobody expects to arrive on: a
+    refund issued while somebody sat on the payment page lands here, and a
+    branch that did not exist would have fallen through to a sentence
+    describing none of them.
+
+    The status is written directly rather than through `apply_transition`
+    because this is a test of what a page *reads*, and driving each of five
+    statuses through the lifecycle would test the lifecycle instead.
+    """
+    order_id = make_order(authed_client, session, [(f"CHK-ST-{status}", 900, 1)])
+    order = session.get(Order, uuid.UUID(order_id))
+    order.status = status
+    session.flush()
+
+    monkeypatch.setattr(
+        stripe_svc, "retrieve_checkout_session", lambda sid: _returning_from(order_id)
+    )
+
+    response = authed_client.get("/checkout/success?session_id=cs_test_back")
+
+    assert response.status_code == 200
+    assert expected in response.text
+    # The claim the old page made about every order, now made about none of
+    # them without looking.
+    assert "has not been marked paid yet" not in response.text
+
+
+# Every word that would tell a customer which repository they are shopping in.
+# A sweep rather than one assertion per phrase, because the phrases that leaked
+# were not the ones anybody would have listed: "which is what Day 8 builds" sat
+# on this page for four days beside an HTTP route a shopper cannot call.
+PROJECT_WORDS = (
+    "Day ",
+    "webhook",
+    "shopagent",
+    "ShopAgent",
+    "/orders/",
+    "POST ",
+    "GET ",
+    ".py",
+    "lifecycle",
+    "metadata",
+    "X-API-Key",
+)
+
+# Every rendering either page can produce, named by the branch that makes it.
+# A sweep over one branch is what let a first draft of this test pass while the
+# unconfigured-Stripe page still said "the Day 8 webhook endpoint": the branches
+# that leak are the rare ones, because they are the ones nobody rereads.
+PAGE_BRANCHES = (
+    "no-session-id",
+    "no-stripe-key",
+    "unreadable-session",
+    "unknown-order",
+    "order-pending",
+    "order-paid",
+    "order-fulfilled",
+    "order-cancelled",
+    "order-refunded",
+    "cancel-page",
+)
+
+
+def _render_branch(branch, authed_client, session, monkeypatch):
+    """Drive one branch of one page and return what a browser would receive."""
+    if branch == "cancel-page":
+        return authed_client.get("/checkout/cancel")
+    if branch == "no-session-id":
+        return authed_client.get("/checkout/success")
+
+    if branch == "no-stripe-key":
+        def raise_missing(session_id):
+            raise stripe_svc.MissingStripeKey("STRIPE_SECRET_KEY is not set")
+
+        monkeypatch.setattr(stripe_svc, "retrieve_checkout_session", raise_missing)
+        return authed_client.get("/checkout/success?session_id=cs_test_back")
+
+    if branch == "unreadable-session":
+        def boom(session_id):
+            raise RuntimeError("No such checkout.session")
+
+        monkeypatch.setattr(stripe_svc, "retrieve_checkout_session", boom)
+        return authed_client.get("/checkout/success?session_id=cs_test_back")
+
+    if branch == "unknown-order":
+        monkeypatch.setattr(
+            stripe_svc,
+            "retrieve_checkout_session",
+            lambda sid: _returning_from("abc-123"),
+        )
+        return authed_client.get("/checkout/success?session_id=cs_test_back")
+
+    status = OrderStatus(branch.removeprefix("order-"))
+    order_id = make_order(authed_client, session, [(f"CHK-LK-{status}", 900, 1)])
+    order = session.get(Order, uuid.UUID(order_id))
+    order.status = status
+    session.flush()
+    monkeypatch.setattr(
+        stripe_svc, "retrieve_checkout_session", lambda sid: _returning_from(order_id)
+    )
+    return authed_client.get("/checkout/success?session_id=cs_test_back")
+
+
+@pytest.mark.parametrize("branch", PAGE_BRANCHES)
+def test_no_page_a_customer_sees_names_the_project_it_was_built_in(
+    authed_client, session, monkeypatch, branch
+):
+    """These two pages are the only thing a non-developer reads.
+
+    Every branch, not one of them. The first version of this test drove the
+    happy path only, and a deliberate mutation putting "the Day 8 webhook
+    endpoint" into the unconfigured-Stripe branch survived it — which is the
+    same shape as the leak being fixed here, since the sentence that sat on
+    this page for four days was in the branch nobody was rereading either.
+    """
+    response = _render_branch(branch, authed_client, session, monkeypatch)
+
+    assert response.status_code == 200
+    leaked = [word for word in PROJECT_WORDS if word in response.text]
+    assert leaked == [], f"{branch} names the project: {leaked}"
+
+
+# Promises this system does not control. Every one of these was on the page and
+# every one was removed for a reason recorded in `checkout_pages.py`; the email
+# receipt was the one measured against Stripe rather than argued about, and
+# `charge.receipt_number` came back null for the live payment of 2026-09-01.
+#
+# A word list rather than a sentence list, because the sentences will be
+# rewritten and the promises are what must not come back — "we will email you"
+# is the same claim as "Stripe has emailed you a receipt".
+BROKEN_PROMISES = (
+    "email",
+    "e-mail",
+    "inbox",
+    "receipt from",
+    "emailed",
+    "few seconds",
+    "few days",
+    "whenever you like",
+    "will be told",
+    "will be returned",
+    "sent out",
+    "shipped",
+)
+
+
+@pytest.mark.parametrize("branch", PAGE_BRANCHES)
+def test_no_page_promises_something_this_shop_does_not_control(
+    authed_client, session, monkeypatch, branch
+):
+    """The page may report; it may not undertake.
+
+    Measured, not assumed: no receipt was emailed for the live payment this
+    project made. `charge.receipt_number` is null — Stripe sets it only once a
+    receipt has actually been sent — and `receipt_email` is null on both the
+    PaymentIntent and the Charge, because nothing here sets it. In test mode
+    Stripe does not email receipts unless the dashboard says so, which is a
+    setting this repository neither reads nor owns.
+
+    The other removals are of the same kind and needed no API call: a settlement
+    time this code does not control, a notification nothing sends, a refund
+    nobody issues, a payment window the expiry handler closes, and an order
+    cancellation the assistant has no tool for.
+    """
+    response = _render_branch(branch, authed_client, session, monkeypatch)
+
+    assert response.status_code == 200
+    promised = [word for word in BROKEN_PROMISES if word in response.text.lower()]
+    assert promised == [], f"{branch} promises: {promised}"
+
+
+@pytest.mark.parametrize("path", ["/checkout/success", "/checkout/cancel"])
+def test_both_pages_send_a_shopper_back_to_the_tab_they_came_from(api_client, path):
+    """The tab first, the link second, and the link says what it costs.
+
+    The payment button opens Stripe in a new tab, so the conversation is
+    usually still open behind this page — and following the link starts a fresh
+    browser session with an empty transcript, which is the wrong thing to do to
+    somebody who still has theirs.
+    """
+    response = api_client.get(path)
+
+    assert response.status_code == 200
+    assert get_settings().ui_base_url in response.text
+    assert "should still be open in the tab you came from" in response.text
+    assert "starts a fresh conversation" in response.text
+
+
+@pytest.mark.parametrize(
+    "status", [OrderStatus.PENDING, OrderStatus.PAID, OrderStatus.CANCELLED]
+)
+def test_reading_the_success_page_never_moves_an_order(
+    authed_client, session, monkeypatch, status
+):
+    """Reporting is not deciding, asserted from every status it can report.
+
+    A redirect is a URL anybody can open, so a page that wrote anything would
+    be trusting a browser with the shop's money. The page now reads the status
+    it prints, which is exactly the change that makes this worth asserting more
+    than once: the read is right beside the place a write would go.
+    """
+    order_id = make_order(authed_client, session, [(f"CHK-RO-{status}", 900, 1)])
+    order = session.get(Order, uuid.UUID(order_id))
+    order.status = status
+    session.flush()
+
+    monkeypatch.setattr(
+        stripe_svc, "retrieve_checkout_session", lambda sid: _returning_from(order_id)
+    )
+
+    authed_client.get("/checkout/success?session_id=cs_test_back")
+
+    session.refresh(order)
+    assert order.status is status
 
 
 def test_an_unknown_session_id_does_not_raise(api_client, monkeypatch):

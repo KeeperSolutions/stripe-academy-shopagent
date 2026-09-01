@@ -137,6 +137,20 @@ class Settings(BaseSettings):
     # explicitly the moment the success page stops living on this host.
     checkout_success_url: OptionalStr = None
     checkout_cancel_url: OptionalStr = None
+    # Where the *browser interface* lives, so the page Stripe redirects to can
+    # offer a way back to it. A third URL rather than a reuse of either of the
+    # two above, because it names a third thing: `app_base_url` is where a
+    # browser reaches the commerce API, `commerce_api_base_url` is where the
+    # agent process reaches it, and this is the Streamlit process — a separate
+    # server on a separate port, which can move without either of them moving.
+    #
+    # The link it produces is a fallback and is described on the page as one.
+    # The payment button opens Stripe in a new tab, so the conversation is
+    # almost always still sitting in the tab behind; following this link starts
+    # a *new* browser session with an empty transcript, which is the wrong
+    # thing to do to somebody who still has theirs. See
+    # `routers/checkout_pages.py`.
+    ui_base_url: str = "http://localhost:8501"
     # Required, with no default, for the same reason `openai_api_key` is: it is
     # the API's only authentication secret. A default here would be a published
     # one — every deployment that forgot the variable would be protected by a
