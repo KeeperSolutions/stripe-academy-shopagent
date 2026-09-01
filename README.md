@@ -426,9 +426,12 @@ order's own total, and the agent answers "your full refund of €94.99 has been
 requested and is on its way, it is not completed yet". `charge.refunded` moved
 the order to `refunded` and put the reserved unit back. $0.001844.
 `docs/screenshots/d11-07-basket-panel-with-checkout.png`,
-`d11-07b-button-reaches-the-gate.png`,
-`d11-08-success-page-reads-the-order.png` and
-`d11-09-refund-dialog.png`.
+`d11-07b-button-reaches-the-gate.png` and `d11-09-refund-dialog.png`. There is
+deliberately no screenshot of the success page: the one taken during the run
+above was superseded within the hour by the removal of a sentence it showed,
+and a picture that has to be retaken every time the copy changes is a second
+record of the page. What the page says is asserted instead, over all ten of its
+renderings.
 
 ## Eval results
 
