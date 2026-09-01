@@ -1484,7 +1484,7 @@ is an AST test, the mechanism `tests/test_lifecycle.py` uses on `transition()`.
 `ChatMessage` holds what was true when it was written; a basket does not stay
 that way, and another client holding the API key can change one — the gate binds
 the model, not the shop. `BrowserSession.cart()` therefore issues `GET
-/cart/{id}` through `ToolSetup.api`, which is the *same* client the five
+/cart/{id}` through `ToolSetup.api`, which is the *same* client the six
 commerce tools were built over, using `memory.cart_id`, which the model has
 never seen and never will. It costs no model call, which is what makes it safe
 to redraw on every rerun; the cost is one HTTP round trip per rerun, recorded as
@@ -1639,8 +1639,54 @@ the one fact the description cannot carry, that only this conversation's order
 is refundable, is in the tool's own refusal where a model that hits it will
 actually read it. `agent/prompt.py` is unchanged.
 
+**Every sentence the gate can produce is per tool, including the branches no
+test reaches.** Adding a second gated tool exposed `_unconfirmed`'s
+"nobody can be asked" branch, which still spoke the checkout's words: "nothing
+was ordered and nothing was charged", over an order that is charged and still
+paid. `_UNREACHABLE` joined `_AWAITING`, `_CHANGED` and `_NOTES` as the fourth
+mapping. The lesson is the shape rather than the string — **a sentence shared
+by two callers is wrong for one of them until somebody checks**, and the
+branches that go unchecked are the ones no test drives.
+
+**`refund_status` is withheld from the model and read by this layer.** Those
+are different things and the first draft did only the first. Stripe can answer
+`failed` or `canceled` on the refund call itself, and the success-shaped result
+would tell a customer their money is on its way with nothing to correct it —
+the order stays `paid`, so `check_order_status` says `paid` for ever.
+`_REFUND_FAILED` turns a terminal status into a refused `ToolResult`; every
+other value, `None` included, is the ordinary accepted case. A refund that
+fails *after* being accepted is a separate, open gap.
+
+**The success page reads `payment_status` before calling an order's `pending`
+a payment in flight.** An order is `pending` from the moment it is placed and
+this URL is one anybody can open, so "you do not need to pay again" was being
+said to shoppers who had not paid. The allow-list is
+`SETTLED_PAYMENT_STATUSES`, imported from `api/services/events.py` rather than
+respelled: it is the same question the webhook asks before moving an order to
+`paid`, and two spellings of "did the money arrive" is the drift this whole
+file argues against. `no_payment_required` is in it, which is why the check is
+not `== "paid"`.
+
+**A structural guard can pass while the property it exists for is false.**
+`request_checkout` dispatches through `self._registry` and an AST test says the
+reason is that the tracing and recording wrappers must see the call. They did —
+and then the follow-up turn cleared the activity log before anything read it,
+and no span was opened, so the click was in neither the panel nor Langfuse
+while the test stayed green. The click is its own traced turn now and keeps its
+own `ChatMessage`, and a behavioural test sits beside the structural one.
+
+The limit is worth stating because it looks like the same bug: the `view_cart`
+the gate reads to build a summary is invisible in the panel on *every* path,
+because `_describe` calls `super().dispatch` on the `GuardedRegistry`, which is
+inside `RecordingRegistry` rather than outside it. That is the wrapper order
+doing what it was built to do — record what the model asked for — and changing
+it is a structural decision, not a fix.
+
 **A gated question names itself in `ui/session.py`, not in `ui/app.py`.**
-`PendingApproval.title` and `.waiting` are properties over a mapping there,
+`PendingApproval.title`, `.waiting` and `.acting` are properties over a mapping
+there — the third arrived from review, because the page said "Placing the
+order…" while a refund was being issued, on screen at exactly the moment the
+irreversible thing happens. All three are properties over one mapping,
 because *which* question is being asked is a decision about the tool and the
 page decides nothing — and because `app.py` runs the whole page at import, so a
 string in it cannot be tested. An unknown tool falls back to a neutral heading

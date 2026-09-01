@@ -1885,6 +1885,55 @@ Both are irreversible. **Repetition is the cheaper mistake, and this repository
 objecting to repetition everywhere else is exactly why the exception needed a
 reason written next to it.**
 
+**Review found the same reversal in the branch nobody reached, which is the
+third time this shape has cost something.** Adding `request_refund` to
+`CONFIRM_BEFORE` exposed `_unconfirmed`'s "nobody can be asked" branch to a
+second tool, and its sentence was still the checkout's: *"nothing was ordered
+and nothing was charged"* — over an order that is charged and still paid. Every
+*other* sentence had been split per tool for exactly this reason; this one was
+missed because no test reaches it for a refund and nothing about the code says
+it is shared. **A mapping written for the two paths anybody drives does not
+cover the third**, and the fix was to give that branch the same treatment the
+others already had.
+
+**Withholding a field is not the same as ignoring it.** `refund_status` is kept
+out of the tool result on purpose — a model holding "succeeded" and "paid"
+collapses them — and the first version did not read it either. Stripe can come
+back `failed` or `canceled` on that very call, and the success-shaped payload
+would have told the customer their money was on its way when it was not, with
+nothing to correct it: the order stays `paid`, so `check_order_status` says
+`paid` for ever. It now reads the status to decide the *shape* of the answer
+and still does not hand it over. That is the boundary this layer is for, and
+the first draft only did half of it.
+
+**"Pending" was two situations wearing one word.** The success page said "your
+payment is being confirmed, you do not need to pay again" for any `pending`
+order — but an order is `pending` from the moment it is placed, and that URL is
+one anybody can open. A shopper who reached the payment page and backed out
+lands there with an `unpaid` session and gets told they have paid. The page
+reads `payment_status` now, through `SETTLED_PAYMENT_STATUSES` imported from
+the webhook rather than respelled, because "did the money arrive" having two
+spellings is what this file argues against everywhere else. **The same
+carelessness the PR set out to remove, one branch deeper**: the copy sweep
+caught sentences that promised too much and missed one that assumed too much.
+
+**A guard whose justification is observability has to actually be observable.**
+`request_checkout` dispatches through `self._registry` rather than
+`self._setup.registry`, and there is an AST test whose stated reason is that
+the tracing and recording wrappers must see the call. They did — and then the
+follow-up turn cleared the activity log before anything read it, and no span
+was ever opened, so the click appeared in neither the panel nor Langfuse. The
+test passed the whole time. **A structural guard can be satisfied while the
+property it exists for is false**, which is the argument for the behavioural
+test that now sits beside it.
+
+One thing that came up with it and was deliberately not changed: the `view_cart`
+the gate reads to build a summary is invisible in the activity panel on *every*
+path, because `_describe` calls `super().dispatch` on the `GuardedRegistry`,
+which sits inside `RecordingRegistry` rather than outside it. Consistent and
+long-standing rather than a regression, and a question about the wrapper order
+rather than something to answer in a review fix.
+
 **Eighteen mutations, all caught, and the tool list tests earned their keep.**
 Adding one tool failed eight existing tests at once — every assertion that names
 the whole set, offline and against the real server. That is the D9 `ping` entry
@@ -2419,6 +2468,16 @@ filters, and only then a tool. One thing to decide before any of it:
 `shopper_id` must stay tool-layer state like `cart_id` — the moment it is an
 argument the model sets, the agent is one prompt away from listing somebody
 else's orders.
+
+**A refund that fails after it is accepted tells nobody.** *(Refunds, PR #11.)*
+`request_refund` refuses a refund Stripe rejects on the call itself, but a
+refund accepted and then failing minutes later arrives as `refund.failed` or
+`charge.refund.updated`, and `api/services/events.py` handles neither. The
+order stays `paid`, `check_order_status` goes on saying `paid`, and the
+customer who was told "your refund is on its way" is never corrected. Closing
+it means a handler and a decision about what a failed refund does to an order
+that is still legitimately paid — which is a smaller version of the partial
+refund question below and probably wants answering with it.
 
 **A refund can be asked for and not taken back.** *(Refunds.)* `request_refund`
 is full-order only, because `stripe_svc.create_refund` takes no amount and
