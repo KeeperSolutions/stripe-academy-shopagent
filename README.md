@@ -184,7 +184,7 @@ python scripts/create_schema.py   # exits 2 if a column or foreign key is missin
 # 7. verify
 docker compose exec db psql -U shopagent -d shopagent \
   -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
-pytest tests/ -v          # 1190 pass; add -m network for the ones that cost money
+pytest tests/ -v          # 1224 pass; add -m network for the ones that cost money
 ```
 
 Step 6 matters on any database that predates a schema change: `create_all`
@@ -213,7 +213,7 @@ deliberate — but nothing can be bought.
 
 ```bash
 # the agent (start `uvicorn` first, see below)
-python -m shopagent.llm.loop            # CLI agent: 10 tools
+python -m shopagent.llm.loop            # CLI agent: 11 tools
 MCP_CATALOG_ENABLED=false \
   python -m shopagent.llm.loop          # same CLI without the catalog: 7 tools
 
@@ -272,7 +272,7 @@ python scripts/run_evals.py --only the_happy_path_reaches_a_payment_page
                                         # `tail`
 
 # tests
-pytest tests/ -v                        # 1233 collected: 1190 pass, 20 skip,
+pytest tests/ -v                        # 1267 collected: 1224 pass, 20 skip,
                                         # 23 deselected because they cost money
 pytest tests/ -m network                # the 4 embedding tests and the 3 chain runs;
                                         # these cost money and need uvicorn running
@@ -371,6 +371,17 @@ wrote. The chat input is disabled while that question is open, because a new
 message would silently void it. The payment link is rendered from state the
 shop wrote, never from the model's prose; the model is not given the URL at all.
 
+**A customer can ask for a refund, and it goes through the same gate.**
+"I want a refund" refunds the order placed in *this* conversation, in full —
+there is no way to refund one line, because there is no status between `paid`
+and `refunded` for a partly refunded order to sit in. The shop shows the order
+and asks before anything is requested, the same two-phase protocol a checkout
+uses. What comes back is a refund that has been **requested**: the order stays
+`paid` until Stripe confirms the money went back, exactly as when a refund is
+issued from the Stripe dashboard. An order from an earlier conversation cannot
+be refunded here — nothing links an order to a shopper, which is written up as
+an open gap.
+
 **The basket sits in the sidebar and is read from the shop, not from the
 conversation.** Lines, quantities and a total, re-read over HTTP on every draw
 and costing no model call — a panel rendered from the last message would keep
@@ -409,10 +420,15 @@ order is paid" from `check_order_status` — a status written by a signed
 
 Driven again through the basket button in the follow-up: two items, **Checkout**
 from the sidebar, confirm, pay, and back — €244.98, `pending → paid`, five
-deliveries, $0.002371 for the whole conversation.
+deliveries, $0.002371 for the whole conversation. And once more for refunds:
+buy, pay, then "I want a refund" — the gate asks *Confirm this refund* over the
+order's own total, and the agent answers "your full refund of €94.99 has been
+requested and is on its way, it is not completed yet". `charge.refunded` moved
+the order to `refunded` and put the reserved unit back. $0.001844.
 `docs/screenshots/d11-07-basket-panel-with-checkout.png`,
-`d11-07b-button-reaches-the-gate.png` and
-`d11-08-success-page-reads-the-order.png`.
+`d11-07b-button-reaches-the-gate.png`,
+`d11-08-success-page-reads-the-order.png` and
+`d11-09-refund-dialog.png`.
 
 ## Eval results
 

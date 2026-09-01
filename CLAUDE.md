@@ -1564,6 +1564,94 @@ list rather than a sentence list, because the sentences get rewritten and the
 promises are what must not come back.
 
 
+**The gate is about what cannot be undone, not about what costs money.**
+`request_refund` joined `CONFIRM_BEFORE` and it gives money *back*, so it
+cannot be the theft D9 built the gate against. It is gated because `refunded`
+is **terminal**: nothing leaves it in the transition table and `paid -> paid`
+is refused, so a refund the customer never asked for is one this system cannot
+reverse. Spending is the most obvious way to be irreversible and not the only
+one — which is the criterion a third gated tool should be tested against.
+
+**Two gated tools mean the gate's sentences are per tool, and the refund's are
+not the checkout's with a word changed.** "Nothing was ordered and nothing was
+charged" is true of a purchase nobody confirmed; a refund nobody confirmed
+leaves an order that *is* charged and still paid, so the same sentence would
+have the model reassure a customer about money the shop is still holding.
+`_AWAITING` and `_CHANGED` in `agent/guardrails.py` and `_NOTES` in
+`agent/confirmation.py` are the three mappings, and `follow_up_note` **raises**
+on a gated tool with no entry rather than falling back — the checkout's wording
+tells the model to place an order, which over a refund is a mistake that reads
+perfectly well and would be found by a customer.
+
+**`_describe` took a tool and still has one renderer, which is the part that
+mattered.** The one-function rule exists so that parking a question and
+spending its answer cannot disagree about whether the thing changed. Adding the
+refund added a *question*, not a second renderer: `_summarise` and `_has_lines`
+already read a cart and an order identically, because `view_cart` and
+`check_order_status` return the same shape. The refund branch reads the order
+alone, and the cart deliberately not — by the time a refund is possible
+`create_checkout` has emptied the cart, so summarising a basket would put
+"Total: €0.00" in front of somebody giving up a real order. That is the exact
+figure PR #9 found on the resume path, arriving from the other direction.
+
+**"There is no order" is read from `memory.order_id`, never from the tool's
+refusal.** Both arrive as a failed `ToolResult` — `check_order_status` refuses
+an absent order, and a commerce API that is down refuses everything — so one
+`not order.ok` check cannot tell them apart. Treating both as "nothing to
+confirm" makes the gate stand aside on a *transport* failure, and
+`request_refund` then runs with nobody asked. The checkout branch survives the
+same shape only because an empty cart makes `create_checkout` refuse anyway;
+a refund has no such second lock. Found by a test whose fixture was corrected
+to the shape `_refuse` really returns, which is the D8/D10 blind spot caught
+early for once.
+
+**A 202 is a shape problem before it is a wording problem.** `POST
+/orders/{id}/refund` answers 202 and the order stays `paid` until
+`charge.refunded` lands. A tool result shaped like a finished action produces
+"your refund is complete", and the customer then reads `paid` when they ask
+again. So `request_refund` returns `refund_requested` rather than `refunded`,
+includes `order_status` *because* it still says `paid` — it is the field that
+would otherwise be assumed — and says in its note that the refund is requested
+and not done. The same sentence is in `REFUND_CONFIRMED_NOTE`, deliberately
+twice: once on each side of the decision, because the follow-up turn is where
+the model writes what the customer reads.
+
+**`refund_status` is dropped on purpose, and it is the interesting omission.**
+Stripe reports `succeeded` immediately for a card. An HTTP client can hold two
+statuses called "succeeded" and "paid" and reason about them; a model collapses
+them into one sentence and picks the wrong one. `api/schemas.py` returns it for
+the first reader and this layer withholds it from the second. That is not the
+"a field that silently disappears is a gap the model fills" failure, because
+the note says what happened — there is nothing left to guess. `refund_id` is
+withheld by the `cart_id` rule: an opaque string the model carries is one it
+will get wrong, and no tool accepts one back.
+
+**There is no `amount` argument, and its absence is the same interface
+`create_refund` already has.** `orders.status` has `refunded` and no notion of
+partly refunded, and `handle_charge_refunded` logs a partial refund at ERROR
+and changes nothing. An `amount` here would be the model offering a customer
+something this shop cannot do. Asserted on the published schema rather than
+described, because the schema is what the model reads.
+
+**Nothing about refunds is in the system prompt.** The tool list is what the
+model reads to work out what it can do — the `ping` entry above says so — and
+the one fact the description cannot carry, that only this conversation's order
+is refundable, is in the tool's own refusal where a model that hits it will
+actually read it. `agent/prompt.py` is unchanged.
+
+**A gated question names itself in `ui/session.py`, not in `ui/app.py`.**
+`PendingApproval.title` and `.waiting` are properties over a mapping there,
+because *which* question is being asked is a decision about the tool and the
+page decides nothing — and because `app.py` runs the whole page at import, so a
+string in it cannot be tested. An unknown tool falls back to a neutral heading
+rather than raising, which is the opposite of `follow_up_note` and for a stated
+reason: there the wrong string is an instruction to the model, here it is a
+heading over a summary the person is reading anyway. Vague is survivable; a
+blank page is not. A separate test fails when a tool joins `CONFIRM_BEFORE`
+with no wording written for it, so the fallback keeps the page working without
+making it right.
+
+
 ## Commands
 
 **The runnable command list lives in `README.md`, and deliberately only there.**

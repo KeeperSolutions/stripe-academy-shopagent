@@ -1799,6 +1799,98 @@ works on the machine it was written on.** Neither was visible to anybody who
 already had it working, and both were found by someone typing the documented
 command instead of the habitual one.
 
+## Refunds from the conversation — findings
+
+**The estimate was wrong in the direction estimates usually are: the chat layer
+was the cheap part.** "Let the customer ask for a refund" was scoped at half a
+day on the assumption that it was a tool plus a gate branch. It was — but the
+recommendation attached to it, that the customer could refund *any* of their
+orders, rested on a premise nobody had checked. `orders` has no `shopper_id`,
+`customer_email` is optional on `POST /orders` and the agent has never sent it,
+and there is no `GET /orders`. So every order the agent places is attributable
+to nobody, and "my orders" is not a query that can be written. The feature
+shipped is the one that was actually costed; the one that was recommended needs
+a migration on a real-data table and is written up as a gap.
+
+**Being irreversible is what earns a confirmation; spending is only the most
+obvious way to be irreversible.** D9 built the gate against a model that could
+be talked into spending money, and a refund moves money the other way — so on
+the gate's original wording it does not qualify. It is gated anyway, because
+`refunded` is terminal: nothing leaves it in the transition table and `paid ->
+paid` is refused, so a refund nobody asked for is one this system cannot undo.
+Restating the criterion was the useful part of the day, and it is the test a
+third gated tool should be held to.
+
+**Two callers of a shared sentence is where a template looks right and is
+wrong.** The obvious move on a second gated tool is to interpolate the tool
+name into the existing notes. "Nothing was ordered and nothing was charged" is
+true of a purchase nobody confirmed and **reverses** for a refund nobody
+confirmed, which leaves an order that is charged and still paid — the same
+sentence would have the model reassure a customer about money the shop is
+holding. Three mappings replaced one string each, and `follow_up_note` raises
+on a gated tool nobody wrote notes for rather than sending the checkout's
+wording somewhere it does not belong: the wrong note here reads perfectly well
+and would be found by a customer rather than by a test.
+
+**A single `not ok` check cannot tell "there is nothing" from "the shop is
+down", and one of those must not open the gate.** `check_order_status` refuses
+an absent order and a commerce API that is unreachable refuses everything, and
+both arrive as a failed `ToolResult`. Treating them alike made the gate stand
+aside on a *transport* failure, which would have let `request_refund` issue a
+real refund with nobody asked. The checkout branch has the same shape and
+survives it only because an empty cart makes `create_checkout` refuse anyway —
+an accident, not a design. The refund reads `memory.order_id` instead, which is
+the same field the tool itself checks.
+
+It was caught because a fixture was corrected, not because anyone reasoned
+about it: `EMPTY_ORDER` in the test harness was a plain dict, so it came back
+`ok=True`, which is the shape the assertion wanted rather than the shape
+`_refuse` really returns. Fixing the fixture failed the test and the test named
+the defect. **That is the D8 and D10 blind spot caught on the way in for once**,
+and it cost ten minutes instead of a release.
+
+**A 202 has to be answered in the shape of the result, not in a sentence about
+it.** `POST /orders/{id}/refund` accepts and the order stays `paid` until
+`charge.refunded` arrives. A result shaped like a finished action produces "your
+refund is complete" however the note is worded, so the key is
+`refund_requested`, `order_status` is included *because* it still reads `paid`,
+and `refund_status` — which Stripe fills with `succeeded` immediately for a
+card — is withheld. An HTTP client can hold two statuses called "succeeded" and
+"paid"; a model collapses them into one sentence and picks the wrong one.
+
+**The live run measured the one thing no offline test can: what the model says
+about a 202.** One conversation, $0.001844. The order went `pending -> paid` on
+a signed `checkout.session.completed`, "I want a refund" parked a question
+headed *Confirm this refund* showing the order's own €94.99 rather than the
+emptied cart's zero, and the answer produced:
+
+> Your full refund of €94.99 has been requested and is on its way. It is not
+> completed yet.
+
+Requested, not complete; the amount quoted from `amount_cents` and therefore
+past the amount guardrail. Then `charge.refunded` moved the order to `refunded`
+and released the reservation — visible afterwards in the cleanup, which reported
+"inventory 0 variant(s) put back", because there was nothing left to put back.
+
+**Streamlit refuses an empty dialog title, so the confirmation modal carries
+three headings for one fact.** "Confirm" from `st.dialog`, "Confirm this refund"
+below it, and the gate's own "About to refund this whole order:" below that.
+The generic one cannot be dropped — `StreamlitAPIException: A non-empty title
+argument has to be provided for dialogs`, measured with a throwaway app on port
+8502 rather than guessed — and it is fixed at decoration time, so it cannot say
+which question this is. Dropping the middle heading was the tidy answer and was
+rejected: it would leave the only per-tool signal inside a grey code block, and
+somebody clicking quickly could approve a refund thinking it was a purchase.
+Both are irreversible. **Repetition is the cheaper mistake, and this repository
+objecting to repetition everywhere else is exactly why the exception needed a
+reason written next to it.**
+
+**Eighteen mutations, all caught, and the tool list tests earned their keep.**
+Adding one tool failed eight existing tests at once — every assertion that names
+the whole set, offline and against the real server. That is the D9 `ping` entry
+paying out: the tests exist so an unintended change to what the model can do
+fails rather than being noticed four days later.
+
 ## Known gaps
 
 Every entry carries the day it was written. **Open** entries are grouped by
@@ -2310,6 +2402,34 @@ stops, which is asserted — `ui.CHECKOUT_TOOL` must be in
 `self._registry`, which is asserted structurally. Both are real guards. What
 neither covers is a *third* caller added later that reaches the tool some other
 way: the guards are written about this one button, not about the class of them.
+
+**Nothing links an order to the shopper who placed it.** *(Refunds.)* `orders`
+has no `shopper_id`; `customer_email` is optional on `POST /orders` and the
+agent has never sent one, so every order the agent places is attributable to
+nobody. The shopper's address reaches `session.customer_details.email` on the
+Stripe side and stops there. The consequences are concrete: "show me my orders"
+cannot be written as a query, `request_refund` can only reach the order placed
+in the conversation it is having, and the profile in `agent/profile.py` is a
+name and some sizes with no purchase history behind it.
+
+Closing it is a chain and not a column: `migrations/0003_*.sql` on a real-data
+table, `place_order` learning who is buying (it takes a `cart_id` and nothing
+else, so `carts` or the request body has to carry it), a `GET /orders` that
+filters, and only then a tool. One thing to decide before any of it:
+`shopper_id` must stay tool-layer state like `cart_id` — the moment it is an
+argument the model sets, the agent is one prompt away from listing somebody
+else's orders.
+
+**A refund can be asked for and not taken back.** *(Refunds.)* `request_refund`
+is full-order only, because `stripe_svc.create_refund` takes no amount and
+`orders.status` has nothing between `paid` and `refunded`. A customer who wants
+one line back is told the shop cannot do it. Per-item refunds need a
+non-terminal status, a `refunded_quantity` column, a per-line stock release
+under the existing locks, an idempotency key that includes the lines — the
+current one is derived from the order id alone, so a second refund of a
+*different* line inside 24 hours would silently return the first refund object
+— and a `charge.refunded` handler that attributes an amount to lines Stripe's
+refund object does not carry.
 
 **There is no rate limit, only a spend cap.** *(D11.)* `UI_SPEND_CAP_USD` stops
 one browser session at $0.50 and is checked at the door of a turn, so the real
