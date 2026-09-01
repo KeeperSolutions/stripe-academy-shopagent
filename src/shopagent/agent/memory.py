@@ -353,11 +353,11 @@ class ConversationMemory:
             self._last_search = LastSearch(
                 tool=tool,
                 arguments=arguments,
-                results=list(_results_in(payload)),
+                results=list(results_in(payload)),
             )
 
 
-def _results_in(payload: Any) -> list[dict]:
+def results_in(payload: Any) -> list[dict]:
     """The ordered rows of a search result envelope.
 
     `{count, results}` is the shape the MCP wrapper adds so that "nothing
@@ -365,6 +365,12 @@ def _results_in(payload: Any) -> list[dict]:
     caller reaching `catalog.search_products` directly gets. Both are read,
     because which one arrives depends on how the tool was reached rather than
     on anything about the search.
+
+    Public rather than `_`-prefixed since D11, which needed the same envelope
+    read a second time — to capture a turn's search results onto the message
+    that produced them. Two readers of one wire format is the drift this
+    repository refuses everywhere else, and the fix is one function with a
+    second caller rather than a copy in `ui/`.
     """
     if isinstance(payload, dict):
         rows = payload.get("results", [])

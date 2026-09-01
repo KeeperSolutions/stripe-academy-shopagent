@@ -37,7 +37,10 @@ from pydantic import BaseModel
 from shopagent.agent import confirmation
 from shopagent.agent.guardrails import (
     AWAITING_ANSWER,
+    AWAITING_REFUND_ANSWER,
     CONFIRM_BEFORE,
+    REFUNDING,
+    REFUND_ORDER_CHANGED,
     FALLBACK_PREFIX,
     PLACING,
     RESUMING,
@@ -100,10 +103,20 @@ ORDER = {
     "total_cents": 19999,
 }
 
-EMPTY_ORDER = {"error": "no order has been placed in this conversation"}
+# What `check_order_status` really answers with no order behind it: a *failed*
+# `ToolResult`, not a dict. `_refuse` in `tools/commerce.py` builds it and
+# `dispatch` passes a `ToolResult` through untouched. A fixture returning a
+# plain dict here would come back `ok=True`, which is the shape the assertion
+# wants rather than the shape the object has — the blind spot D8 and D10 each
+# paid for, and the one that hid a real defect in this gate for ten minutes.
+EMPTY_ORDER = ToolResult(
+    ok=False,
+    content="Error: no order has been placed in this conversation.",
+    error="no order has been placed in this conversation",
+)
 
 
-def build(can_confirm=True, cart=CART, memory=None, order=ORDER):
+def build(can_confirm=True, cart=CART, memory=None, order=ORDER, order_id="o-1"):
     """A registry holding a fake cart and a fake checkout, with the gate on.
 
     `can_confirm` replaced D9's `confirm` callable when the gate stopped
@@ -112,6 +125,13 @@ def build(can_confirm=True, cart=CART, memory=None, order=ORDER):
     rather than a pass.
     """
     memory = memory or ConversationMemory()
+    # `create_checkout` writes this in `tools/commerce.py`, and the fake one
+    # below does not — so it is set here instead. It is not decoration: the
+    # refund gate reads `memory.order_id` to tell "there is no order" from
+    # "the shop is not answering", and a harness that left it None would put
+    # every refund test in the wrong branch.
+    if order_id is not None:
+        memory.order_id = order_id
     registry = GuardedRegistry(memory, can_confirm=can_confirm)
     ran = []
 
@@ -121,11 +141,28 @@ def build(can_confirm=True, cart=CART, memory=None, order=ORDER):
         return cart
 
     def check_order_status():
+        if isinstance(order, Exception):
+            raise order
         return order
 
     def create_checkout():
         ran.append("create_checkout")
         return {"order_id": "o-1", "checkout_url": "https://pay.example/1", "total_cents": 18998}
+
+    def request_refund():
+        ran.append("request_refund")
+        # Built from the shape the real result always has, including the
+        # `order_status` that still says `paid` — the field the whole 202
+        # contract rests on. A fixture that dropped it would leave the one
+        # thing worth asserting about a refund untested.
+        return {
+            "order_id": "o-1",
+            "refund_requested": True,
+            "amount_cents": 19999,
+            "currency": "eur",
+            "order_status": "paid",
+            "note": "requested, not completed",
+        }
 
     def add_to_cart(variant_id: int, quantity: int = 1):
         ran.append(f"add_to_cart:{variant_id}")
@@ -142,6 +179,9 @@ def build(can_confirm=True, cart=CART, memory=None, order=ORDER):
     )
     registry.register(
         ToolSpec(name="add_to_cart", description="d", args_model=AddArgs, fn=add_to_cart)
+    )
+    registry.register(
+        ToolSpec(name="request_refund", description="d", args_model=NoArgs, fn=request_refund)
     )
     return registry, memory, ran
 
@@ -166,8 +206,15 @@ def settle(memory, said_yes):
     return shown
 
 
-def test_checkout_is_the_call_that_needs_a_person():
-    assert CONFIRM_BEFORE == frozenset({"create_checkout"})
+def test_the_two_calls_that_need_a_person_are_the_irreversible_ones():
+    """Spending is not the criterion; being unable to undo it is.
+
+    A refund gives money *back*, so it cannot be the theft this gate was built
+    against — and it is gated anyway, because `refunded` is terminal. There is
+    no transition out of it and `paid -> paid` is refused, so a refund nobody
+    asked for is one this system cannot reverse.
+    """
+    assert CONFIRM_BEFORE == frozenset({"create_checkout", "request_refund"})
 
 
 def test_the_first_checkout_asks_and_buys_nothing():
@@ -676,3 +723,224 @@ def test_an_approval_is_not_spent_on_a_cart_that_changed_after_it_was_given():
 
     assert ran == [], "an approval for one basket bought another"
     assert not result.ok
+
+
+# --- the refund goes through the same gate, asking a different question ---
+
+
+def test_the_first_refund_asks_and_refunds_nothing():
+    """Phase one for the other gated tool. Same protocol, different question."""
+    registry, memory, ran = build()
+
+    result = registry.dispatch("request_refund", {})
+
+    assert ran == [], "the tool ran before anybody was asked"
+    assert not result.ok
+    assert result.content == AWAITING_REFUND_ANSWER
+
+    pending = memory.pending_confirmation
+    assert pending is not None
+    assert pending.tool == "request_refund"
+    assert pending.answer is None
+
+
+def test_the_refund_summary_is_read_from_the_order_and_never_the_cart():
+    """The defect the cart branch would have produced here.
+
+    By the time a refund is possible the cart is empty — `create_checkout`
+    clears it when it places the order. Summarising a basket would put
+    "Total: €0.00" in front of somebody about to give up a €199.99 order,
+    which is the exact figure PR #9 found on the resume path.
+    """
+    registry, memory, _ = build(cart=EMPTY_CART)
+
+    registry.dispatch("request_refund", {})
+
+    summary = memory.pending_confirmation.summary
+    assert "Storm Guard Shell" in summary
+    assert "Total: €199.99" in summary
+    assert "€0.00" not in summary
+
+
+def test_the_refund_question_says_the_whole_order_is_going_back():
+    """Saying "a refund" and saying "this whole order" are not the same thing.
+
+    `stripe_svc.create_refund` takes no amount and there is no status between
+    `paid` and `refunded`, so a full refund is the only one this shop can
+    issue. Somebody approving a summary that did not say so could reasonably
+    think they were returning one item.
+    """
+    registry, memory, _ = build()
+
+    registry.dispatch("request_refund", {})
+
+    assert REFUNDING in memory.pending_confirmation.summary
+    assert "whole order" in memory.pending_confirmation.summary
+
+
+def test_confirming_lets_the_refund_through():
+    registry, memory, ran = build()
+    registry.dispatch("request_refund", {})
+
+    shown = settle(memory, True)
+    result = registry.dispatch("request_refund", {})
+
+    assert len(shown) == 1
+    assert ran == ["request_refund"]
+    assert result.ok
+
+
+def test_declining_a_refund_says_the_order_is_unchanged_not_that_nothing_was_charged():
+    """The checkout's refusal reads backwards here, and that is why it is separate.
+
+    "Nothing was charged" is true of a purchase nobody confirmed. A refund
+    nobody confirmed leaves an order that *is* charged and still paid, and
+    telling the model otherwise would have it reassure a customer about money
+    the shop is still holding.
+    """
+    registry, memory, ran = build()
+    registry.dispatch("request_refund", {})
+
+    settle(memory, False)
+    result = registry.dispatch("request_refund", {})
+
+    assert ran == []
+    assert not result.ok
+    assert "nothing was charged" not in result.content.lower()
+    assert "order is unchanged" in result.content
+    assert "request_refund" in result.content
+
+
+def test_a_refund_cannot_be_confirmed_when_nobody_can_be_asked():
+    """D9's rule, unchanged, on the second gated tool.
+
+    A gate that cannot reach a person is not a gate, so the answer is a refusal
+    rather than a pass — and it has to hold for a tool added after the rule was
+    written, or the rule is about `create_checkout` rather than about gating.
+    """
+    registry, memory, ran = build(can_confirm=False)
+
+    result = registry.dispatch("request_refund", {})
+
+    assert ran == []
+    assert not result.ok
+    assert memory.pending_confirmation is None
+
+
+def test_a_refund_with_no_order_lets_the_tool_answer():
+    """Nothing to confirm, so the gate steps out of the way.
+
+    `request_refund` says "no order has been placed in this conversation" far
+    better than any question this gate could ask about nothing — the same
+    handover the empty-cart branch makes for a checkout. Read from
+    `memory.order_id`, which is what makes this pass while the next one refuses.
+    """
+    registry, memory, ran = build(order=EMPTY_ORDER, order_id=None)
+    assert memory.order_id is None
+
+    result = registry.dispatch("request_refund", {})
+
+    assert memory.pending_confirmation is None
+    assert ran == ["request_refund"], "the tool ran and answered in its own words"
+    # What those words are is `tools/commerce.py`'s business and is asserted
+    # there; the claim here is only that the gate handed over instead of
+    # inventing a question about nothing. The fake above always succeeds,
+    # which is why `result` is not read.
+    assert result is not None
+
+
+def test_an_approval_for_a_checkout_does_not_pay_for_a_refund():
+    """An approval is for a question, not for a mood.
+
+    The turn carrying an answer back is a whole loop with every tool available,
+    so the model can call the other gated tool inside it. `take_confirmation`
+    matches on the tool, and this is that check on the pair that now exists —
+    before the refund there was only one gated tool and nothing could have
+    caught it.
+    """
+    registry, memory, ran = build()
+    registry.dispatch("create_checkout", {})
+    settle(memory, True)
+
+    result = registry.dispatch("request_refund", {})
+
+    assert ran == [], "a yes given for the purchase paid for the refund"
+    assert not result.ok
+    assert result.content == AWAITING_REFUND_ANSWER
+
+
+def test_an_order_that_changed_after_the_yes_is_asked_about_again():
+    """The `_spend` re-read, on the refund's own question.
+
+    A refund approved for a pending order and spent against one Stripe has
+    since moved is an approval for a different fact. The new summary is parked
+    and the customer is asked about the order as it stands.
+    """
+    order = dict(ORDER)
+    registry, memory, ran = build(order=order)
+    registry.dispatch("request_refund", {})
+    settle(memory, True)
+
+    order["status"] = "refunded"
+    order["total_cents"] = 9999
+    order["items"] = [{**ORDER["items"][0], "line_total_cents": 9999}]
+    result = registry.dispatch("request_refund", {})
+
+    assert ran == []
+    assert result.content == REFUND_ORDER_CHANGED
+    assert "€99.99" in memory.pending_confirmation.summary
+
+
+def test_an_order_that_cannot_be_read_refunds_nothing_and_never_runs_the_tool():
+    """The hole a single `not order.ok` check would have left open.
+
+    "There is no order" and "the shop is not answering" both arrive as a failed
+    `ToolResult`, and only the first means there is nothing to confirm. A gate
+    that treated them alike would stand aside on a transport failure and
+    `request_refund` would issue a real refund with nobody asked. A checkout is
+    protected from the same shape by an empty cart refusing anyway; a refund has
+    no such second lock, which is why the no-order case is read from the memory
+    and this one is not.
+    """
+    registry, memory, ran = build(
+        order=RuntimeError("the commerce API is not answering")
+    )
+
+    result = registry.dispatch("request_refund", {})
+
+    assert ran == [], "the refund ran without anybody being asked"
+    assert not result.ok
+    assert "could not be read" in result.content
+    assert memory.pending_confirmation is None
+
+
+def test_an_unconfirmable_refund_does_not_say_nothing_was_charged():
+    """The branch adding a second gated tool exposed. Raised on PR #11.
+
+    D9's rule is that a gate which cannot reach anybody refuses — and until the
+    refund arrived, only one tool could reach this branch, so its sentence was
+    the checkout's. For a refund it is backwards: the order is still charged
+    and still paid, and "nothing was charged" is the exact false reassurance
+    the per-tool notes exist to avoid.
+    """
+    registry, memory, ran = build(can_confirm=False)
+
+    result = registry.dispatch("request_refund", {})
+
+    assert ran == []
+    assert not result.ok
+    assert memory.pending_confirmation is None
+    assert "nothing was charged" not in result.content.lower()
+    assert "order is unchanged" in result.content
+    assert "refund was not requested" in result.content
+
+
+def test_an_unconfirmable_checkout_still_says_nothing_was_charged():
+    """The other half, unchanged — the fix must not have swapped the sentences."""
+    registry, _, ran = build(can_confirm=False)
+
+    result = registry.dispatch("create_checkout", {})
+
+    assert ran == []
+    assert "nothing was charged" in result.content
+    assert "refund" not in result.content

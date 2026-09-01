@@ -141,6 +141,43 @@ DECLINED_NOTE = (
 )
 
 
+# The same two notes for a refund, and they are separate strings rather than a
+# template with the tool name substituted in. The checkout notes tell the model
+# to place the order; a refund is the opposite movement of money and terminal,
+# so the sentence a declined refund needs is not the declined purchase's with a
+# word changed — "nothing was charged" would be exactly backwards.
+#
+# The confirmed one carries the 202 into the follow-up turn, because that turn
+# is where the model writes the sentence the customer reads and it is the
+# moment it will want to say "done". The tool result says the same thing again
+# when the call goes through; twice is deliberate, once on each side of the
+# decision.
+REFUND_CONFIRMED_NOTE = (
+    "The shop showed the customer the order and its total and asked them to "
+    "confirm a full refund. They confirmed. Call request_refund now — the "
+    "confirmation is recorded and this call will go through. Asking for a "
+    "refund is not the same as the money arriving: report what the tool says "
+    "and do not tell them the refund is complete."
+)
+
+REFUND_DECLINED_NOTE = (
+    "The shop showed the customer the order and its total and asked them to "
+    "confirm a full refund. They declined. No refund was requested and their "
+    "order is unchanged. Tell them that plainly, and do not call "
+    "request_refund again unless they ask for it in a later message."
+)
+
+# Which pair of notes a tool's answer is carried back with. A mapping rather
+# than a chain of `if`s so that adding a third gated tool is a line here and a
+# failure everywhere it has not been thought about — `follow_up_note` raises on
+# a tool it does not know rather than sending the checkout's wording to
+# something that is not a checkout.
+_NOTES: dict[str, tuple[str, str]] = {
+    "create_checkout": (CONFIRMED_NOTE, DECLINED_NOTE),
+    "request_refund": (REFUND_CONFIRMED_NOTE, REFUND_DECLINED_NOTE),
+}
+
+
 def resolve_pending(memory: object, confirm: Confirmer | None) -> PendingConfirmation | None:
     """Put whatever is parked to a person, and record what they said.
 
@@ -163,5 +200,20 @@ def resolve_pending(memory: object, confirm: Confirmer | None) -> PendingConfirm
 
 
 def follow_up_note(pending: PendingConfirmation) -> str:
-    """The system message that carries a person's answer back to the model."""
-    return CONFIRMED_NOTE if pending.answer else DECLINED_NOTE
+    """The system message that carries a person's answer back to the model.
+
+    Keyed on the tool the question was about. A gated tool with no entry in
+    `_NOTES` raises rather than falling back to the checkout's wording, which
+    would tell the model to place an order it was never asked about — the
+    loudest possible version of a mistake that would otherwise be a sentence
+    nobody reread.
+    """
+    try:
+        confirmed, declined = _NOTES[pending.tool]
+    except KeyError:  # pragma: no cover - a gated tool nobody wrote notes for
+        raise KeyError(
+            f"no follow-up note is written for {pending.tool!r}. A tool added "
+            f"to CONFIRM_BEFORE needs its own pair here: the checkout's "
+            f"wording is about placing an order and is wrong for anything else."
+        ) from None
+    return confirmed if pending.answer else declined

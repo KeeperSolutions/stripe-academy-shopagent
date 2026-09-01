@@ -27,7 +27,7 @@ from shopagent.llm.client import AssistantMessage, ToolCall
 from shopagent.llm.usage import UsageTracker
 from shopagent.obs import redaction
 from shopagent.obs.instrumentation import TracedClient, TracedRegistry
-from shopagent.obs.tracing import Tracer, build_tracer
+from shopagent.obs.tracing import CONVERSATION, Tracer, build_tracer
 from shopagent.tools.registry import ToolRegistry, ToolResult, ToolSpec
 from pydantic import BaseModel
 
@@ -740,3 +740,91 @@ def test_that_answer_is_redacted_like_every_other_thing_a_person_reads():
     wire = capture.wire()
     assert "Your order is on its way." not in wire
     assert "<redacted:" in wire, "the answer was dropped rather than digested"
+
+
+# --- one conversation across several roots (D11, step 4) -----------------
+
+
+def test_a_session_id_reaches_every_span_of_the_conversation():
+    """What makes a browser's turns one conversation in Langfuse.
+
+    The CLI holds one root open for its whole REPL, so its conversation *is*
+    one trace. A browser cannot: Streamlit reruns each interaction on a fresh
+    thread and an OTEL span lives in a `contextvar`, so a root entered on one
+    rerun's thread cannot be closed on another's. One root per turn is the only
+    shape that closes where it opened, and this is what puts them back
+    together.
+
+    Asserted on the wire rather than on what the caller passed, because the
+    caller passing it and `propagate_attributes` receiving it are two facts —
+    and a mutation that dropped it between them survived a test that only
+    checked the first.
+    """
+    capture = Capture()
+
+    with capture.tracer.conversation(
+        shopper_id=None, model="m", session_id="tab-7f3a"
+    ) as span:
+        span.update(metadata={"turn": 1})
+
+    assert "tab-7f3a" in capture.wire()
+
+
+def test_two_turns_with_one_session_id_are_two_traces_and_one_session():
+    capture = Capture()
+
+    for _ in range(2):
+        with capture.tracer.conversation(shopper_id=None, model="m", session_id="tab-1"):
+            pass
+
+    wire = capture.wire()
+    assert wire.count("tab-1") >= 2
+    # Two roots, which is the shape being grouped rather than a defect in it.
+    assert len([name for name in capture.names() if name == CONVERSATION]) == 2
+
+
+def test_a_conversation_with_no_session_id_still_works():
+    """The CLI's call, unchanged. `session_id` defaults to `None` precisely so
+    the path D1 through D10 use is not touched by D11 needing one."""
+    capture = Capture()
+
+    with capture.tracer.conversation(shopper_id=None, model="m"):
+        pass
+
+    assert CONVERSATION in capture.names()
+
+
+def test_the_session_id_is_sent_as_written():
+    """Not digested, and that is the one judgement in it.
+
+    `shopper_id` identifies a person and leaves as a digest. A session id is a
+    `uuid4` the browser layer invents per tab: it carries nothing anybody wrote
+    and identifies nobody, and digesting it would cost the grouping for no
+    privacy gained.
+    """
+    capture = Capture()
+    session_id = "9f8e7d6c5b4a39281706f5e4d3c2b1a0"
+
+    with capture.tracer.conversation(shopper_id=None, model="m", session_id=session_id):
+        pass
+
+    assert session_id in capture.wire()
+
+
+def test_an_unconfigured_tracer_offers_no_trace_url():
+    """Unconfigured is an ordinary state, so a caller gets `None` rather than
+    an exception — the same call `stripe_secret_key` already gets."""
+    assert Tracer().trace_url() is None
+
+
+def test_a_broken_client_does_not_take_the_page_down_asking_for_a_url():
+    """A diagnostic must not cause the outage it describes."""
+
+    class Exploding:
+        def get_trace_url(self):
+            raise RuntimeError("langfuse is having a day")
+
+    tracer = Tracer(Exploding())
+
+    assert tracer.trace_url() is None
+    assert tracer.enabled is False, "the tracer goes inert after its first failure"

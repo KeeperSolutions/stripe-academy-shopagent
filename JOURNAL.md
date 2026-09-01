@@ -1563,6 +1563,383 @@ end to end, ten times, in one process — which is the only condition under whic
 either defect is visible. That is the argument for the suite, and it is worth
 stating as a measurement rather than as a hope about evals in general.
 
+## Day 11 — findings
+
+**`grep -c` counted its own line, and a wrong reading sent a correct piece of
+code to be investigated.** Step 3 reported "`stripe listen` is running (1
+process)" on the strength of `ps aux | grep -c "[s]tripe listen"`. That counts
+*lines of output*, not processes, and it returned a number that read as one
+forwarder while nothing was forwarding at all. The conclusion drawn from it —
+"the expiry webhook never arrived, and I do not know whether `cancel_order`
+expires the session" — put a question mark over D7 code that turned out to be
+exactly right: `pgrep -fl` found no forwarder, the session was `expired`, and
+Stripe had emitted `checkout.session.expired` twenty-two seconds after the
+cancel.
+
+This is the fourth time in this project that a tool not doing what it appeared
+to do has looked identical to a result, and the first time it happened in
+process diagnostics rather than in a test. The others were a fixture missing a
+field, a probe exercising a neighbouring operation, and a mutation whose branch
+no scenario reached. The shape is the same every time: **a measurement that
+cannot fail is not a measurement**, and `grep -c` over `ps` cannot report zero
+while the grep itself is running.
+
+**The customer and the model are now looking at two different lists, and the UI
+is what put them there.** Grouping variants by colour is right for a person —
+`black · 41, 42, 43 — €94.99` is one row where three used to be — and it means
+"the second one" no longer means the same thing on both sides of the
+conversation. The model resolves an ordinal against `search_products`' flat
+result; the customer counts rows on the page. In the CLI those were the same
+list, because the CLI printed what the tool returned.
+
+Measured rather than feared: the same sentence, "add the second one to my
+cart", resolved to the *second product* on one run and to the *second variant of
+the first product* on another. That second reading is the one the grouped cards
+make natural, and it is a different kind of problem from the model variance D10
+already records — **that one is the model being non-deterministic; this one is
+the interface having introduced a second frame of reference.** No guardrail can
+see it: both answers are variants the model was legitimately shown, so
+`seen_variant_ids` passes either. Filed as an open gap rather than patched,
+because the fix is a product decision — number the cards, or stop grouping — and
+neither belongs in a rendering step.
+
+**A mutation survived a test that watched the caller instead of the wire.**
+`Tracer.conversation(session_id=...)` reaches Langfuse through
+`propagate_attributes`, and the test asserted what `BrowserSession` *passed*. So
+deleting the argument in `obs/tracing.py`, between the two, changed nothing the
+test could see. Two facts — the caller sending it and the SDK receiving it — and
+a test that checked the first while the entry claimed the second. The
+replacement asserts it on the exported span, using the in-memory exporter D10
+already built for the redaction tests.
+
+**A mutation survived because no scenario reached its branch.** `resolve_pending`
+refuses an already-answered confirmation, and a double-click test passed with
+that check deleted — because when the model *spends* the approval,
+`take_confirmation` clears it and a second answer finds nothing anyway. The
+check earns its place only in the other branch: the model answers without
+calling `create_checkout`, so the question stays parked, and a second click
+would drive a second turn carrying a second `CONFIRMED_NOTE`. Same lesson as
+D10's two-cycle probe, one layer up: **a guard's test has to be written against
+the state the guard exists for, not against the state that is easy to reach.**
+
+**A third category of surviving mutation: the defect was unrepresentable.**
+"Cards must be captured onto the message, not read back from `last_search`" was
+falsified by rewriting the capture to read `last_search` — and the test passed,
+correctly. `ChatMessage` is frozen and its `cards` tuple is built when the
+bubble is made, so at that instant both designs read the same thing. The eager
+capture had made the lazy defect impossible to express, and the assertion was
+therefore measuring something else. The distinguishing property is elsewhere:
+`last_search` survives a turn and the activity log does not, so the wrong
+design puts the boots from two turns ago under "what is your returns policy?".
+Alongside "the test was weak" and "the mutation was broken", this is the third
+reason a mutation survives, and it is the only one where **the code is right and
+the claim was mis-stated.**
+
+**`st.dialog` was measured with a probe outside the project rather than read out
+of a docstring.** The confirmation modal had to satisfy four things nothing in
+the documentation states together: that it closes only programmatically
+(`dismissible=False`), that closing it redraws the *page* and not just itself
+(`st.rerun(scope="app")`, because a dialog is a fragment), that a double-click
+produces one answer and not two, and that a newly parked question reopens it. A
+throwaway script on another port answered all four in a few minutes and cost
+nothing. The alternative was building the real thing on four assumptions and
+finding out during a paid run.
+
+**`$` is LaTeX in Streamlit's markdown, and the page said so before any test
+did.** `f"session ${cost} of ${cap}"` rendered the cost inside a maths block and
+swallowed the cap. It was found by loading the page and reading it, which is
+also how D10 found eighteen plaintext copies of a query in a live trace while
+every unit test agreed the argument was digested. **Some defects are only
+visible in the artefact.**
+
+**D9's unknown-variant guardrail refused a test script, which is the guardrail
+working.** The first draft of the confirmation tests called `add_to_cart(86272)`
+with no preceding search, and was refused because the id had not appeared in a
+tool result in that conversation. Every script here now opens with a search —
+not as scene-setting, but because the guard makes it a precondition. A guard
+that inconveniences the person writing tests for it is one that is actually in
+the path.
+
+**The end-to-end payment worked, and the one thing that broke was the
+harness.** A browser navigated to the Stripe URL *in the same tab*, paid, and
+came back to a cold Streamlit session with the conversation gone — which looked
+like a session-durability defect and was not one. `st.link_button` opens a new
+tab by default, so a customer clicking "Pay with Stripe" leaves the app tab
+alive; only the automation had gone somewhere the customer never goes. Driven
+again through the button, the session survived the round trip and the agent
+answered "Yes, your payment went through. The order is paid." from
+`check_order_status` — a status written by a signed `checkout.session.completed`
+and by nothing else. **An automated path that is not the user's path can
+manufacture a defect report about code that is correct**, which is the same
+lesson as the `grep -c` entry above, arriving from the other direction on the
+same day.
+
+## Day 11 follow-up — findings
+
+**A page that asserts a fact it did not read goes stale faster than anybody can
+read it.** The success page told every returning shopper that "the order has not
+been marked paid yet", and it was right about the *session* and had never looked
+at the *order*. Measured on the live run: the browser landed on the page and the
+order was already `paid` — the five signed deliveries had been processed at
+09:05:11 and 09:05:14, which is inside the time it takes to focus a tab. So the
+one sentence a customer reads about their own money contradicted the shop, in
+the direction of alarming them. The fix is not a better sentence, it is a
+`SELECT`: the page reports the status and no longer has an opinion of its own.
+The D7 rule it looked like it was protecting is untouched and now asserted from
+three statuses rather than one — **reporting is not deciding**, and the page
+still writes nothing.
+
+**A leak sweep that drives one branch measures one branch.** The first version
+of the test forbidding project vocabulary on the customer-facing pages drove the
+happy path and passed. A deliberate mutation putting "the Day 8 webhook
+endpoint" into the unconfigured-Stripe branch survived it — which is the same
+shape as the leak being fixed, because the sentence that sat on this page for
+four days was in a branch nobody was rereading either. The test now drives all
+ten renderings the two pages can produce, and four separate leak mutations, one
+per rare branch, each fail it. **The branches that leak are the ones nobody
+looks at, so a sweep has to enumerate branches rather than sample them.**
+
+**Two of ten mutations survived, and only one of them was a weak test.** The
+guard refusing a checkout click past the spend cap could be deleted with every
+test still green, because the scenario built the session with a cap of nothing —
+so `send` refused the turn that fills the basket, the click met an *empty*
+basket, and it was refused for that reason instead. The scenario never reached
+the branch. Filling the basket first and lowering the cap onto it afterwards is
+what makes the mutation fail. This is the same defect the D10 entry records
+about a probe exercising a neighbouring operation, and it is now the third time
+this project has caught it: **a surviving mutation is a question about the
+scenario before it is a question about the assertion.**
+
+**The button had to be defended structurally, because behaviour cannot see the
+difference.** Dispatching `create_checkout` on `self._setup.registry` instead of
+`self._registry` passes every behavioural test there is — the gate still parks,
+the summary still comes from the cart, the order is still placed under the same
+locks. What it skips is `TracedRegistry` and `RecordingRegistry`, so a checkout
+started from the button would be missing from the trace and from the activity
+panel: invisible in exactly the surface built to make tool calls visible. One
+AST assertion on the single `dispatch` in `request_checkout` is what catches it,
+and it is the same mechanism `tests/test_lifecycle.py` uses on `transition()`.
+
+**The agreement between the button and the gate is one assertion and it is not
+the button's own.** `ui.CHECKOUT_TOOL` is asserted to be a member of
+`guardrails.CONFIRM_BEFORE`. The whole argument for a checkout button is that
+`create_checkout` is a tool the gate stops; the day that name falls out of the
+set — renamed, split, the gate narrowed — the button silently stops being a
+request for confirmation and becomes a second way to buy something, with nothing
+failing anywhere near it.
+
+**A docstring left behind by the step that superseded it is a lie with a
+citation.** `ui/app.py` opened with "**The confirmation gate is not wired up
+here** — that is step 3", written on step 2 and still there four commits later
+with the modal sitting sixty lines below it. Nothing failed, because nothing
+tests prose. It was found by reading the file in order to add to it, which is
+the only way it ever would have been.
+
+**The live run cost $0.002371 and the model never saw a payment link.** Five
+turns: a search, a two-item add, the follow-up turn the button's confirmation
+drove, and a status check. The order went `pending → paid` on a signed
+`checkout.session.completed`, the agent answered "Yes, your payment went
+through. The order status is `paid`" from `check_order_status`, and the basket
+panel emptied itself the moment the cart became an order — read from the shop,
+not from the message that said so.
+
+**A receipt this shop never sent was promised on the page for one commit.** The
+success page said "Stripe has emailed you a receipt", which reads like a fact
+and is a guess about a third party's configuration. Checked against the live
+payment rather than argued about: `charge.receipt_number` is **null** — Stripe
+sets it only once a receipt has actually been sent — and `receipt_email` is null
+on the PaymentIntent *and* on the Charge, because nothing in
+`payments/checkout.py` sets it. The shopper's address reaches
+`session.customer_details.email` and stops there. On top of that, test mode
+emails no receipts at all unless the dashboard is configured to, which is a
+setting this repository neither reads nor owns.
+
+Removing it turned up four more of the same kind, none of which needed an API
+call — they only needed reading the sentence as a promise instead of as prose:
+
+- **"This usually takes a few seconds."** True of a card and false of a
+  delayed-notification method, which settles in days. Which methods are offered
+  is a dashboard setting `payments/checkout.py` deliberately does not restrict,
+  so the page was making a claim about a configuration it had chosen not to
+  control.
+- **"You will be told the moment it lands."** There is no push of any kind. The
+  assistant answers when asked, through `check_order_status`.
+- **"If you were charged, the payment will be returned to your card."** Nobody
+  issues that refund. `paid -> cancelled` is not in the transition table, so a
+  cancelled order was never paid — and the replacement still does not claim the
+  opposite, because telling a charged shopper they were not charged is the one
+  answer this file already refuses to give.
+- **"You can pay for it whenever you like", and "say so in the conversation and
+  the items will be released."** The first is contradicted by this system's own
+  behaviour: a Checkout Session expires and `checkout.session.expired` cancels
+  the order and releases its stock. The second promised something the assistant
+  has no tool for — there are five commerce tools and none of them cancels an
+  order.
+
+The lesson is narrower than "check your copy". **Every one of these was written
+by somebody who knew the system, and each is a sentence about a part of it they
+were not looking at** — the dashboard, the transition table, the tool list, the
+expiry handler. Prose is the one artefact in this repository with no compiler
+and no test, so it is the place where a belief about a neighbouring module
+survives longest. The guard is now a word sweep over all ten renderings, and
+each of the seven promises was put back by mutation and fails it.
+
+**`pytest tests/` did not work on a fresh clone, and `python -m pytest tests/`
+did.** `test_the_handler_takes_no_body_parameter` imports `walk_api_routes` from
+`tests.test_api_auth` rather than keeping a second copy of the route walker,
+which needs the repository root on `sys.path` — and `python -m pytest` puts the
+working directory there while bare `pytest` does not. So the suite passed for
+whoever typed the first form and failed for whoever typed the second, which is
+the form the README gives. `pythonpath = ["."]` in `pyproject.toml` fixes it;
+both commands now return the same 1190 passed, 20 skipped, 23 deselected, and
+collection is unchanged at 1233 with no duplicated node ids.
+
+It is the same class of defect as D10's unpinned `langfuse`: **a repository that
+works on the machine it was written on.** Neither was visible to anybody who
+already had it working, and both were found by someone typing the documented
+command instead of the habitual one.
+
+## Refunds from the conversation — findings
+
+**The estimate was wrong in the direction estimates usually are: the chat layer
+was the cheap part.** "Let the customer ask for a refund" was scoped at half a
+day on the assumption that it was a tool plus a gate branch. It was — but the
+recommendation attached to it, that the customer could refund *any* of their
+orders, rested on a premise nobody had checked. `orders` has no `shopper_id`,
+`customer_email` is optional on `POST /orders` and the agent has never sent it,
+and there is no `GET /orders`. So every order the agent places is attributable
+to nobody, and "my orders" is not a query that can be written. The feature
+shipped is the one that was actually costed; the one that was recommended needs
+a migration on a real-data table and is written up as a gap.
+
+**Being irreversible is what earns a confirmation; spending is only the most
+obvious way to be irreversible.** D9 built the gate against a model that could
+be talked into spending money, and a refund moves money the other way — so on
+the gate's original wording it does not qualify. It is gated anyway, because
+`refunded` is terminal: nothing leaves it in the transition table and `paid ->
+paid` is refused, so a refund nobody asked for is one this system cannot undo.
+Restating the criterion was the useful part of the day, and it is the test a
+third gated tool should be held to.
+
+**Two callers of a shared sentence is where a template looks right and is
+wrong.** The obvious move on a second gated tool is to interpolate the tool
+name into the existing notes. "Nothing was ordered and nothing was charged" is
+true of a purchase nobody confirmed and **reverses** for a refund nobody
+confirmed, which leaves an order that is charged and still paid — the same
+sentence would have the model reassure a customer about money the shop is
+holding. Three mappings replaced one string each, and `follow_up_note` raises
+on a gated tool nobody wrote notes for rather than sending the checkout's
+wording somewhere it does not belong: the wrong note here reads perfectly well
+and would be found by a customer rather than by a test.
+
+**A single `not ok` check cannot tell "there is nothing" from "the shop is
+down", and one of those must not open the gate.** `check_order_status` refuses
+an absent order and a commerce API that is unreachable refuses everything, and
+both arrive as a failed `ToolResult`. Treating them alike made the gate stand
+aside on a *transport* failure, which would have let `request_refund` issue a
+real refund with nobody asked. The checkout branch has the same shape and
+survives it only because an empty cart makes `create_checkout` refuse anyway —
+an accident, not a design. The refund reads `memory.order_id` instead, which is
+the same field the tool itself checks.
+
+It was caught because a fixture was corrected, not because anyone reasoned
+about it: `EMPTY_ORDER` in the test harness was a plain dict, so it came back
+`ok=True`, which is the shape the assertion wanted rather than the shape
+`_refuse` really returns. Fixing the fixture failed the test and the test named
+the defect. **That is the D8 and D10 blind spot caught on the way in for once**,
+and it cost ten minutes instead of a release.
+
+**A 202 has to be answered in the shape of the result, not in a sentence about
+it.** `POST /orders/{id}/refund` accepts and the order stays `paid` until
+`charge.refunded` arrives. A result shaped like a finished action produces "your
+refund is complete" however the note is worded, so the key is
+`refund_requested`, `order_status` is included *because* it still reads `paid`,
+and `refund_status` — which Stripe fills with `succeeded` immediately for a
+card — is withheld. An HTTP client can hold two statuses called "succeeded" and
+"paid"; a model collapses them into one sentence and picks the wrong one.
+
+**The live run measured the one thing no offline test can: what the model says
+about a 202.** One conversation, $0.001844. The order went `pending -> paid` on
+a signed `checkout.session.completed`, "I want a refund" parked a question
+headed *Confirm this refund* showing the order's own €94.99 rather than the
+emptied cart's zero, and the answer produced:
+
+> Your full refund of €94.99 has been requested and is on its way. It is not
+> completed yet.
+
+Requested, not complete; the amount quoted from `amount_cents` and therefore
+past the amount guardrail. Then `charge.refunded` moved the order to `refunded`
+and released the reservation — visible afterwards in the cleanup, which reported
+"inventory 0 variant(s) put back", because there was nothing left to put back.
+
+**Streamlit refuses an empty dialog title, so the confirmation modal carries
+three headings for one fact.** "Confirm" from `st.dialog`, "Confirm this refund"
+below it, and the gate's own "About to refund this whole order:" below that.
+The generic one cannot be dropped — `StreamlitAPIException: A non-empty title
+argument has to be provided for dialogs`, measured with a throwaway app on port
+8502 rather than guessed — and it is fixed at decoration time, so it cannot say
+which question this is. Dropping the middle heading was the tidy answer and was
+rejected: it would leave the only per-tool signal inside a grey code block, and
+somebody clicking quickly could approve a refund thinking it was a purchase.
+Both are irreversible. **Repetition is the cheaper mistake, and this repository
+objecting to repetition everywhere else is exactly why the exception needed a
+reason written next to it.**
+
+**Review found the same reversal in the branch nobody reached, which is the
+third time this shape has cost something.** Adding `request_refund` to
+`CONFIRM_BEFORE` exposed `_unconfirmed`'s "nobody can be asked" branch to a
+second tool, and its sentence was still the checkout's: *"nothing was ordered
+and nothing was charged"* — over an order that is charged and still paid. Every
+*other* sentence had been split per tool for exactly this reason; this one was
+missed because no test reaches it for a refund and nothing about the code says
+it is shared. **A mapping written for the two paths anybody drives does not
+cover the third**, and the fix was to give that branch the same treatment the
+others already had.
+
+**Withholding a field is not the same as ignoring it.** `refund_status` is kept
+out of the tool result on purpose — a model holding "succeeded" and "paid"
+collapses them — and the first version did not read it either. Stripe can come
+back `failed` or `canceled` on that very call, and the success-shaped payload
+would have told the customer their money was on its way when it was not, with
+nothing to correct it: the order stays `paid`, so `check_order_status` says
+`paid` for ever. It now reads the status to decide the *shape* of the answer
+and still does not hand it over. That is the boundary this layer is for, and
+the first draft only did half of it.
+
+**"Pending" was two situations wearing one word.** The success page said "your
+payment is being confirmed, you do not need to pay again" for any `pending`
+order — but an order is `pending` from the moment it is placed, and that URL is
+one anybody can open. A shopper who reached the payment page and backed out
+lands there with an `unpaid` session and gets told they have paid. The page
+reads `payment_status` now, through `SETTLED_PAYMENT_STATUSES` imported from
+the webhook rather than respelled, because "did the money arrive" having two
+spellings is what this file argues against everywhere else. **The same
+carelessness the PR set out to remove, one branch deeper**: the copy sweep
+caught sentences that promised too much and missed one that assumed too much.
+
+**A guard whose justification is observability has to actually be observable.**
+`request_checkout` dispatches through `self._registry` rather than
+`self._setup.registry`, and there is an AST test whose stated reason is that
+the tracing and recording wrappers must see the call. They did — and then the
+follow-up turn cleared the activity log before anything read it, and no span
+was ever opened, so the click appeared in neither the panel nor Langfuse. The
+test passed the whole time. **A structural guard can be satisfied while the
+property it exists for is false**, which is the argument for the behavioural
+test that now sits beside it.
+
+One thing that came up with it and was deliberately not changed: the `view_cart`
+the gate reads to build a summary is invisible in the activity panel on *every*
+path, because `_describe` calls `super().dispatch` on the `GuardedRegistry`,
+which sits inside `RecordingRegistry` rather than outside it. Consistent and
+long-standing rather than a regression, and a question about the wrapper order
+rather than something to answer in a review fix.
+
+**Eighteen mutations, all caught, and the tool list tests earned their keep.**
+Adding one tool failed eight existing tests at once — every assertion that names
+the whole set, offline and against the real server. That is the D9 `ping` entry
+paying out: the tests exist so an unintended change to what the model can do
+fails rather than being noticed four days later.
+
 ## Known gaps
 
 Every entry carries the day it was written. **Open** entries are grouped by
@@ -2013,6 +2390,129 @@ out of the list.
 
 ---
 
+### Open — the browser UI
+
+**The customer and the model count different lists.** *(D11.)* Cards group
+variants by colour, so one row on the page can be three variants in the tool
+result. "The second one" therefore resolves against two different orderings,
+and both are legitimate: the model reads `search_products`' flat result, the
+customer reads rows. Measured — the same sentence gave the second *product* on
+one run and the second *variant of the first product* on another. No guardrail
+can catch it, because either answer is a variant the model was genuinely shown,
+so `seen_variant_ids` passes both. It is not the model variance D10 records; it
+is a second frame of reference the interface introduced. Closing it means
+numbering the cards or ungrouping them, which is a product decision and not a
+rendering one.
+
+**The browser's session layer is not the one the eval suite drives.** *(D11.)*
+`evals/runner.py` and `ui/session.py` both enter through `build_tool_setup` and
+both drive `run_tool_loop`, which is asserted structurally on each of them —
+but the runner drives the loop directly while the browser drives it through
+`BrowserSession`, whose state lives in `st.session_state`. So "the browser and
+the runner behave the same" is a claim about two code paths that meet below the
+session layer and not at it, and there is no test that can be written for the
+part above. The honest statement is that the *shop* is the same and the
+*driver* is not.
+
+**A conversation does not survive a restart, or a reload.** *(D11, narrowed in
+the follow-up.)* Everything one tab holds — the transcript, the
+`ConversationMemory` with its cart and order ids, the cost — is in
+`st.session_state`, which is per websocket session. A server restart, a hard
+refresh, or a customer returning by URL rather than by tab all produce an empty
+chat and an agent that cannot answer about an order it placed a minute earlier.
+The order is safe in Postgres; the *conversation's handle on it* is not.
+
+The follow-up did not fix this and could not: it is a fact about where the state
+lives. What it did was stop the shop being silent about it. The success page now
+says the conversation is waiting in the tab it came from and offers its link as
+the fallback, spelling out that following it starts a fresh conversation.
+Measured on the live run — the original tab held its full transcript and its
+$0.002060 while the link opened a second session at $0.000000 beside it. The
+round trip is still fine because the payment button opens a new tab, which is
+one path being lucky rather than the state being durable.
+
+**The basket panel is one HTTP request per rerun, and Streamlit reruns a lot.**
+*(D11 follow-up.)* `BrowserSession.cart()` reads `GET /cart/{id}` every time the
+page is drawn, which is every click, every keystroke that submits, and every
+dialog answer. It costs no model call and that was the requirement it was
+written against — but against a remote API rather than localhost it is a round
+trip a person waits for, and there is no caching because a cached basket is the
+stale panel the live read exists to prevent. The shape of the fix is an
+invalidation signal from the tools that change a cart, which is state the
+conversation would have to carry and does not.
+
+**A second entry point into the checkout is kept in step by two assertions
+about this one button.**
+*(D11 follow-up.)* The basket button dispatches `create_checkout` through the
+same `GuardedRegistry` the model reaches, so nothing the gate protects is
+bypassed. That argument holds only while `create_checkout` is a tool the gate
+stops, which is asserted — `ui.CHECKOUT_TOOL` must be in
+`guardrails.CONFIRM_BEFORE` — and while `request_checkout` dispatches on
+`self._registry`, which is asserted structurally. Both are real guards. What
+neither covers is a *third* caller added later that reaches the tool some other
+way: the guards are written about this one button, not about the class of them.
+
+**Nothing links an order to the shopper who placed it.** *(Refunds.)* `orders`
+has no `shopper_id`; `customer_email` is optional on `POST /orders` and the
+agent has never sent one, so every order the agent places is attributable to
+nobody. The shopper's address reaches `session.customer_details.email` on the
+Stripe side and stops there. The consequences are concrete: "show me my orders"
+cannot be written as a query, `request_refund` can only reach the order placed
+in the conversation it is having, and the profile in `agent/profile.py` is a
+name and some sizes with no purchase history behind it.
+
+Closing it is a chain and not a column: `migrations/0003_*.sql` on a real-data
+table, `place_order` learning who is buying (it takes a `cart_id` and nothing
+else, so `carts` or the request body has to carry it), a `GET /orders` that
+filters, and only then a tool. One thing to decide before any of it:
+`shopper_id` must stay tool-layer state like `cart_id` — the moment it is an
+argument the model sets, the agent is one prompt away from listing somebody
+else's orders.
+
+**A refund that fails after it is accepted tells nobody.** *(Refunds, PR #11.)*
+`request_refund` refuses a refund Stripe rejects on the call itself, but a
+refund accepted and then failing minutes later arrives as `refund.failed` or
+`charge.refund.updated`, and `api/services/events.py` handles neither. The
+order stays `paid`, `check_order_status` goes on saying `paid`, and the
+customer who was told "your refund is on its way" is never corrected. Closing
+it means a handler and a decision about what a failed refund does to an order
+that is still legitimately paid — which is a smaller version of the partial
+refund question below and probably wants answering with it.
+
+**A refund can be asked for and not taken back.** *(Refunds.)* `request_refund`
+is full-order only, because `stripe_svc.create_refund` takes no amount and
+`orders.status` has nothing between `paid` and `refunded`. A customer who wants
+one line back is told the shop cannot do it. Per-item refunds need a
+non-terminal status, a `refunded_quantity` column, a per-line stock release
+under the existing locks, an idempotency key that includes the lines — the
+current one is derived from the order id alone, so a second refund of a
+*different* line inside 24 hours would silently return the first refund object
+— and a `charge.refunded` handler that attributes an amount to lines Stripe's
+refund object does not carry.
+
+**There is no rate limit, only a spend cap.** *(D11.)* `UI_SPEND_CAP_USD` stops
+one browser session at $0.50 and is checked at the door of a turn, so the real
+ceiling is the cap plus one turn. Nothing stops *many* sessions: a new tab is a
+new cap, and there is no per-IP or per-process limit anywhere. Adequate for a
+demo on one machine and not for anything reachable.
+
+**`ui/app.py` has no tests that run it.** *(D11.)* Everything it renders is
+decided in `ui/session.py`, `ui/cards.py` and `ui/colors.py`, all of which are
+covered — and the page itself is exercised only by hand, with screenshots as the
+record. What *is* asserted is asserted by parsing the file: that it formats no
+money and performs no division, that `ui/session.py` beneath it never imports
+Streamlit, and — added in the D11 follow-up — that the basket panel returns
+before its button on an empty or unreadable basket, that the button is disabled
+while a confirmation or the cap stands, and that the panel holds no control but
+the checkout. Those are real guards and every one of them was falsified by
+mutation, but they read structure rather than behaviour: they would all pass over
+a page that crashed on the first render.
+
+**The spend cap is per session and the cost meter is per process.** *(D11.)*
+`UsageTracker` is built per `BrowserSession`, so two tabs each get their own
+$0.50 and the process total is nowhere. A dashboard reading "what has this
+deployment spent today" has nothing to read.
+
 ### Open — deployment and operations
 
 **There is no readiness endpoint.** *(D6.)* `/health` deliberately does not touch
@@ -2097,12 +2597,41 @@ write, so its safety rests on verification running before anything else rather
 than on being read-only. `PUBLIC_PATHS` in `tests/test_api_auth.py` records all
 three, and the sweep fails on a fourth nobody decided on.
 
-The success page also deliberately does not mark the order paid, and says so on
-the page: a redirect is a URL anybody can open.
+The success page also deliberately does not mark the order paid: a redirect is a
+URL anybody can open. It used to *say* that on the page, in the project's own
+words, and the D11 follow-up removed the sentence rather than the rule. It now
+reads the order's real status and reports it — which is a `SELECT` beside the
+place a write would go, and is asserted from three statuses rather than argued
+for in prose.
 
 ---
 
 ### Closed
+
+**A browser conversation was several unrelated traces.** *(D11 step 1 → closed
+on D11 step 4.)* The original entry read: "The CLI opens one conversation span
+for its whole REPL and closes it on the way out; the browser cannot. A Streamlit
+rerun runs on a fresh thread and an OTEL span is put in the current context by a
+`contextvar`, so a span entered on one rerun's thread cannot be closed on
+another's. One span per turn is entered and closed on the same thread, always —
+and the cost is that D10's Definition of done, *a trace shows the whole
+conversation*, is not met on the browser path."
+
+The premise held and the conclusion did not. Per-turn roots are still the only
+shape that closes where it opens; what was missing was that Langfuse groups
+traces natively. `propagate_attributes` takes `session_id`, `Tracer.conversation`
+now takes one too — optional, defaulting to `None`, so the CLI path D1 through
+D10 use is byte-for-byte unaffected — and `BrowserSession` passes a `uuid4` per
+tab. N traces, one session view.
+
+Two details are worth keeping. The id is deliberately *not* redacted: it is a
+value this process invents, carrying nothing anybody wrote and identifying
+nobody, where `shopper_id` identifies a person and leaves as a digest — two
+parameters rather than one for exactly that reason. And the test asserts it on
+the exported span rather than on what the caller passed, because the first
+version checked the caller and a mutation deleting the argument in between
+survived it.
+
 
 **`190 euros`, written as a word, was not caught.** *(D9 → closed on D9, found
 stale on D10.)* The original entry read: "The amount validation matches a number

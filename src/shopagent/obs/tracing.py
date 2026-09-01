@@ -114,7 +114,9 @@ class Tracer:
     # --- the three shapes of observation ---------------------------------
 
     @contextmanager
-    def conversation(self, *, shopper_id: str | None, model: str) -> Iterator[Observation]:
+    def conversation(
+        self, *, shopper_id: str | None, model: str, session_id: str | None = None
+    ) -> Iterator[Observation]:
         """The root observation. Everything else nests inside it.
 
         `start_as_current_observation` rather than `start_observation`, and the
@@ -128,6 +130,20 @@ class Tracer:
         in the UI says who they are. It is set through `propagate_attributes`,
         which puts it on every child span, so a span added later cannot forget
         it.
+
+        `session_id` groups several of these roots into one conversation, and
+        it arrived on D11 for one caller. The CLI holds a single root open for
+        its whole REPL, so its conversation *is* one trace and it passes
+        nothing here. A browser cannot: Streamlit reruns each interaction on a
+        fresh thread, and an OTEL span lives in a `contextvar`, so a root
+        entered on one rerun's thread cannot be closed on another's. One root
+        per turn is the only shape that closes on the thread that opened it —
+        and `session_id` is what puts those roots back together in Langfuse.
+
+        It is not redacted, and that is the one judgement in it: it is a
+        `uuid4` this process invents per browser tab, carrying nothing a person
+        wrote and identifying nobody. `shopper_id` is the opposite and is
+        digested, which is why the two are separate parameters rather than one.
         """
         if not self.enabled:
             yield Observation(self)
@@ -147,6 +163,7 @@ class Tracer:
                 _propagate(
                     user_id=redaction.redact_identifier(shopper_id),
                     trace_name=CONVERSATION,
+                    session_id=session_id,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - see the module docstring
@@ -224,6 +241,22 @@ class Tracer:
             self._guard(span.end, "end a guardrail observation")
 
     # --- housekeeping ----------------------------------------------------
+
+    def trace_url(self) -> str | None:
+        """A link to the trace being written right now, if there is one.
+
+        A method here rather than `tracer._client.get_current_trace_id()` at
+        the call site — which is what `evals/runner.py` does and is a reach
+        into a private attribute this class exists to own. Guarded like every
+        other SDK call: an observability vendor that cannot produce a URL is
+        not a reason for a page to fail to render.
+
+        `None` whenever tracing is off, which is an ordinary state and the one
+        a caller has to handle anyway.
+        """
+        if not self.enabled:
+            return None
+        return self._guard(self._client.get_trace_url, "build a trace URL")
 
     def flush(self) -> None:
         """Send whatever is queued. Called after every turn.

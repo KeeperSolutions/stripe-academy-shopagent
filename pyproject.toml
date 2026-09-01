@@ -36,3 +36,16 @@ markers = [
     "stripe: calls the Stripe API in test mode (needs STRIPE_SECRET_KEY)",
 ]
 addopts = "-m 'not network and not stripe'"
+# The repository root on `sys.path`, so `tests` is importable as a package.
+# One test needs that — `test_the_handler_takes_no_body_parameter` imports
+# `walk_api_routes` from `tests.test_api_auth` rather than keeping a second
+# copy of the route walker — and without this line it fails with
+# `ModuleNotFoundError: No module named 'tests'`.
+#
+# The defect it fixes is not that test's: `python -m pytest` puts the working
+# directory on `sys.path` and bare `pytest` does not, so the suite passed for
+# whoever happened to type the first form and failed for whoever typed the
+# second — which is the command the README gives. A repository that works on
+# one machine and not another, the same class as the unpinned `langfuse`
+# D10 recorded, and invisible until somebody else clones it.
+pythonpath = ["."]

@@ -137,6 +137,20 @@ class Settings(BaseSettings):
     # explicitly the moment the success page stops living on this host.
     checkout_success_url: OptionalStr = None
     checkout_cancel_url: OptionalStr = None
+    # Where the *browser interface* lives, so the page Stripe redirects to can
+    # offer a way back to it. A third URL rather than a reuse of either of the
+    # two above, because it names a third thing: `app_base_url` is where a
+    # browser reaches the commerce API, `commerce_api_base_url` is where the
+    # agent process reaches it, and this is the Streamlit process — a separate
+    # server on a separate port, which can move without either of them moving.
+    #
+    # The link it produces is a fallback and is described on the page as one.
+    # The payment button opens Stripe in a new tab, so the conversation is
+    # almost always still sitting in the tab behind; following this link starts
+    # a *new* browser session with an empty transcript, which is the wrong
+    # thing to do to somebody who still has theirs. See
+    # `routers/checkout_pages.py`.
+    ui_base_url: str = "http://localhost:8501"
     # Required, with no default, for the same reason `openai_api_key` is: it is
     # the API's only authentication secret. A default here would be a published
     # one — every deployment that forgot the variable would be protected by a
@@ -189,6 +203,24 @@ class Settings(BaseSettings):
     # ability to read a trace as a conversation; what it keeps is every
     # question the trace exists to answer. See `obs/redaction.py`.
     trace_redact_text: bool = True
+
+    # --- The browser UI (D11) ---
+    # What one browser session may spend on model calls before the shop stops
+    # answering it. A cap rather than a warning, and a *session* cap rather
+    # than a per-turn one: the failure it is set against is not one expensive
+    # question, it is a browser — a person clicking Send is orders of magnitude
+    # faster than a person typing into a terminal, and nothing else in this
+    # system stops them. D10 measured a whole ten-scenario eval pass at
+    # $0.0117, so $0.50 is roughly forty such passes: far past any honest
+    # demonstration and far short of a bill worth noticing.
+    #
+    # Enforced at the door of a turn, never inside one — `run_tool_loop` is
+    # not opened for this. So a turn that begins under the cap runs to its end
+    # and may cross it, and the overshoot is bounded by what one turn can
+    # spend: MAX_TOOL_ITERATIONS model calls, measured at $0.0005-$0.002 each.
+    # A cap enforced mid-turn would have to abandon a message list holding
+    # tool calls with no answers, which is a 400 on every later request.
+    ui_spend_cap_usd: float = Field(default=0.50, gt=0)
 
     # --- Stripe (D7-D8) ---
     # Optional, and deliberately not treated the way `shopagent_api_key` is.
