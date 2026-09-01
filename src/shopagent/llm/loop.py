@@ -168,6 +168,14 @@ class ToolSetup:
     # result. Exposed here because the CLI and the tests are the only things
     # that can see it — nothing is put in front of the model.
     memory: ConversationMemory | None = None
+    # The commerce client this session's tools were built over, exposed for the
+    # same reason `memory` is and with the same limit: nothing here is put in
+    # front of the model. D11's browser reads the cart through it to draw a
+    # panel beside the conversation, which has to be the *same* client and the
+    # same `memory.cart_id` the tools use — a second client would be a second
+    # connection pool, and a second cart id would be a panel describing a
+    # basket the agent cannot see.
+    api: Any = None
     # Who answers a parked confirmation. Held here rather than inside the
     # registry because the registry no longer asks anybody (D10, step 1): the
     # gate parks a question and whatever is presenting the conversation puts it
@@ -228,7 +236,8 @@ def build_tool_setup(
     # answered by the tool itself, in words written for the model. The stack
     # owns the client for the same reason it owns the MCP subprocess — whatever
     # ends the session closes the sockets.
-    register_commerce_tools(registry, stack.enter_context(api_factory()), memory)
+    api = stack.enter_context(api_factory())
+    register_commerce_tools(registry, api, memory)
 
     if catalog_enabled is None:
         catalog_enabled = get_settings().mcp_catalog_enabled
@@ -238,6 +247,7 @@ def build_tool_setup(
             registry=registry,
             catalog_available=False,
             memory=memory,
+            api=api,
             confirm=confirm,
             note="catalog disabled (MCP_CATALOG_ENABLED=false)",
         )
@@ -254,12 +264,17 @@ def build_tool_setup(
             registry=registry,
             catalog_available=False,
             memory=memory,
+            api=api,
             confirm=confirm,
             note=f"catalog unavailable ({type(exc).__name__}: {exc})",
         )
 
     return ToolSetup(
-        registry=registry, catalog_available=True, memory=memory, confirm=confirm
+        registry=registry,
+        catalog_available=True,
+        memory=memory,
+        api=api,
+        confirm=confirm,
     )
 
 

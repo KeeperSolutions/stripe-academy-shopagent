@@ -17,7 +17,10 @@ from pathlib import Path
 import pytest
 
 from shopagent.agent.activity import ActivityLog, RecordingRegistry, ToolCallRecord
+from shopagent.config import get_settings
+from shopagent.money import format_amount
 from shopagent.obs.tracing import Tracer
+from shopagent.tools.http import CommerceAPIUnreachable
 from shopagent.tools.registry import ToolRegistry, ToolResult, ToolSpec
 from shopagent.ui import session as ui
 
@@ -1500,3 +1503,444 @@ def test_a_traced_turn_carries_the_link_the_tracer_gave_it(offline):
     assert session.send("hi").messages[1].trace_url == (
         "https://cloud.langfuse.com/trace/abc123"
     )
+
+
+# --- the basket beside the conversation (D11 follow-up) ------------------
+
+
+def _a_filled_basket() -> list[FakeReply]:
+    """Two turns: search, then add one Summit Peak Pro. No checkout."""
+    return [
+        _tool("search_products", {"query": "trail shoes"}),
+        FakeReply(content="Here is the Summit Peak Pro."),
+        _tool("add_to_cart", {"variant_id": FakeCommerceBackend.VARIANT_ID, "quantity": 2}),
+        FakeReply(content="Added two."),
+    ]
+
+
+def _fill(session) -> None:
+    session.send("find me trail shoes")
+    session.send("add two Summit Peak Pro")
+
+
+def test_the_basket_panel_reads_the_shop_rather_than_the_transcript(shopping):
+    """The defect a panel rendered from the last message would have.
+
+    A `ChatMessage` holds what was true when it was written. The basket changes
+    after that — here by a route the conversation never saw, which is the point:
+    another client holding the API key can change a cart, and the gate binds the
+    model rather than the shop. A panel reading the transcript would go on
+    showing two units for the rest of the afternoon.
+    """
+    session = shopping(replies=_a_filled_basket())
+    _fill(session)
+
+    assert session.cart().unit_count == 2
+
+    # Changed behind the conversation's back, exactly as another client would.
+    session.backend.quantity = 5
+
+    panel = session.cart()
+    assert panel.unit_count == 5
+    assert panel.lines[0].quantity == 5
+
+
+def test_reading_the_basket_asks_the_commerce_api(shopping):
+    session = shopping(replies=_a_filled_basket())
+    _fill(session)
+    before = len(session.backend.requests)
+
+    session.cart()
+
+    made = session.backend.requests[before:]
+    assert made == [("GET", f"/cart/{FakeCommerceBackend.CART_ID}")]
+
+
+def test_reading_the_basket_costs_no_model_call(shopping):
+    """Streamlit re-runs this script on every click.
+
+    A panel that asked the model what was in the basket would bill a shopper
+    for scrolling, and the cap would stop a conversation nobody had had.
+    """
+    session = shopping(replies=_a_filled_basket())
+    _fill(session)
+    calls_before = len(session.fake_client.seen)
+    cost_before = session.session_cost_usd
+
+    for _ in range(20):
+        session.cart()
+
+    assert len(session.fake_client.seen) == calls_before
+    assert session.session_cost_usd == cost_before
+
+
+def test_the_basket_panel_uses_the_carts_own_id_and_never_makes_one(shopping):
+    """The model has never seen a cart id and the panel does not invent one."""
+    session = shopping(replies=_a_filled_basket())
+    _fill(session)
+
+    session.cart()
+
+    # A `POST /cart` from the panel would be a second basket beside the one the
+    # conversation filled, drawn empty next to a conversation that is not.
+    assert session.backend.requests.count(("POST", "/cart")) == 1
+
+
+def test_an_untouched_conversation_has_an_empty_basket(shopping):
+    session = shopping(replies=[FakeReply(content="hello")])
+    session.send("hi")
+
+    panel = session.cart()
+
+    assert panel.empty
+    assert panel.lines == ()
+    assert panel.unit_count == 0
+    assert panel.error is None
+    # No cart exists yet, so nothing was asked of the shop either.
+    assert session.backend.requests == []
+
+
+def test_a_basket_that_cannot_be_read_says_so_instead_of_raising(shopping):
+    """The page has to survive the shop being down; the conversation still works."""
+    session = shopping(replies=_a_filled_basket())
+    _fill(session)
+
+    def refuse(method, path, json=None):
+        raise CommerceAPIUnreachable("the shop is not answering")
+
+    session.backend.request = refuse
+
+    panel = session.cart()
+
+    assert panel.error == ui.CART_UNREADABLE
+    assert panel.empty
+
+
+def test_every_amount_in_the_panel_arrives_already_formatted(shopping):
+    """`ui/app.py` formats no money, so this is where the figures are made."""
+    session = shopping(replies=_a_filled_basket(), unit_cents=14999)
+    _fill(session)
+
+    panel = session.cart()
+
+    money = format_amount(14999, get_settings().currency)
+    assert panel.lines[0].unit_price == money
+    assert panel.total == format_amount(29998, get_settings().currency)
+    # The integer itself must not reach a renderer: `29998` reads as thirty
+    # thousand to whoever is about to pay three hundred.
+    assert "29998" not in panel.total
+
+
+def test_the_panel_takes_the_total_the_server_computed(shopping):
+    """Never a sum over the lines, which would be a second opinion.
+
+    D6 recomputes a cart total from the database on every read precisely so
+    that nothing downstream has to. The fake is made to disagree with its own
+    lines, and the panel has to report the server.
+    """
+    session = shopping(replies=_a_filled_basket())
+    _fill(session)
+    real = session.backend.request
+
+    def disagreeing(method, path, json=None):
+        body = real(method, path, json)
+        if method == "GET" and path.startswith("/cart/"):
+            body = {**body, "total_cents": 111}
+        return body
+
+    session.backend.request = disagreeing
+
+    assert session.cart().total == format_amount(111, get_settings().currency)
+
+
+# --- the button, and what it does not go around --------------------------
+
+
+def test_the_button_asks_for_a_tool_the_gate_actually_gates():
+    """The whole argument, in one assertion.
+
+    The button is defensible only because `create_checkout` is a tool the gate
+    stops. The day that name falls out of `CONFIRM_BEFORE` — renamed, split,
+    or the gate narrowed — the button silently stops being a request for
+    confirmation and becomes a second way to buy something, with no test
+    failing anywhere near it.
+    """
+    from shopagent.agent.guardrails import CONFIRM_BEFORE
+
+    assert ui.CHECKOUT_TOOL in CONFIRM_BEFORE
+
+
+def test_the_button_dispatches_through_the_registry_the_model_uses():
+    """Structural, because the behavioural version cannot see the difference.
+
+    `self._setup.registry` is the `GuardedRegistry` itself and would pass every
+    test below: the gate still parks, the summary still comes from the cart.
+    What it skips is the tracing and the recording wrapped around it, so a
+    checkout started from the button would be missing from the trace and from
+    the activity panel — invisible in exactly the surface built to make tool
+    calls visible. `self._registry` is the one the model's loop is handed.
+    """
+    function = next(
+        node
+        for node in ast.walk(SESSION_TREE)
+        if isinstance(node, ast.FunctionDef) and node.name == "request_checkout"
+    )
+    dispatches = calls_in(function, "dispatch")
+
+    assert len(dispatches) == 1
+    (call,) = dispatches
+    assert ast.unparse(call.func) == "self._registry.dispatch"
+
+
+def test_the_button_asks_the_gate_and_buys_nothing(shopping):
+    """The falsification target: a button that placed the order itself.
+
+    An implementation that called `POST /orders` — or the tool function behind
+    the registry — would leave `backend.ordered` true with no question in front
+    of anybody, which is the whole of what this must never do.
+    """
+    session = shopping(replies=_a_filled_basket())
+    _fill(session)
+
+    result = session.request_checkout()
+
+    assert result.pending is not None
+    assert result.pending.tool == "create_checkout"
+    assert session.backend.ordered is False
+    assert ("POST", "/orders") not in session.backend.requests
+
+
+def test_the_button_costs_no_model_call_to_ask(shopping):
+    """The question is the gate's, built from the cart. Nothing is generated."""
+    session = shopping(replies=_a_filled_basket())
+    _fill(session)
+    before = len(session.fake_client.seen)
+
+    session.request_checkout()
+
+    assert len(session.fake_client.seen) == before
+
+
+def test_the_total_the_button_puts_up_for_approval_comes_from_the_cart(shopping):
+    """The property D9 paid for and D10 kept, now reached by a second caller.
+
+    A person approving a figure the model invented is worse than no gate at
+    all. The button changes who asks for the checkout and nothing about where
+    the number comes from — so the cart is read again here, at the moment of
+    asking, and the summary is the gate's own rendering of what came back.
+    """
+    session = shopping(replies=_a_filled_basket(), unit_cents=14999)
+    _fill(session)
+    before = len(session.backend.requests)
+
+    result = session.request_checkout()
+
+    assert ("GET", f"/cart/{FakeCommerceBackend.CART_ID}") in session.backend.requests[before:]
+    assert format_amount(29998, get_settings().currency) in result.pending.summary
+    assert "Summit Peak Pro" in result.pending.summary
+
+
+def test_confirming_a_button_checkout_places_the_order_and_shows_the_link(shopping):
+    """The whole path, ending where the model's own path ends."""
+    session = shopping(
+        replies=_a_filled_basket()
+        + [
+            # The follow-up turn the answer drives. The model calls the tool
+            # again and the gate spends the approval — which is the protocol,
+            # not a shortcut the button took.
+            _tool("create_checkout", {}),
+            FakeReply(content="Your order is placed — the payment link is below."),
+        ]
+    )
+    _fill(session)
+    session.request_checkout()
+
+    result = session.answer_confirmation(True)
+
+    assert session.backend.ordered is True
+    assert session.pending is None
+    assert result.messages[-1].payment_url == FakeCommerceBackend.CHECKOUT_URL
+
+
+def test_declining_a_button_checkout_orders_nothing(shopping):
+    session = shopping(
+        replies=_a_filled_basket() + [FakeReply(content="Nothing was ordered.")]
+    )
+    _fill(session)
+    session.request_checkout()
+
+    result = session.answer_confirmation(False)
+
+    assert session.backend.ordered is False
+    assert session.pending is None
+    assert "Nothing was ordered." in result.messages[-1].text
+
+
+def test_the_payment_link_a_button_checkout_produces_never_reaches_the_model(shopping):
+    """The URL is the shop's to print, on this path as on the other one."""
+    session = shopping(
+        replies=_a_filled_basket()
+        + [_tool("create_checkout", {}), FakeReply(content="Placed.")]
+    )
+    _fill(session)
+    session.request_checkout()
+    session.answer_confirmation(True)
+
+    everything = json.dumps(session._messages)
+    assert FakeCommerceBackend.CHECKOUT_URL not in everything
+    assert "checkout.stripe.com" not in everything
+
+
+def test_a_click_while_a_question_is_open_changes_nothing(shopping):
+    """The page disables the button; this does not depend on the page doing it.
+
+    A second click must not park a second question over the first, and must not
+    reach `begin_turn(from_customer=True)` — which would drop the approval the
+    customer is looking at and leave the modal describing nothing.
+    """
+    session = shopping(replies=_a_filled_basket())
+    _fill(session)
+    first = session.request_checkout().pending
+    before = list(session.backend.requests)
+
+    again = session.request_checkout()
+
+    assert again.pending == first
+    assert session.backend.requests == before
+
+
+def test_a_click_past_the_spend_cap_changes_nothing(shopping):
+    """The follow-up turn an answer drives is a model call.
+
+    The door that refuses a typed message has to refuse a click, or the cap
+    would be reachable around it in one press.
+    """
+    # Filled first, then the cap is lowered onto a session that already has a
+    # basket. Building it with a cap of nothing instead meant `send` refused
+    # the turn that fills the cart, so the click met an empty basket and was
+    # refused for that reason — the guard could be mutated away and the test
+    # still passed, which is how this was found rather than reasoned about.
+    session = shopping(replies=_a_filled_basket())
+    _fill(session)
+    session._cap_usd = 0.0
+    assert session.cap_reached
+    assert session.cart().unit_count == 2
+    before = list(session.backend.requests)
+
+    result = session.request_checkout()
+
+    assert result.pending is None
+    assert session.backend.requests == before
+    assert session.backend.ordered is False
+
+
+def test_a_click_on_an_empty_basket_orders_nothing_and_says_so(shopping):
+    """The page disables the button here too; the turn logic still has to hold.
+
+    Nothing to confirm means the gate lets `create_checkout` through, and the
+    tool refuses an empty cart in its own words. What a person sees is a notice
+    rather than the tool's sentence, which was written for the model.
+    """
+    session = shopping(replies=[FakeReply(content="hello")])
+    session.send("hi")
+
+    result = session.request_checkout()
+
+    assert result.pending is None
+    assert session.backend.ordered is False
+    assert result.messages[-1].notice == ui.CHECKOUT_NOT_STARTED
+
+
+def test_a_button_checkout_appears_in_the_activity_of_the_turn_that_settles_it(shopping):
+    """The click is not a silent path through the shop.
+
+    `RecordingRegistry` sits outermost, so the `create_checkout` the follow-up
+    turn makes is recorded like any other — which is what makes the panel a
+    record of what happened rather than of what the model decided.
+    """
+    session = shopping(
+        replies=_a_filled_basket()
+        + [_tool("create_checkout", {}), FakeReply(content="Placed.")]
+    )
+    _fill(session)
+    session.request_checkout()
+
+    result = session.answer_confirmation(True)
+
+    names = [call.name for call in result.messages[-1].activity]
+    assert "create_checkout" in names
+
+
+# --- what the page does with the panel -----------------------------------
+
+
+def _draw_cart_source() -> ast.FunctionDef:
+    app = ast.parse((SESSION_PATH.parent / "app.py").read_text())
+    return next(
+        node
+        for node in ast.walk(app)
+        if isinstance(node, ast.FunctionDef) and node.name == "_draw_cart"
+    )
+
+
+def test_the_page_offers_no_button_over_a_basket_it_could_not_read():
+    """An empty basket and an unreadable one both leave before the button.
+
+    A checkout button over a basket nobody could read is a button whose total
+    is unknown, and one over an empty basket is a press that can only produce a
+    refusal. Read structurally because the alternative is importing `app.py`,
+    which runs the whole page at module scope.
+    """
+    function = _draw_cart_source()
+    button = next(
+        call for call in calls_in(function, "button")
+        if ast.unparse(call.func).endswith("st.button")
+    )
+
+    guarded = {
+        ast.unparse(node.test)
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and node.lineno < button.lineno
+        and any(isinstance(inner, ast.Return) for inner in node.body)
+    }
+    assert "panel.error" in guarded
+    assert "panel.empty" in guarded
+
+
+def test_the_page_disables_the_button_while_a_question_or_the_cap_stands():
+    function = _draw_cart_source()
+    button = next(
+        call for call in calls_in(function, "button")
+        if ast.unparse(call.func).endswith("st.button")
+    )
+
+    disabled = next(
+        keyword for keyword in button.keywords if keyword.arg == "disabled"
+    )
+    guard = next(
+        ast.unparse(node.value)
+        for node in ast.walk(function)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == ast.unparse(disabled.value)
+            for target in node.targets
+        )
+    )
+    assert "pending is not None" in guard
+    assert "cap_reached" in guard
+
+
+def test_the_page_offers_no_way_to_take_a_line_out_of_the_basket():
+    """Changing a basket is something you ask for.
+
+    A remove control in the panel would be the second shopping interface the
+    whole layout argues against — the same reason a product card has no Add
+    button. The one control is the checkout, and it is named.
+    """
+    function = _draw_cart_source()
+    labels = {
+        ast.unparse(call.args[0]) if call.args else ""
+        for call in calls_in(function, "button")
+    }
+    assert labels == {"CHECKOUT_LABEL"}

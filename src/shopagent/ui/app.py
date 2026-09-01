@@ -22,6 +22,16 @@ produced them, and **a card is not clickable**: nothing enters a basket except
 by asking. A card with an "Add" button would be a second way to shop, and the
 whole layout is the claim that there is only one.
 
+**The one control that is not a message is the basket's Checkout button.** It
+adds no route to payment: it dispatches `create_checkout` through the same
+`GuardedRegistry` the model reaches, so the gate parks the same question built
+from the same `view_cart` read, and a person still approves the same summary.
+What it skips is the model's decision to call the tool, which the customer has
+just made by clicking. `BrowserSession.request_checkout` holds the argument in
+full, including the two implementations that were refused. Nothing else in the
+panel is a control — no line can be removed there, because changing a basket is
+something you ask for.
+
 **The page is centred, and that is `st.chat_input`'s doing.** Streamlit pins a
 `chat_input` called from an app's main body to the bottom of the page, and
 renders it inline — scrolling away with the content — as soon as it is nested
@@ -30,11 +40,19 @@ in a container or a column. So the readable column is not built out of
 itself to the bottom of. Fighting that with columns would have traded a pinned
 input for a centred one.
 
-**The confirmation gate is not wired up here.** `create_checkout` parks a
-question on the conversation's memory and this page shows that it is waiting,
-deliberately without answering it — that is step 3. Nothing is ordered and
-nothing is charged in the meantime, which is the safe half of the D10 protocol:
-an unanswered approval is never spendable.
+**The confirmation gate is answered here and implemented nowhere here.** When
+`create_checkout` meets the gate, the question is parked on the conversation's
+memory; this page reads it, puts it in a modal, and hands the answer back
+through `BrowserSession.answer_confirmation` — which is `resolve_pending` plus
+one follow-up turn, the same two calls the CLI and the eval runner make. The
+summary in that modal is printed verbatim and is never rebuilt here. Until
+somebody answers, nothing is ordered and nothing is charged, which is the safe
+half of the D10 protocol: an unanswered approval is never spendable.
+
+(The paragraph this replaces said the gate was "not wired up here, that is step
+3". It was written on step 2 and step 3 wired it up without coming back for
+it — a docstring describing the file as it was two commits ago, which is the
+kind of drift this project spends its comments arguing against.)
 """
 
 from __future__ import annotations
@@ -74,6 +92,16 @@ WAITING_FOR_YOU = (
 # press, because the two buttons already say that and the summary underneath is
 # the part worth reading.
 CONFIRM_TITLE = "Confirm this purchase"
+
+# The panel beside the conversation. A basket, and one button.
+CART_TITLE = "Your basket"
+CART_EMPTY = "Nothing in it yet. Ask for something and it will appear here."
+# Said under the button rather than beside every line, because it is one rule
+# about the whole panel: this is a view, and the only way to change what is in
+# it is to ask. There is no remove control for the same reason there is no Add
+# button on a card — see `_draw_cart`.
+CART_READ_ONLY = "Ask the assistant to change or remove anything."
+CHECKOUT_LABEL = "Checkout"
 
 
 # --- what this process holds, and what this tab holds --------------------
@@ -131,6 +159,21 @@ def _swatch(color: str | None) -> str:
     )
 
 
+def _amount(text: str) -> str:
+    """An already-formatted amount, made safe to put in markdown.
+
+    Streamlit renders markdown, and a pair of unescaped dollars around a number
+    is inline LaTeX to it — the header caption lost its spend cap into a maths
+    block on D11 for exactly this, and it was found by looking at the page
+    rather than by a test. Every amount on this page arrives formatted by
+    `money.format_amount`, and in a shop priced in dollars that string starts
+    with the character that opens the block.
+
+    This escapes and computes nothing. The figure is whatever came in.
+    """
+    return html.escape(text).replace("$", "\\$")
+
+
 def _group_line(group: layout.VariantGroup) -> str:
     """One colour of one product at one price, with all of its sizes.
 
@@ -142,7 +185,7 @@ def _group_line(group: layout.VariantGroup) -> str:
     """
     parts = [html.escape(part) for part in (group.color, group.label) if part]
     head = " · ".join(parts)
-    price = html.escape(group.price)
+    price = _amount(group.price)
 
     if group.all_sold_out:
         # Nothing left in this colour. Said in words, because a row that was
@@ -313,6 +356,73 @@ def _ask_to_confirm(session: turns.BrowserSession, summary: str) -> None:
         st.rerun(scope="app")
 
 
+def _draw_cart(session: turns.BrowserSession, pending: turns.PendingApproval | None) -> bool:
+    """The basket, in the sidebar. Returns True if the customer asked to check out.
+
+    **Why the sidebar.** The criterion was that it must not break the
+    conversation and must be visible without scrolling, and the main column can
+    only satisfy one of those at a time: drawn above the transcript it pushes
+    the conversation down the page, and drawn below it, it sits at the end of a
+    thread that grows all afternoon. The sidebar is neither — it keeps its own
+    scroll, stays put while the conversation moves, and Streamlit collapses it
+    on a narrow screen. It also leaves `st.chat_input` alone, which matters
+    more here than it looks: that input pins itself to the bottom of the page
+    only while it is called from the main body, and a panel that had to be
+    nested in a container to sit above it would have unpinned it.
+
+    **Nothing here removes anything.** There is no per-line control, for the
+    same reason a product card has no Add button: changing what is in a basket
+    is something the customer asks for, and a panel that could take a line out
+    would be the second shopping interface this page exists to argue against.
+    The one button is a checkout, and what that button does — and does not
+    bypass — is `BrowserSession.request_checkout`.
+    """
+    panel = session.cart()
+    asked = False
+
+    with st.sidebar:
+        st.subheader(CART_TITLE, anchor=False)
+
+        if panel.error:
+            st.warning(panel.error)
+            return False
+
+        if panel.empty:
+            st.caption(CART_EMPTY)
+            return False
+
+        for line in panel.lines:
+            name = html.escape(line.product_name)
+            label = html.escape(line.variant_label)
+            st.markdown(f"**{name}**")
+            st.caption(
+                f"{label} · {line.quantity} × {_amount(line.unit_price)} "
+                f"= {_amount(line.line_total)}"
+            )
+
+        st.divider()
+        st.markdown(f"**Total** · {_amount(panel.total)}")
+        st.caption(f"{panel.unit_count} item(s)")
+
+        # Disabled for two states that are one sentence apart and not the same
+        # thing. A question already open: answering it is the way forward, and
+        # a second click would drop the approval the customer is looking at.
+        # The cap reached: the follow-up turn an answer drives is a model call,
+        # and the door that refuses a message has to refuse a click too.
+        blocked = pending is not None or session.cap_reached
+        if st.button(
+            CHECKOUT_LABEL,
+            type="primary",
+            use_container_width=True,
+            disabled=blocked,
+            key="cart-checkout",
+        ):
+            asked = True
+        st.caption(CART_READ_ONLY)
+
+    return asked
+
+
 def _draw_openers(session: turns.BrowserSession) -> str | None:
     """The empty screen. Returns a line the customer picked, if they picked one."""
     st.caption("Ask for anything in the shop — searching, sizes, a basket, an order.")
@@ -343,10 +453,22 @@ st.caption(
 for note in session.notes:
     st.caption(f"[{note}]")
 
+pending = session.pending
+
+# Drawn before the transcript so the click is handled on the run that produced
+# it. Streamlit places it in the sidebar wherever it is called from, so this
+# says nothing about where it appears — only about when it is read.
+wants_checkout = _draw_cart(session, pending)
+if wants_checkout:
+    with st.spinner("Reading your basket…"):
+        session.request_checkout()
+    # Straight back to the top of the script, where `session.pending` is read
+    # again and the dialog is opened over a page already in its new state.
+    st.rerun()
+
 for message in session.transcript:
     _draw_message(message)
 
-pending = session.pending
 if pending is not None:
     # Behind the modal, so the page still says what state it is in — and it is
     # deliberately the sentence without the summary. The summary belongs to the

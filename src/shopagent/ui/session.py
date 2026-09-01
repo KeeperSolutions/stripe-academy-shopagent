@@ -90,10 +90,20 @@ from shopagent.mcp_client.client import MCPToolClient
 from shopagent.money import format_amount
 from shopagent.obs.instrumentation import TracedClient, TracedRegistry
 from shopagent.obs.tracing import Tracer, build_tracer
-from shopagent.tools.http import CommerceAPI
+from shopagent.tools.http import CommerceAPI, CommerceAPIError
 
 CUSTOMER = "customer"
 SHOP = "shop"
+
+# The one tool the cart panel's button asks for. Named here rather than
+# imported from `agent/guardrails.py`, which holds it as a member of
+# `CONFIRM_BEFORE` — a set of tools the gate stops, not a name a caller is
+# meant to reach for. What matters is that the two agree, and that is asserted
+# rather than arranged: `test_the_button_asks_for_a_tool_the_gate_actually_gates`
+# fails if this name ever falls outside `CONFIRM_BEFORE`, which is the moment
+# the button would stop being a request to the gate and become a second way to
+# buy something.
+CHECKOUT_TOOL = "create_checkout"
 
 # What a person is told when the session's cap is reached. Written for a
 # shopper rather than for an operator: it says what stopped, that nothing is
@@ -104,6 +114,25 @@ CAP_NOTICE = (
     "This demo session has reached its spending limit, so the assistant has "
     "stopped answering. Everything above is still here to read, and any order "
     "already placed is unaffected. Start a new session to carry on."
+)
+
+
+# What a person is told when the cart cannot be read for the panel. The panel
+# is a convenience beside a conversation that still works, so this says what is
+# missing and points at the thing that does work, rather than reading as an
+# outage.
+CART_UNREADABLE = (
+    "The basket cannot be shown right now. Ask the assistant what is in it."
+)
+
+# When the button's request reached the shop and no question came back. The
+# gate parks a question for every basket there is something to confirm about,
+# so this is the other case: nothing to check out. Written for a shopper, and
+# deliberately vague about which of the several reasons it was — the assistant
+# below can say, and it has the conversation to say it in.
+CHECKOUT_NOT_STARTED = (
+    "The shop could not start a checkout for this basket. Ask the assistant "
+    "below and it will say why."
 )
 
 
@@ -263,6 +292,53 @@ class ProductCard:
     category: str | None
     description: str | None
     variants: tuple[VariantCard, ...]
+
+
+@dataclass(frozen=True)
+class CartLine:
+    """One line of the basket, as the panel beside the conversation shows it.
+
+    Both amounts arrive already through `money.format_amount`, for the reason
+    `VariantCard.price` does: every figure a person reads in this system comes
+    out of that one function, and a renderer doing its own arithmetic is the
+    float this project has refused since D1.
+    """
+
+    variant_id: int
+    product_name: str
+    variant_label: str
+    quantity: int
+    unit_price: str
+    line_total: str
+
+
+@dataclass(frozen=True)
+class CartPanel:
+    """What is in the basket right now, read from the shop rather than recalled.
+
+    **Read from the commerce API on every draw, never from the transcript.** A
+    `ChatMessage` carries what was true when it was written, and a basket
+    changes after that — a panel rendered from the last `view_cart` result
+    would show a line the customer removed two turns ago and would keep showing
+    it. The panel is a live view or it is a lie with a timestamp nobody can see.
+
+    Reading it costs one HTTP request and no model call at all, which is the
+    other half of why it can be redrawn on every rerun: Streamlit re-executes
+    this script on every click, and a panel that asked the model what was in
+    the basket would bill a shopper for scrolling.
+    """
+
+    lines: tuple[CartLine, ...]
+    total: str
+    unit_count: int
+    # Set when the cart could not be read. The panel then says so and offers
+    # nothing to press — a checkout button over a basket nobody could read is a
+    # button whose total is unknown.
+    error: str | None = None
+
+    @property
+    def empty(self) -> bool:
+        return not self.lines
 
 
 @dataclass(frozen=True)
@@ -503,6 +579,58 @@ class BrowserSession:
         """What the shop remembers, for display. There is no setter."""
         return self._profile
 
+    def cart(self) -> CartPanel:
+        """The basket, read from the shop over the tools' own client.
+
+        Three things about where this reads from, and each of them is the
+        reason it is not read from somewhere easier.
+
+        **The commerce API, not the transcript.** A message holds what was true
+        when it was written; a basket does not stay that way. `self._setup.api`
+        is the same client the five commerce tools were built over, so the
+        panel and the agent are looking at one shop through one connection
+        pool.
+
+        **`memory.cart_id`, not an id of its own.** The model has never seen a
+        cart id and never will — that is D9's rule and the reason the tools
+        hold it. A panel that made its own cart would draw an empty basket
+        beside a conversation that had filled one.
+
+        **No model call, ever.** One `GET`, and the numbers come back already
+        computed by the API, which recomputes a cart total from the database on
+        every read for exactly this reason. Streamlit re-runs this script on
+        every click, so anything here that reached the model would bill a
+        shopper for scrolling.
+        """
+        currency = get_settings().currency
+        cart_id = self._memory.cart_id if self._memory else None
+        if cart_id is None:
+            # Not an error and not a failure to read: a shopper who has added
+            # nothing has an empty basket, which is the same answer `view_cart`
+            # gives the model in the same situation.
+            return CartPanel(lines=(), total=format_amount(0, currency), unit_count=0)
+
+        api = self._setup.api
+        if api is None:
+            return CartPanel(
+                lines=(), total=format_amount(0, currency), unit_count=0,
+                error=CART_UNREADABLE,
+            )
+
+        try:
+            body = api.request("GET", f"/cart/{cart_id}")
+        except CommerceAPIError:
+            # Narrow on purpose: this catches the shop being unreachable, slow,
+            # or refusing, which are the states a panel has to survive. Anything
+            # else is a fault in this process and belongs in the traceback the
+            # page would otherwise never show.
+            return CartPanel(
+                lines=(), total=format_amount(0, currency), unit_count=0,
+                error=CART_UNREADABLE,
+            )
+
+        return _panel(body, currency)
+
     # --- driving a turn ---------------------------------------------------
 
     def send(self, text: str) -> TurnResult:
@@ -538,6 +666,81 @@ class BrowserSession:
             lambda: self._messages.append({"role": "user", "content": text})
         )
         return self._result((customer, shop), error)
+
+    def request_checkout(self) -> TurnResult:
+        """Ask the gate to check this basket out, on the customer's own click.
+
+        **This is a second way to *start* a checkout and deliberately not a
+        second way to *make* one.** D11 decided the cart panel would be
+        read-only, on the argument that a second route to payment contradicts a
+        demo built to show an agent. That decision is reversed here for exactly
+        one implementation, and which implementation is the whole of the
+        reasoning:
+
+        - **Not** `POST /orders` and `POST /orders/{id}/checkout` from the
+          page. That really is a second route: it reaches the commerce API
+          without the gate, without the memory and without a summary anybody
+          approved, and it stays refused.
+        - **Not** typing "proceed to checkout" into the conversation as though
+          the customer had. It adds no route, but it inherits the variance D10
+          measured and D11 hit live — the model sometimes answers a request to
+          check out with prose instead of a tool call — so a button that
+          sometimes does nothing is a button nobody trusts.
+        - **This**: the same `create_checkout`, dispatched through the same
+          `GuardedRegistry.dispatch` the model reaches, which parks the same
+          question built from the same `view_cart` read and rendered through
+          the same `money.format_amount`.
+
+        What is bypassed is one thing and it is nameable: the model's decision
+        to call the tool. The customer expresses that decision by clicking,
+        which is a better signal than a sentence somebody has to hope is
+        parsed. **Everything the gate protects is still in front of them** —
+        the summary comes from the cart and not from prose, a person still
+        answers, `_spend` still re-reads the basket and refuses an approval
+        given for a different one, and the order is still placed by
+        `create_checkout` under `place_order`'s locks.
+
+        `begin_turn(from_customer=True)` because a click is the customer
+        acting, and it carries that method's other effect on purpose: an
+        approval nobody answered lapses here, so a click can never spend one
+        parked earlier. The page disables the button while a question is open,
+        and this does not rely on that.
+
+        Returns with `pending` set and nothing bought — the same half-finished
+        state `send` returns when the model asks. The caller puts the question
+        to the customer and answers it through `answer_confirmation`, which is
+        D10's protocol unchanged and not a third implementation of it.
+        """
+        if self.pending is not None or self.cap_reached:
+            # A question is already in front of them, or this session has
+            # stopped spending. Either way the click changes nothing: the
+            # follow-up turn an answer drives is a model call, and letting one
+            # start past the cap would spend money the door already refused.
+            return self._nothing_happened()
+
+        self._memory.begin_turn(from_customer=True)
+        self._activity.begin_turn()
+        self._registry.dispatch(CHECKOUT_TOOL, {})
+
+        if self.pending is not None:
+            # The ordinary outcome: a question is parked and nothing ran.
+            return self._result(())
+
+        # The gate let the call through, which it does when there is nothing to
+        # confirm — an empty basket, or an order already placed in this
+        # conversation whose payment page `create_checkout` resumes. The link
+        # is taken off the memory here for the same reason a turn takes it:
+        # left there, it would be printed again under every later answer.
+        link = self._memory.take_checkout_url() if self._memory else None
+        shop = ChatMessage(
+            role=SHOP,
+            text="",
+            activity=tuple(self._activity.calls),
+            payment_url=link,
+            notice=None if link else CHECKOUT_NOT_STARTED,
+        )
+        self._transcript.append(shop)
+        return self._result((shop,))
 
     def answer_confirmation(self, approved: bool) -> TurnResult:
         """Carry a person's yes or no back to the model, through the protocol.
@@ -684,6 +887,39 @@ class BrowserSession:
             cap_reached=self.cap_reached,
             error=error,
         )
+
+
+def _panel(body: dict, currency: str) -> CartPanel:
+    """One cart body from the API, turned into what the panel draws.
+
+    Reads the names `api/schemas.py` publishes — `unit_price_cents` and
+    `line_total_cents` are already the flattened, resolved numbers this side of
+    the boundary is meant to read, so nothing is renamed a third time here.
+    The only work done is `money.format_amount`, and it is done once per figure
+    so that no template ever holds an integer number of cents.
+    """
+    items = [item for item in body.get("items", []) if isinstance(item, dict)]
+    lines = tuple(
+        CartLine(
+            variant_id=int(item["variant_id"]),
+            product_name=str(item.get("product_name", "")),
+            variant_label=str(item.get("variant_label", "")),
+            quantity=int(item.get("quantity", 0)),
+            unit_price=format_amount(item.get("unit_price_cents"), currency),
+            line_total=format_amount(item.get("line_total_cents"), currency),
+        )
+        for item in items
+        if "variant_id" in item
+    )
+    return CartPanel(
+        lines=lines,
+        # The server's total, never a sum computed here. D6 recomputes it from
+        # the database on every read precisely so that nothing downstream has
+        # to, and a panel that added the lines up itself would be a second
+        # opinion about what the basket costs.
+        total=format_amount(body.get("total_cents", 0), body.get("currency", currency)),
+        unit_count=sum(line.quantity for line in lines),
+    )
 
 
 def _card(row: dict, currency: str) -> ProductCard:
