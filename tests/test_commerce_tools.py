@@ -1063,3 +1063,46 @@ def test_an_order_the_api_refuses_to_refund_reaches_the_model_in_its_own_words()
 
     assert not result.ok
     assert "order is pending, so it cannot be refunded" in result.content
+
+
+@pytest.mark.parametrize("status", ["failed", "canceled"])
+def test_a_refund_the_provider_already_rejected_is_not_reported_as_on_its_way(status):
+    """Withholding `refund_status` is not the same as ignoring it. PR #11.
+
+    Stripe can come back terminal on this very call. The success-shaped payload
+    would then tell the customer their money is on its way when it is not — and
+    nothing corrects it, because the order stays `paid` and
+    `check_order_status` goes on saying so for ever.
+    """
+    recorder = Recorder([(
+        "POST",
+        f"/orders/{ORDER_ID}/refund",
+        httpx.Response(202, json=refund_body(order_status="paid") | {"refund_status": status}),
+    )])
+    registry, _ = build(recorder, ConversationMemory(order_id=ORDER_ID))
+
+    result = registry.dispatch("request_refund", {})
+
+    assert not result.ok
+    assert "did not go through" in result.content
+    assert "on its way" not in result.content
+
+
+@pytest.mark.parametrize("status", ["succeeded", "pending", "requires_action", None])
+def test_every_non_terminal_refund_status_is_still_an_accepted_request(status):
+    """The three Stripe values that mean "not over yet" all take the same path.
+
+    `None` is in the list deliberately: it means the provider said nothing
+    about the outcome, which is the ordinary accepted case and not a failure.
+    """
+    recorder = Recorder([(
+        "POST",
+        f"/orders/{ORDER_ID}/refund",
+        httpx.Response(202, json=refund_body() | {"refund_status": status}),
+    )])
+    registry, _ = build(recorder, ConversationMemory(order_id=ORDER_ID))
+
+    result = registry.dispatch("request_refund", {})
+
+    assert result.ok
+    assert json.loads(result.content)["refund_requested"] is True

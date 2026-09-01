@@ -112,6 +112,17 @@ class CheckOrderStatusArgs(BaseModel):
     """No arguments: it reports on the order placed in this conversation."""
 
 
+# Refund statuses that are over and did not work. Stripe's other values —
+# `succeeded`, `pending`, `requires_action` — all mean the same thing to this
+# layer: accepted, and the order moves when `charge.refunded` arrives.
+#
+# This covers the synchronous case only. A refund that is accepted here and
+# fails minutes later arrives as its own event, and nothing handles it: the
+# order stays `paid` and the customer is never told. That is a real gap and it
+# is recorded as one rather than half-closed here.
+_REFUND_FAILED = frozenset({"failed", "canceled"})
+
+
 class RequestRefundArgs(BaseModel):
     """No arguments: it refunds the order placed in this conversation, in full.
 
@@ -322,7 +333,7 @@ def _order_view(body: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_commerce_tools(api: CommerceAPI, state: HoldsCartState) -> list[ToolSpec]:
-    """The five tools, closed over one conversation's API client and memory.
+    """The six tools, closed over one conversation's API client and memory.
 
     A factory rather than a module-level registry with decorators, which is
     what `tools/basic.py` uses: those two tools are stateless, these five share
@@ -504,12 +515,19 @@ def build_commerce_tools(api: CommerceAPI, state: HoldsCartState) -> list[ToolSp
         which is the same argument `api/schemas.py` makes for putting it in the
         response. And the note says plainly what has and has not happened.
 
-        `refund_status` is deliberately left out, and it is the interesting
-        omission: Stripe usually reports `succeeded` immediately for a card, and
-        a model holding two statuses called "succeeded" and "paid" will collapse
-        them into one sentence. The API returns it because an HTTP client can
-        hold both; this layer does not, because this reader will not. There is
-        no gap for the model to fill, because the note says what happened.
+        `refund_status` is deliberately left out of the *result*, and it is the
+        interesting omission: Stripe usually reports `succeeded` immediately for
+        a card, and a model holding two statuses called "succeeded" and "paid"
+        will collapse them into one sentence. The API returns it because an HTTP
+        client can hold both; this layer does not, because this reader will not.
+
+        **It is read here, though, and a terminal failure changes the shape of
+        the answer.** Withholding the field is not the same as ignoring it:
+        Stripe can come back `failed` or `canceled` on this very call, and the
+        success-shaped payload would then tell the customer their money is on
+        its way when it is not — with nothing to correct it, because the order
+        stays `paid` and `check_order_status` goes on saying so for ever.
+        Raised by review on PR #11.
 
         `refund_id` is left out for the reason the payment link is: an opaque
         string the model has to carry is one it will eventually get wrong, and
@@ -526,6 +544,19 @@ def build_commerce_tools(api: CommerceAPI, state: HoldsCartState) -> list[ToolSp
             )
 
         refund = api.request("POST", f"/orders/{state.order_id}/refund")
+
+        if refund.get("refund_status") in _REFUND_FAILED:
+            # Terminal on arrival. A `None` status is not this — it means the
+            # provider said nothing about the outcome, which is the ordinary
+            # "accepted, ask later" case the note below covers.
+            return _refuse(
+                "the refund was not accepted by the payment provider, so the "
+                "customer has not been refunded and their order is unchanged. "
+                "Tell them the refund did not go through and that they should "
+                "contact the shop. Do not call this tool again — it will fail "
+                "the same way."
+            )
+
         return {
             "order_id": refund["order_id"],
             "refund_requested": True,
@@ -638,7 +669,7 @@ def build_commerce_tools(api: CommerceAPI, state: HoldsCartState) -> list[ToolSp
 def register_commerce_tools(
     registry: ToolRegistry, api: CommerceAPI, state: HoldsCartState
 ) -> HoldsCartState:
-    """Put the five tools into a registry, the way D5 puts the MCP ones in.
+    """Put the six tools into a registry, the way D5 puts the MCP ones in.
 
     Returns the session so a caller that let this build one can still reach it.
     """
