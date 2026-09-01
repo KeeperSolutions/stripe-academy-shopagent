@@ -354,22 +354,30 @@ class CartPanel:
 # to the model to place an order nobody asked about. Here it is a heading over
 # a summary the person is reading anyway, so vague is survivable and a blank
 # page is not.
+# Three strings per question: the dialog's heading, what the page says behind
+# it, and what the spinner says while the answer is being carried back. The
+# third arrived from review on PR #11 — the page said "Placing the order…"
+# while a refund was being issued, which is the same class of mistake as the
+# reassurance below and one the customer sees at the worst moment.
 _QUESTIONS = {
     "create_checkout": (
         "Confirm this purchase",
         "Waiting for your confirmation. Nothing has been ordered and nothing "
         "has been charged.",
+        "Placing the order…",
     ),
     "request_refund": (
         "Confirm this refund",
         "Waiting for your confirmation. No refund has been requested and your "
         "order is unchanged.",
+        "Requesting the refund…",
     ),
 }
 
 _UNNAMED_QUESTION = (
     "Confirm this",
     "Waiting for your confirmation. Nothing has happened yet.",
+    "Working…",
 )
 
 
@@ -394,6 +402,16 @@ class PendingApproval:
         """What the dialog is headed. "Confirm this purchase" over a refund is
         a heading that contradicts the summary underneath it."""
         return _QUESTIONS.get(self.tool, _UNNAMED_QUESTION)[0]
+
+    @property
+    def acting(self) -> str:
+        """What the page says while the answer is being carried back.
+
+        Per tool for the same reason the two above are: "Placing the order…"
+        over a refund names the opposite movement of money, and it is on screen
+        exactly while the irreversible thing happens.
+        """
+        return _QUESTIONS.get(self.tool, _UNNAMED_QUESTION)[2]
 
     @property
     def waiting(self) -> str:
@@ -637,7 +655,7 @@ class BrowserSession:
 
         **The commerce API, not the transcript.** A message holds what was true
         when it was written; a basket does not stay that way. `self._setup.api`
-        is the same client the five commerce tools were built over, so the
+        is the same client the six commerce tools were built over, so the
         panel and the agent are looking at one shop through one connection
         pool.
 
@@ -770,24 +788,49 @@ class BrowserSession:
 
         self._memory.begin_turn(from_customer=True)
         self._activity.begin_turn()
-        self._registry.dispatch(CHECKOUT_TOOL, {})
 
-        if self.pending is not None:
-            # The ordinary outcome: a question is parked and nothing ran.
-            return self._result(())
+        # Traced as its own root, like any other turn. Without this the click
+        # is the one thing the shop does that appears in neither the activity
+        # panel nor Langfuse — and the whole argument for dispatching through
+        # `self._registry` rather than `self._setup.registry` is that the
+        # tracing and recording wrappers see it. That argument was hollow while
+        # nothing opened a span or kept the log. Raised by review on PR #11.
+        trace_url: str | None = None
+        with self._tracer.conversation(
+            shopper_id=self._shopper_id,
+            model=self._client.model,
+            session_id=self._session_id,
+        ):
+            trace_url = self._tracer.trace_url()
+            self._registry.dispatch(CHECKOUT_TOOL, {})
+        self._tracer.flush()
 
-        # The gate let the call through, which it does when there is nothing to
-        # confirm — an empty basket, or an order already placed in this
-        # conversation whose payment page `create_checkout` resumes. The link
-        # is taken off the memory here for the same reason a turn takes it:
-        # left there, it would be printed again under every later answer.
+        # The link is taken off the memory whatever happened, for the reason a
+        # turn takes it: left there, it would be printed again under every
+        # later answer. It is `None` on the parked branch, because the tool did
+        # not run.
         link = self._memory.take_checkout_url() if self._memory else None
+        parked = self.pending is not None
+
+        # A bubble with no text on both branches, and it is the shop's own
+        # record rather than words put in the customer's mouth — which is the
+        # line `agent/confirmation.py` draws and this stays on the right side
+        # of. It carries what the click did: the `view_cart` the gate read and
+        # the `create_checkout` it refused, which are the two rows somebody
+        # opening the panel is looking for. Nothing is said in prose, because
+        # the dialog is about to say it.
         shop = ChatMessage(
             role=SHOP,
             text="",
             activity=tuple(self._activity.calls),
             payment_url=link,
-            notice=None if link else CHECKOUT_NOT_STARTED,
+            # Nothing to say while a question is open — the dialog is the
+            # answer. The notice is for the other branch, where the gate let
+            # the call through because there was nothing to confirm: an empty
+            # basket, or an order already placed whose payment page
+            # `create_checkout` resumes.
+            notice=None if parked or link else CHECKOUT_NOT_STARTED,
+            trace_url=trace_url,
         )
         self._transcript.append(shop)
         return self._result((shop,))

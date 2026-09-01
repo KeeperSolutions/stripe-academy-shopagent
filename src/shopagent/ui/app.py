@@ -361,7 +361,7 @@ def _ask_to_confirm(session: turns.BrowserSession, pending: turns.PendingApprova
     if confirm.button(
         "Confirm", type="primary", use_container_width=True, key="confirm-yes"
     ):
-        with st.spinner("Placing the order…"):
+        with st.spinner(pending.acting):
             session.answer_confirmation(True)
         st.rerun(scope="app")
 

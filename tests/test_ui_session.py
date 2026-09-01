@@ -2014,3 +2014,80 @@ def test_every_gated_tool_has_wording_written_for_it():
 
     missing = [tool for tool in CONFIRM_BEFORE if tool not in ui._QUESTIONS]
     assert missing == [], f"gated with no wording of its own: {missing}"
+
+
+def test_the_spinner_names_the_action_it_is_waiting_on():
+    """"Placing the order…" over a refund names the opposite movement of money.
+
+    It is on screen exactly while the irreversible thing happens, which is the
+    worst moment for the page to be describing something else. Raised on PR #11.
+    """
+    purchase = ui.PendingApproval(tool="create_checkout", summary="s")
+    refund = ui.PendingApproval(tool="request_refund", summary="s")
+
+    assert purchase.acting == "Placing the order…"
+    assert refund.acting == "Requesting the refund…"
+    assert ui.PendingApproval(tool="cancel_order", summary="s").acting == "Working…"
+
+
+def test_the_page_takes_its_spinner_from_the_pending_question_too():
+    app = ast.parse((SESSION_PATH.parent / "app.py").read_text())
+    source = ast.unparse(app)
+
+    assert "Placing the order" not in source
+    assert "pending.acting" in source
+
+
+def test_the_checkout_click_keeps_what_it_did(shopping):
+    """The click is the shop acting, and it has to be visible like anything else.
+
+    The whole argument for dispatching through `self._registry` rather than
+    `self._setup.registry` is that the tracing and recording wrappers see it —
+    and that was hollow while nothing kept the log: the follow-up turn cleared
+    it before anybody could read it, so the `create_checkout` the gate refused
+    appeared in no panel at all. Raised on PR #11.
+
+    The `view_cart` the gate reads to build the summary is *not* here, and that
+    is not this fix falling short. `_describe` calls `super().dispatch` on the
+    `GuardedRegistry` itself, which is inside `RecordingRegistry` rather than
+    outside it, so the gate's own reads are invisible on every path including
+    the model's. Consistent, long-standing, and a structural question about the
+    wrapper order rather than something to change in a review fix.
+    """
+    session = shopping(replies=_a_filled_basket())
+    _fill(session)
+
+    result = session.request_checkout()
+
+    assert result.pending is not None, "and the question is still parked"
+    (record,) = result.messages
+    (call,) = record.activity
+    assert call.name == "create_checkout"
+    assert call.ok is False, "the refusal is the row somebody opens the panel for"
+    assert record.text == "", "the shop's own record, not words in the customer's mouth"
+
+
+def test_the_checkout_click_is_traced_as_its_own_turn(shopping):
+    """One root per click, grouped into the tab's conversation like every turn."""
+
+    class Linking(Tracer):
+        def __init__(self):
+            super().__init__()
+            self.opened = []
+
+        def conversation(self, **kwargs):
+            self.opened.append(kwargs)
+            return super().conversation(**kwargs)
+
+        def trace_url(self):
+            return "https://cloud.langfuse.com/trace/from-the-click"
+
+    session = shopping(replies=_a_filled_basket())
+    _fill(session)
+    session._tracer = Linking()
+
+    (record,) = session.request_checkout().messages
+
+    assert record.trace_url == "https://cloud.langfuse.com/trace/from-the-click"
+    (opened,) = session._tracer.opened
+    assert opened["session_id"] == session.session_id

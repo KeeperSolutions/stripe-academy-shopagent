@@ -157,6 +157,26 @@ REFUND_ORDER_CHANGED = (
     "you are waiting for their confirmation, and stop there."
 )
 
+# What the model is told when nobody can be asked at all. D9's rule is that a
+# gate which cannot reach a person refuses rather than allows, and the refusal
+# has to say what is true of *this* call: adding `request_refund` to the gate
+# exposed this branch to a tool the checkout's sentence is backwards for. A
+# refund nobody could confirm leaves an order that is still charged and still
+# paid, so "nothing was charged" would be the exact false reassurance the
+# per-tool notes below exist to avoid. Raised by review on PR #11.
+_UNREACHABLE = {
+    CHECKOUT_TOOL: (
+        "Error: this checkout could not be confirmed with the customer, so "
+        "nothing was ordered and nothing was charged. Tell them the order was "
+        "not placed."
+    ),
+    REFUND_TOOL: (
+        "Error: this refund could not be confirmed with the customer, so no "
+        "refund was requested. Their order is unchanged and they have not been "
+        "refunded. Tell them the refund was not requested."
+    ),
+}
+
 # Which pair a gated tool speaks with. The mapping is the reason
 # `_unconfirmed` and `_spend` take the tool name through rather than reaching
 # for a module constant: two gated tools now, and the checkout's wording is
@@ -534,12 +554,7 @@ class GuardedRegistry(RememberingRegistry):
 
         if not self._can_confirm:
             return ToolResult(
-                ok=False,
-                content=(
-                    "Error: this checkout could not be confirmed with the "
-                    "customer, so nothing was ordered and nothing was charged. "
-                    "Tell them the order was not placed."
-                ),
+                ok=False, content=_UNREACHABLE[name],
                 error="no confirmation is possible in this session",
             )
 

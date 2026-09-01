@@ -763,7 +763,7 @@ def test_the_refund_summary_is_read_from_the_order_and_never_the_cart():
 
 
 def test_the_refund_question_says_the_whole_order_is_going_back():
-    """"A refund" and "this whole order" are different things to agree to.
+    """Saying "a refund" and saying "this whole order" are not the same thing.
 
     `stripe_svc.create_refund` takes no amount and there is no status between
     `paid` and `refunded`, so a full refund is the only one this shop can
@@ -912,3 +912,35 @@ def test_an_order_that_cannot_be_read_refunds_nothing_and_never_runs_the_tool():
     assert not result.ok
     assert "could not be read" in result.content
     assert memory.pending_confirmation is None
+
+
+def test_an_unconfirmable_refund_does_not_say_nothing_was_charged():
+    """The branch adding a second gated tool exposed. Raised on PR #11.
+
+    D9's rule is that a gate which cannot reach anybody refuses — and until the
+    refund arrived, only one tool could reach this branch, so its sentence was
+    the checkout's. For a refund it is backwards: the order is still charged
+    and still paid, and "nothing was charged" is the exact false reassurance
+    the per-tool notes exist to avoid.
+    """
+    registry, memory, ran = build(can_confirm=False)
+
+    result = registry.dispatch("request_refund", {})
+
+    assert ran == []
+    assert not result.ok
+    assert memory.pending_confirmation is None
+    assert "nothing was charged" not in result.content.lower()
+    assert "order is unchanged" in result.content
+    assert "refund was not requested" in result.content
+
+
+def test_an_unconfirmable_checkout_still_says_nothing_was_charged():
+    """The other half, unchanged — the fix must not have swapped the sentences."""
+    registry, _, ran = build(can_confirm=False)
+
+    result = registry.dispatch("create_checkout", {})
+
+    assert ran == []
+    assert "nothing was charged" in result.content
+    assert "refund" not in result.content
