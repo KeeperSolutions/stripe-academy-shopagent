@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session
 
 from shopagent.api.db import get_session
 from shopagent.api.lifecycle import OrderStatus
+from shopagent.api.services.events import SETTLED_PAYMENT_STATUSES
 from shopagent.api.models import Order
 from shopagent.config import get_settings
 from shopagent.money import format_amount
@@ -127,11 +128,17 @@ _STATUS_TEXT = {
         "Payment received",
         "<p>Your payment went through and your order is confirmed.</p>",
     ),
+    # `pending` is two different situations and only one of them is a payment
+    # in flight, so this entry is never used on its own — `_pending_text`
+    # chooses between them from what Stripe says about the *session*. Kept in
+    # the table so every status has an entry and the lookup below cannot fall
+    # through, and set to the neutral half, which is the one that is safe to
+    # show when nothing else is known.
     OrderStatus.PENDING: (
-        "Payment is being confirmed",
-        "<p>Your payment is being confirmed, and you do not need to pay again. "
-        "Refresh this page to check, or ask in the conversation and the "
-        "assistant will look it up for you.</p>",
+        "This order has not been paid",
+        "<p>This order is waiting for payment. Nothing has been charged for it "
+        "yet. Ask in the conversation and the assistant will give you the "
+        "payment link again.</p>",
     ),
     OrderStatus.FULFILLED: (
         "Order complete",
@@ -157,6 +164,33 @@ _UNKNOWN_ORDER = (
     "were charged, your card statement is the record — the reference below is "
     "what identifies the payment.</p>",
 )
+
+
+# What a `pending` order means once the session is taken into account. An order
+# is `pending` from the moment it is placed, and this URL is one anybody can
+# open — a shopper who reached the payment page and backed out lands here with
+# an `unpaid` session and a `pending` order, and telling them "you do not need
+# to pay again" would be telling somebody who has not paid that they have.
+# Raised by review on PR #11.
+#
+# The allow-list is `SETTLED_PAYMENT_STATUSES`, imported rather than respelled:
+# it is the same question the webhook asks before moving an order to `paid`,
+# and two spellings of "did the money arrive" is the drift this file exists to
+# argue against. `no_payment_required` is in it, which is why this is not
+# `== "paid"`.
+_PAYMENT_IN_FLIGHT = (
+    "Payment is being confirmed",
+    "<p>Your payment is being confirmed, and you do not need to pay again. "
+    "Refresh this page to check, or ask in the conversation and the assistant "
+    "will look it up for you.</p>",
+)
+
+
+def _pending_text(payment_status: str | None) -> tuple[str, str]:
+    """Which of the two `pending` stories this shopper is in."""
+    if payment_status in SETTLED_PAYMENT_STATUSES:
+        return _PAYMENT_IN_FLIGHT
+    return _STATUS_TEXT[OrderStatus.PENDING]
 
 
 def _order_status(session: Session, order_id: str) -> OrderStatus | None:
@@ -228,6 +262,8 @@ def checkout_success(
 
     if status is None:
         heading, explanation = _UNKNOWN_ORDER
+    elif status is OrderStatus.PENDING:
+        heading, explanation = _pending_text(checkout.payment_status)
     else:
         heading, explanation = _STATUS_TEXT[status]
 
@@ -256,7 +292,7 @@ def checkout_cancel() -> HTMLResponse:
         # Session expires, and `checkout.session.expired` cancels the order and
         # releases its stock. And "say so in the conversation and the items will
         # be released" promised something the assistant cannot do: there are
-        # five commerce tools and none of them cancels an order.
+        # six commerce tools and none of them cancels an order.
         "<p>Nothing was charged. Your order is still open and its items are "
         "still held, so the same checkout can be started again.</p>"
         "<p>Leaving this page is not the same as cancelling the order. An order "

@@ -696,19 +696,25 @@ def test_the_success_page_does_not_change_the_order(authed_client, session, monk
 # --- what the success page says, once it reads the order (D11 follow-up) ---
 
 
-def _returning_from(order_id: str, amount: int = 900):
-    """A Stripe session as the success page receives one, with an order on it."""
+def _returning_from(order_id: str, amount: int = 900, payment_status: str = "paid"):
+    """A Stripe session as the success page receives one, with an order on it.
+
+    `payment_status` is a parameter rather than a constant because the page now
+    reads it: an order is `pending` from the moment it is placed, and this URL
+    is one anybody can open, so "your payment is being confirmed" is only true
+    when the session says the money actually arrived.
+    """
 
     class Returned:
         id = "cs_test_back"
         status = "complete"
-        payment_status = "paid"
         amount_total = amount
         currency = CURRENCY
 
         class metadata:
             _data = {"order_id": order_id}
 
+    Returned.payment_status = payment_status
     return Returned
 
 
@@ -831,6 +837,42 @@ def _render_branch(branch, authed_client, session, monkeypatch):
         stripe_svc, "retrieve_checkout_session", lambda sid: _returning_from(order_id)
     )
     return authed_client.get("/checkout/success?session_id=cs_test_back")
+
+
+@pytest.mark.parametrize(
+    "payment_status, expected, forbidden",
+    [
+        ("paid", "being confirmed", "has not been paid"),
+        ("no_payment_required", "being confirmed", "has not been paid"),
+        ("unpaid", "has not been paid", "do not need to pay again"),
+        (None, "has not been paid", "do not need to pay again"),
+    ],
+)
+def test_a_pending_order_is_only_called_a_payment_in_flight_when_it_is_one(
+    authed_client, session, monkeypatch, payment_status, expected, forbidden
+):
+    """`pending` is two situations and only one of them is a payment arriving.
+
+    An order is `pending` from the moment it is placed, and this URL is one
+    anybody can open — a shopper who reached the payment page and backed out
+    lands here with an `unpaid` session, and "you do not need to pay again"
+    would tell somebody who has not paid that they have. The allow-list is
+    `SETTLED_PAYMENT_STATUSES`, the same one the webhook uses before moving an
+    order to `paid`, which is why `no_payment_required` is in it and this is
+    not `== "paid"`. Raised by review on PR #11.
+    """
+    order_id = make_order(authed_client, session, [(f"CHK-PS-{payment_status}", 900, 1)])
+    monkeypatch.setattr(
+        stripe_svc,
+        "retrieve_checkout_session",
+        lambda sid: _returning_from(order_id, payment_status=payment_status),
+    )
+
+    response = authed_client.get("/checkout/success?session_id=cs_test_back")
+
+    assert response.status_code == 200
+    assert expected in response.text
+    assert forbidden not in response.text
 
 
 @pytest.mark.parametrize("branch", PAGE_BRANCHES)
