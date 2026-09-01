@@ -341,20 +341,70 @@ class CartPanel:
         return not self.lines
 
 
+# What each gated question is called, and what the page says while it stands.
+#
+# Here rather than in `ui/app.py` because it is a decision and not a rendering:
+# which question is being asked is a fact about the tool, and the file that
+# decides a turn is the one that knows it. It is also the only way to test it,
+# since `app.py` runs the whole page at import.
+#
+# The fallback is neutral rather than an exception, which is the opposite of
+# what `confirmation.follow_up_note` does with an unknown tool — and the
+# difference is who reads the result. There, the wrong string is an instruction
+# to the model to place an order nobody asked about. Here it is a heading over
+# a summary the person is reading anyway, so vague is survivable and a blank
+# page is not.
+_QUESTIONS = {
+    "create_checkout": (
+        "Confirm this purchase",
+        "Waiting for your confirmation. Nothing has been ordered and nothing "
+        "has been charged.",
+    ),
+    "request_refund": (
+        "Confirm this refund",
+        "Waiting for your confirmation. No refund has been requested and your "
+        "order is unchanged.",
+    ),
+}
+
+_UNNAMED_QUESTION = (
+    "Confirm this",
+    "Waiting for your confirmation. Nothing has happened yet.",
+)
+
+
 @dataclass(frozen=True)
 class PendingApproval:
     """The question in front of the customer right now.
 
-    `summary` is the gate's own text, built from a real `view_cart` result and
+    `summary` is the gate's own text, built from a real tool result and
     rendered through `money.format_amount` — never from anything the model
     wrote. That is the property D9 paid for and D10 kept through the rewrite: a
     person approving a figure the model invented is worse than no gate at all,
     because it launders the invention through a human and leaves a record
-    saying they agreed. Step 2 renders this string and must not compose its own.
+    saying they agreed. The page renders this string and must not compose its
+    own.
     """
 
     tool: str
     summary: str
+
+    @property
+    def title(self) -> str:
+        """What the dialog is headed. "Confirm this purchase" over a refund is
+        a heading that contradicts the summary underneath it."""
+        return _QUESTIONS.get(self.tool, _UNNAMED_QUESTION)[0]
+
+    @property
+    def waiting(self) -> str:
+        """What the page says behind the dialog while the question stands.
+
+        Per tool because the reassurance differs and reverses: a parked
+        purchase has charged nothing, while a parked refund leaves an order
+        that is still paid — and "nothing has been charged" would be telling
+        somebody their money is not where it is.
+        """
+        return _QUESTIONS.get(self.tool, _UNNAMED_QUESTION)[1]
 
 
 @dataclass(frozen=True)

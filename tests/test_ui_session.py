@@ -1944,3 +1944,73 @@ def test_the_page_offers_no_way_to_take_a_line_out_of_the_basket():
         for call in calls_in(function, "button")
     }
     assert labels == {"CHECKOUT_LABEL"}
+
+
+# --- a second gated tool reaches the same dialog (D11 follow-up) ---------
+
+
+def test_each_gated_question_is_headed_by_what_it_is_about():
+    """"Confirm this purchase" over a refund contradicts the summary below it."""
+    purchase = ui.PendingApproval(tool="create_checkout", summary="s")
+    refund = ui.PendingApproval(tool="request_refund", summary="s")
+
+    assert purchase.title == "Confirm this purchase"
+    assert refund.title == "Confirm this refund"
+
+
+def test_the_sentence_behind_the_dialog_reverses_between_the_two():
+    """The reassurance is not the same one, and the wrong one is a lie.
+
+    A parked purchase has charged nothing. A parked refund leaves an order that
+    *is* charged, so "nothing has been charged" would tell somebody their money
+    is not where it is.
+    """
+    purchase = ui.PendingApproval(tool="create_checkout", summary="s")
+    refund = ui.PendingApproval(tool="request_refund", summary="s")
+
+    assert "nothing has been charged" in purchase.waiting.lower()
+    assert "nothing has been charged" not in refund.waiting.lower()
+    assert "order is unchanged" in refund.waiting
+
+
+def test_a_question_nobody_named_is_vague_rather_than_wrong():
+    """The opposite of what `follow_up_note` does, and for a stated reason.
+
+    There, an unknown tool raises, because the wrong string is an instruction
+    to the model to place an order nobody asked about. Here it is a heading
+    over a summary the person is reading anyway — vague is survivable and a
+    blank page is not.
+    """
+    unknown = ui.PendingApproval(tool="cancel_order", summary="s")
+
+    assert unknown.title == "Confirm this"
+    assert "purchase" not in unknown.waiting
+    assert "refund" not in unknown.waiting
+
+
+def test_the_page_takes_its_wording_from_the_pending_question():
+    """`app.py` decides nothing, including what to call the question.
+
+    Read structurally because importing the page runs it. What this catches is
+    a heading hard-coded back into the renderer, which is where it was until a
+    second gated tool made it wrong.
+    """
+    app = ast.parse((SESSION_PATH.parent / "app.py").read_text())
+    source = ast.unparse(app)
+
+    assert "Confirm this purchase" not in source
+    assert "pending.title" in source
+    assert "pending.waiting" in source
+
+
+def test_every_gated_tool_has_wording_written_for_it():
+    """The one that fails when a third tool is gated and nobody comes here.
+
+    The fallback keeps the page working; it does not make the page right. This
+    is the reminder, and it fails at the moment the gate changes rather than
+    the moment a customer reads "Confirm this" over their money.
+    """
+    from shopagent.agent.guardrails import CONFIRM_BEFORE
+
+    missing = [tool for tool in CONFIRM_BEFORE if tool not in ui._QUESTIONS]
+    assert missing == [], f"gated with no wording of its own: {missing}"

@@ -68,7 +68,14 @@ from shopagent.tools.registry import ToolResult
 # because the tool is a plain function reachable without this layer and the
 # rule belongs to the agent: it is about who is allowed to decide, not about
 # what a checkout is.
-CONFIRM_BEFORE = frozenset({"create_checkout"})
+# The calls that move money, in either direction. `request_refund` is here for
+# a reason the name "spend" does not cover: a refund gives money *back*, so it
+# cannot be the theft the gate was built against — but it is **terminal**.
+# `refunded` has no outgoing transition and `paid -> paid` is refused, so a
+# refund the customer did not ask for cannot be undone by this system at all.
+# "Irreversible" is the property that earns a confirmation, and spending is only
+# the most obvious way to be irreversible.
+CONFIRM_BEFORE = frozenset({"create_checkout", "request_refund"})
 
 # The tool the gate reads the confirmation total from, and the tool whose
 # argument is checked against what the model has been shown. Named here for the
@@ -77,6 +84,8 @@ CONFIRM_BEFORE = frozenset({"create_checkout"})
 CART_TOOL = "view_cart"
 ORDER_TOOL = "check_order_status"
 ADD_TOOL = "add_to_cart"
+CHECKOUT_TOOL = "create_checkout"
+REFUND_TOOL = "request_refund"
 
 # The two things `create_checkout` can be about, and the person confirming has
 # to be told which. It places an order from the cart; it also hands back the
@@ -89,6 +98,12 @@ ADD_TOOL = "add_to_cart"
 # to add the indentation itself.
 PLACING = "  About to place this order:"
 RESUMING = "  That order is already placed. This only fetches its payment link again:"
+
+# What a refund is about. It says "in full" because that is the only refund
+# this system can issue — `create_refund` takes no amount, and a partial one
+# has nowhere to live — and a person approving "a refund" without that word
+# could reasonably think they were returning one item.
+REFUNDING = "  About to refund this whole order:"
 
 # What the model is told while a person is being asked (D10, step 1). The gate
 # no longer blocks for an answer, so this is the result of the *first*
@@ -119,6 +134,35 @@ BASKET_CHANGED = (
     "ask them to confirm yourself. Say briefly that the order changed and you "
     "are waiting for their confirmation, and stop there."
 )
+
+# The same two, for a refund. Written out rather than templated off the tool
+# name, because the facts differ and not only the verb: a parked *purchase* has
+# charged nothing, while a parked *refund* leaves an order that is still paid,
+# and telling the model "nothing has been charged" about it would be false.
+AWAITING_REFUND_ANSWER = (
+    "The customer is being asked to confirm this refund right now: the shop is "
+    "showing them the order and its total and waiting for their answer. No "
+    "refund has been requested and their order is unchanged. Do not call "
+    "request_refund again and do not ask them to confirm yourself — the shop "
+    "is asking them directly. Say briefly that you are waiting for their "
+    "confirmation and stop there. Their answer will reach you next."
+)
+
+REFUND_ORDER_CHANGED = (
+    "The order is not the one the customer approved a refund for — it changed "
+    "after they said yes, so their approval does not cover it and no refund "
+    "has been requested. The shop is now showing them the order as it stands "
+    "and waiting for a fresh answer. Do not call request_refund again and do "
+    "not ask them to confirm yourself. Say briefly that the order changed and "
+    "you are waiting for their confirmation, and stop there."
+)
+
+# Which pair a gated tool speaks with. The mapping is the reason
+# `_unconfirmed` and `_spend` take the tool name through rather than reaching
+# for a module constant: two gated tools now, and the checkout's wording is
+# wrong for the other one in both branches.
+_AWAITING = {CHECKOUT_TOOL: AWAITING_ANSWER, REFUND_TOOL: AWAITING_REFUND_ANSWER}
+_CHANGED = {CHECKOUT_TOOL: BASKET_CHANGED, REFUND_TOOL: REFUND_ORDER_CHANGED}
 
 
 # --- amounts -------------------------------------------------------------
@@ -454,6 +498,17 @@ class GuardedRegistry(RememberingRegistry):
         if answered is not None:
             if answered.answer:
                 return self._spend(name, answered)
+            if name == REFUND_TOOL:
+                return ToolResult(
+                    ok=False,
+                    content=(
+                        "Error: the customer did not confirm the refund, so no "
+                        "refund was requested and their order is unchanged. "
+                        "Acknowledge that, and do not call request_refund again "
+                        "unless they ask for it in a later message."
+                    ),
+                    error="the customer declined the refund",
+                )
             return ToolResult(
                 ok=False,
                 content=(
@@ -472,7 +527,9 @@ class GuardedRegistry(RememberingRegistry):
             # second time: a person is looking at one question, and a second
             # summary would be a second thing to approve.
             return ToolResult(
-                ok=False, content=AWAITING_ANSWER, error="waiting for the customer to confirm"
+                ok=False,
+                content=_AWAITING[name],
+                error="waiting for the customer to confirm",
             )
 
         if not self._can_confirm:
@@ -486,13 +543,13 @@ class GuardedRegistry(RememberingRegistry):
                 error="no confirmation is possible in this session",
             )
 
-        summary = self._describe()
+        summary = self._describe(name)
         if isinstance(summary, ToolResult) or summary is None:
             return summary
 
         self.memory.park_confirmation(name, summary)
         return ToolResult(
-            ok=False, content=AWAITING_ANSWER, error="waiting for the customer to confirm"
+            ok=False, content=_AWAITING[name], error="waiting for the customer to confirm"
         )
 
     def _spend(self, name: str, approved: PendingConfirmation) -> ToolResult | None:
@@ -519,7 +576,7 @@ class GuardedRegistry(RememberingRegistry):
         follow-up turn — that question lapses at their next message rather than
         driving a loop the model controls. Raised by review on PR #10.
         """
-        current = self._describe()
+        current = self._describe(name)
         if isinstance(current, ToolResult) or current is None:
             # Unreadable, or nothing left to buy. Both are already answered
             # above: the first is a sentence about the cart, and the second
@@ -531,19 +588,30 @@ class GuardedRegistry(RememberingRegistry):
 
         self.memory.park_confirmation(name, current)
         return ToolResult(
-            ok=False, content=BASKET_CHANGED, error="the basket changed after it was approved"
+            ok=False,
+            content=_CHANGED[name],
+            error="the basket changed after it was approved",
         )
 
-    def _describe(self) -> ToolResult | str | None:
+    def _describe(self, tool: str) -> ToolResult | str | None:
         """What a person would be shown right now, read from the shop.
 
         Three answers, and each is a different thing for the caller to do: a
         string is the summary, `None` means there is nothing to confirm and the
-        tool should answer in its own words, and a `ToolResult` is the cart
-        being unreadable. One function because parking a question and spending
-        its answer have to describe the basket the same way — two renderers
-        would be two opinions about whether it changed.
+        tool should answer in its own words, and a `ToolResult` is the shop
+        being unreadable. Still **one function**, which is the property that
+        matters: parking a question and spending its answer have to describe the
+        same thing the same way, and two renderers would be two opinions about
+        whether it changed.
+
+        `tool` selects which question is being asked, not how it is rendered.
+        Both branches end in `_summarise`, which already reads a cart and an
+        order identically because `view_cart` and `check_order_status` return
+        the same shape. So adding the refund added a *question* and no second
+        renderer — the thing the one-function rule was protecting is untouched.
         """
+        if tool == REFUND_TOOL:
+            return self._describe_order_for_refund()
         cart = super().dispatch(CART_TOOL, {})
         if not cart.ok:
             return ToolResult(
@@ -570,6 +638,50 @@ class GuardedRegistry(RememberingRegistry):
             # question this gate could ask about nothing.
             return None
         return f"{RESUMING}\n{_summarise(order.content)}"
+
+    def _describe_order_for_refund(self) -> ToolResult | str | None:
+        """The order a full refund would be issued against.
+
+        The cart is not read at all, and that is the whole difference between
+        the two questions. By the time a refund is possible the cart is empty —
+        `create_checkout` clears it when it places the order — so summarising a
+        basket here would put "Total: €0.00" in front of somebody about to give
+        up a real order. That exact figure is the defect PR #9 found on the
+        resume path, arriving again from the other direction.
+
+        `None` when there is no order: `request_refund` then says "nothing has
+        been placed in this conversation" in its own words, which is a better
+        sentence than any question this gate could ask about nothing. That is
+        the same handover the empty-cart branch above makes.
+
+        **"There is no order" is read from the memory and not from the tool's
+        refusal, and that distinction is load-bearing.** Both arrive as a
+        failed `ToolResult` — `check_order_status` refuses an absent order, and
+        a commerce API that is down refuses everything — so a single `not
+        order.ok` check cannot tell them apart. Treating both as "nothing to
+        confirm" would let the gate stand aside on a *transport* failure, and
+        `request_refund` would then run with nobody asked. The checkout branch
+        above gets away with the same shape only because an empty cart makes
+        `create_checkout` refuse anyway; a refund has no such second lock, so
+        this asks the memory, which is the same field the tool itself checks.
+        """
+        if self.memory.order_id is None:
+            return None
+        order = super().dispatch(ORDER_TOOL, {})
+        if not order.ok or not _has_lines(order.content):
+            # An order this conversation placed, that cannot be read right now.
+            # Never `None`: that would run the refund unconfirmed.
+            return ToolResult(
+                ok=False,
+                content=(
+                    "Error: the order could not be read, so the customer could "
+                    "not be shown what they were about to have refunded and no "
+                    "refund was requested. Call check_order_status and tell "
+                    "them what you find."
+                ),
+                error="the order could not be read before confirming",
+            )
+        return f"{REFUNDING}\n{_summarise(order.content)}"
 
 
 def _as_dict(raw_args: Any) -> dict[str, Any] | None:

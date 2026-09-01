@@ -11,10 +11,14 @@ Anything asserted here has to be true for all three, so nothing here imports
 
 from __future__ import annotations
 
+import pytest
+
 from shopagent.agent.confirmation import (
     CONFIRMATION_LIFETIME_TURNS,
     CONFIRMED_NOTE,
     DECLINED_NOTE,
+    REFUND_CONFIRMED_NOTE,
+    REFUND_DECLINED_NOTE,
     ScriptedConfirmer,
     follow_up_note,
     resolve_pending,
@@ -189,3 +193,63 @@ def test_two_conversations_do_not_share_an_approval():
     resolve_pending(first, ScriptedConfirmer(answer=True))
 
     assert second.pending_confirmation is None
+
+
+# --- a second gated tool, with its own words (D11 follow-up) -------------
+
+
+def test_a_refund_carries_the_refunds_notes_and_not_the_checkouts():
+    """The checkout's wording is about placing an order and is wrong here.
+
+    "Nothing was ordered and nothing was charged" is true of a purchase nobody
+    confirmed. A refund nobody confirmed leaves an order that *is* charged, so
+    the same sentence would have the model reassure a customer about money the
+    shop is still holding.
+    """
+    memory = ConversationMemory()
+    memory.park_confirmation("request_refund", "  About to refund this whole order:")
+    memory.answer_confirmation(True)
+
+    note = follow_up_note(memory.pending_confirmation)
+
+    assert note == REFUND_CONFIRMED_NOTE
+    assert "create_checkout" not in note
+    assert "request_refund" in note
+
+
+def test_a_declined_refund_does_not_say_nothing_was_charged():
+    memory = ConversationMemory()
+    memory.park_confirmation("request_refund", "  About to refund this whole order:")
+    memory.answer_confirmation(False)
+
+    note = follow_up_note(memory.pending_confirmation)
+
+    assert note == REFUND_DECLINED_NOTE
+    assert "nothing was charged" not in note.lower()
+    assert "order is unchanged" in note
+
+
+def test_the_confirmed_refund_note_carries_the_202_into_the_answer():
+    """The turn that spends the approval is where the sentence gets written.
+
+    That turn is the model's first chance to tell the customer what happened,
+    and its instinct is "your refund is complete" because the call succeeded.
+    The tool result says so too; twice is deliberate, once on each side of the
+    decision.
+    """
+    assert "not tell them the refund is complete" in REFUND_CONFIRMED_NOTE
+
+
+def test_a_gated_tool_with_no_notes_written_for_it_raises():
+    """Loud rather than plausible.
+
+    Falling back to the checkout's wording would tell the model to place an
+    order it was never asked about — a mistake that reads perfectly well and
+    would be found by a customer rather than by a test.
+    """
+    memory = ConversationMemory()
+    memory.park_confirmation("cancel_order", "  About to cancel this order:")
+    memory.answer_confirmation(True)
+
+    with pytest.raises(KeyError, match="no follow-up note is written"):
+        follow_up_note(memory.pending_confirmation)

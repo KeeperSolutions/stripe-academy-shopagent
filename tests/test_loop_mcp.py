@@ -41,6 +41,7 @@ COMMERCE_TOOLS = [
     "remove_from_cart",
     "create_checkout",
     "check_order_status",
+    "request_refund",
 ]
 # Three since D9 — `ping` is no longer advertised by the server. The list is
 # the interface, so it is pinned in order and by name: this fails when one
@@ -142,14 +143,14 @@ def test_the_catalog_rules_forbid_answering_from_memory():
 
 @pytest.mark.db
 def test_the_catalog_switch_on_adds_the_server_tools(engine):
-    """Ten tools: the local two, D9's five, then the three the server lists."""
+    """Eleven tools: the local two, the six commerce ones, then the server's three."""
     with ExitStack() as stack:
         setup = build_tool_setup(stack, catalog_enabled=True)
         names = setup.registry.names()
         available = setup.catalog_available
 
     assert names == LOCAL_TOOLS + COMMERCE_TOOLS + CATALOG_TOOLS
-    assert len(names) == 10
+    assert len(names) == 11
     assert "ping" not in names
     assert available is True
 
@@ -243,8 +244,8 @@ def test_a_full_round_trip_through_the_unmodified_loop(engine, capsys):
     assert payload["count"] >= 1
     assert all(product["category"] == "shoes" for product in payload["results"])
 
-    # The model was offered all ten, and the terminal showed the call.
-    assert len(client.seen_tools[0]) == 10
+    # The model was offered all eleven, and the terminal showed the call.
+    assert len(client.seen_tools[0]) == 11
     assert "search_products" in capsys.readouterr().out
 
 
@@ -277,6 +278,7 @@ COMMERCE_TOOLS = [
     "remove_from_cart",
     "create_checkout",
     "check_order_status",
+    "request_refund",
 ]
 
 
@@ -337,7 +339,7 @@ class FakeCatalogClient:
         raise AssertionError("this fake is for listing only")
 
 
-def test_the_model_is_offered_exactly_these_ten_tools():
+def test_the_model_is_offered_exactly_these_eleven_tools():
     """Named and ordered, so it fails on a disappearance and on an arrival.
 
     The same shape as D6's hand-written table of foreign-key expectations: a
@@ -359,11 +361,12 @@ def test_the_model_is_offered_exactly_these_ten_tools():
         "remove_from_cart",
         "create_checkout",
         "check_order_status",
+        "request_refund",
         "search_products",
         "get_product_details",
         "check_stock",
     ]
-    assert len(setup.registry.names()) == 10
+    assert len(setup.registry.names()) == 11
     assert "ping" not in setup.registry.names()
 
 

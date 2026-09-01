@@ -14,7 +14,7 @@ import json
 import httpx
 import pytest
 
-from shopagent.agent.memory import ConversationMemory
+from shopagent.agent.memory import ConversationMemory, RememberingRegistry
 from shopagent.tools.commerce import register_commerce_tools
 from shopagent.tools.http import CommerceAPI
 from shopagent.tools.registry import ToolRegistry
@@ -25,6 +25,7 @@ TOOL_NAMES = [
     "remove_from_cart",
     "create_checkout",
     "check_order_status",
+    "request_refund",
 ]
 
 CART_ID = "11111111-1111-1111-1111-111111111111"
@@ -33,7 +34,7 @@ ORDER_ID = "33333333-3333-3333-3333-333333333333"
 
 
 def build(handler, session=None):
-    """A registry holding the five tools, wired to a fake commerce API."""
+    """A registry holding the six tools, wired to a fake commerce API."""
     api = CommerceAPI(
         base_url="http://commerce.test",
         api_key="test-key",
@@ -68,7 +69,7 @@ def one_line(variant_id=21, quantity=1, unit=9499):
     }
 
 
-def test_the_five_tools_are_registered():
+def test_the_six_tools_are_registered():
     registry, _ = build(lambda request: httpx.Response(200, json=cart_body()))
 
     assert registry.names() == TOOL_NAMES
@@ -882,3 +883,183 @@ def test_the_second_approval_is_asked_about_the_order_and_not_an_empty_cart(
     assert RESUMING in second_summary
     assert "€94.99" in second_summary
     assert "€0.00" not in second_summary
+
+
+# --- asking for a refund, which is not the same as getting one -----------
+
+
+def refund_body(order_status="paid", amount=9499):
+    """What `POST /orders/{id}/refund` really answers.
+
+    Built from `api/schemas.py::RefundResponse`, every field present including
+    the two this tool deliberately drops. A fixture holding only what the
+    assertions read could not show that `refund_status` is omitted on purpose,
+    which is the decision most worth pinning here.
+    """
+    return {
+        "order_id": ORDER_ID,
+        "refund_id": "re_3UAncwRnt986EK7P1abcdefg",
+        "refund_status": "succeeded",
+        "amount_cents": amount,
+        "currency": "eur",
+        "order_status": order_status,
+    }
+
+
+def test_request_refund_asks_the_api_for_this_conversations_order():
+    recorder = Recorder([("POST", f"/orders/{ORDER_ID}/refund", httpx.Response(202, json=refund_body()))])
+    registry, _ = build(recorder, ConversationMemory(order_id=ORDER_ID))
+
+    result = registry.dispatch("request_refund", {})
+
+    assert result.ok
+    assert recorder.calls == [f"POST /orders/{ORDER_ID}/refund"]
+
+
+def test_request_refund_reports_a_request_and_never_a_completed_refund():
+    """The whole of what this tool is careful about.
+
+    `POST /orders/{id}/refund` answers 202: Stripe accepted, the money has not
+    moved, and the order is still `paid` until `charge.refunded` lands. A
+    result shaped like a finished action produces "your refund is complete",
+    and the customer then reads `paid` when they ask again.
+    """
+    recorder = Recorder([("POST", f"/orders/{ORDER_ID}/refund", httpx.Response(202, json=refund_body()))])
+    registry, _ = build(recorder, ConversationMemory(order_id=ORDER_ID))
+
+    payload = json.loads(registry.dispatch("request_refund", {}).content)
+
+    assert payload["refund_requested"] is True
+    assert "refunded" not in payload, "a key called refunded reads as a finished one"
+    # The status is included *because* it still says paid. It is the field that
+    # would otherwise be assumed, which is the same argument `api/schemas.py`
+    # makes for putting it in the response.
+    assert payload["order_status"] == "paid"
+    assert "not completed" in payload["note"]
+    assert "check_order_status" in payload["note"]
+
+
+def test_the_refund_result_hides_stripes_own_status():
+    """The interesting omission, and the reason it is not a gap.
+
+    Stripe reports `succeeded` immediately for a card. A model holding two
+    statuses called "succeeded" and "paid" collapses them into one sentence,
+    and the sentence it picks is the wrong one. The API returns it because an
+    HTTP client can hold both; this layer does not, because this reader will
+    not — and the note says what happened, so there is nothing for the model to
+    fill in.
+    """
+    recorder = Recorder([("POST", f"/orders/{ORDER_ID}/refund", httpx.Response(202, json=refund_body()))])
+    registry, _ = build(recorder, ConversationMemory(order_id=ORDER_ID))
+
+    content = registry.dispatch("request_refund", {}).content
+
+    assert "succeeded" not in content
+    assert "refund_status" not in content
+
+
+def test_the_refund_result_hides_the_refund_id():
+    """The `cart_id` rule reaching its next piece of state.
+
+    An opaque string the model has to carry is one it will eventually get
+    wrong — measured on a Stripe URL in PR #9 — and no tool accepts a refund id
+    back, so there is no argument for it to get wrong either. The order id is
+    the reference a customer needs and it is returned.
+    """
+    recorder = Recorder([("POST", f"/orders/{ORDER_ID}/refund", httpx.Response(202, json=refund_body()))])
+    registry, _ = build(recorder, ConversationMemory(order_id=ORDER_ID))
+
+    content = registry.dispatch("request_refund", {}).content
+
+    assert "re_3UAncwRnt986EK7P1abcdefg" not in content
+    assert ORDER_ID in content
+
+
+def test_the_refunded_amount_is_recorded_so_the_model_may_quote_it():
+    """`agent/memory.py` collects keys ending in `_cents`, and this is one.
+
+    The amount guardrail refuses a figure that never appeared in a tool result.
+    Naming the field `amount_cents` rather than `amount` is what lets the model
+    say "€94.99 is on its way back" without being corrected — and it is the
+    naming rule in CLAUDE.md doing real work rather than being tidy.
+    """
+    recorder = Recorder([("POST", f"/orders/{ORDER_ID}/refund", httpx.Response(202, json=refund_body()))])
+    memory = ConversationMemory(order_id=ORDER_ID)
+    registry = ToolRegistry()
+    api = CommerceAPI(
+        base_url="http://commerce.test", api_key="k", transport=httpx.MockTransport(recorder)
+    )
+    register_commerce_tools(registry, api, memory)
+    remembering = RememberingRegistry(memory)
+    for spec in registry.specs():
+        remembering.register(spec)
+
+    remembering.dispatch("request_refund", {})
+
+    assert 9499 in memory.seen_amount_cents
+
+
+def test_request_refund_before_any_order_says_so_without_calling_the_api():
+    def refuse(request):  # pragma: no cover - reaching it is the failure
+        raise AssertionError(f"the API was called: {request.method} {request.url.path}")
+
+    registry, _ = build(refuse)
+
+    result = registry.dispatch("request_refund", {})
+
+    assert not result.ok
+    assert "nothing to refund" in result.content
+    # The limit is named rather than left for the model to discover, because
+    # the customer's next sentence is about an order this assistant cannot see.
+    assert "earlier conversation" in result.content
+
+
+def test_request_refund_takes_no_order_id_from_the_model():
+    """The rule the whole module lives under, on the newest tool.
+
+    An id the model carries is one it invents. `request_refund` refunds this
+    conversation's order and nothing else, so an `order_id` in the arguments is
+    ignored rather than honoured.
+    """
+    recorder = Recorder([("POST", f"/orders/{ORDER_ID}/refund", httpx.Response(202, json=refund_body()))])
+    registry, _ = build(recorder, ConversationMemory(order_id=ORDER_ID))
+
+    registry.dispatch("request_refund", {"order_id": "an-order-the-model-made-up"})
+
+    assert recorder.calls == [f"POST /orders/{ORDER_ID}/refund"]
+
+
+def test_request_refund_offers_the_model_no_amount_to_set():
+    """There is nowhere for a partial refund to live, so there is no argument.
+
+    `stripe_svc.create_refund` takes no amount and `orders.status` has no
+    "partly refunded", so an `amount` here would be the model offering a
+    customer something this shop cannot do — and `handle_charge_refunded`
+    would log the result at ERROR and change nothing.
+    """
+    registry, _ = build(lambda request: httpx.Response(200, json=cart_body()))
+
+    schema = next(
+        spec.to_openai_schema()
+        for spec in registry.specs()
+        if spec.name == "request_refund"
+    )
+
+    assert schema["function"]["parameters"].get("properties", {}) == {}
+
+
+def test_an_order_the_api_refuses_to_refund_reaches_the_model_in_its_own_words():
+    """A 409 is written for whoever reads it, and rewriting it here would give
+    one contract two authors. `refund_order` refuses a pending order, a
+    zero-total one and one already refunded, each with its own sentence."""
+    recorder = Recorder([(
+        "POST",
+        f"/orders/{ORDER_ID}/refund",
+        httpx.Response(409, json={"detail": "order is pending, so it cannot be refunded"}),
+    )])
+    registry, _ = build(recorder, ConversationMemory(order_id=ORDER_ID))
+
+    result = registry.dispatch("request_refund", {})
+
+    assert not result.ok
+    assert "order is pending, so it cannot be refunded" in result.content

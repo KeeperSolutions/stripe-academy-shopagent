@@ -112,6 +112,18 @@ class CheckOrderStatusArgs(BaseModel):
     """No arguments: it reports on the order placed in this conversation."""
 
 
+class RequestRefundArgs(BaseModel):
+    """No arguments: it refunds the order placed in this conversation, in full.
+
+    No `order_id`, by the rule the whole module lives under — the model is
+    never handed an identifier it has to carry back. And no `amount`, because
+    there is nowhere for a partial refund to live: `orders.status` has
+    `refunded` and no notion of partly refunded, and `stripe_svc.create_refund`
+    takes no amount for exactly that reason. An argument here would be the
+    model offering a customer something this shop cannot do.
+    """
+
+
 # --- failure text --------------------------------------------------------
 #
 # Written for the model, which is their only reader. Each says what happened,
@@ -473,6 +485,65 @@ def build_commerce_tools(api: CommerceAPI, state: HoldsCartState) -> list[ToolSp
             )
         return _order_view(api.request("GET", f"/orders/{state.order_id}"))
 
+    @_reports_failures(changes_state=True)
+    def request_refund() -> Any:
+        """Ask for a full refund of this conversation's order.
+
+        **The result is written against the one sentence the model will want to
+        write.** `POST /orders/{id}/refund` answers 202: Stripe has accepted the
+        request, the money has not moved, and the order is still `paid` — it
+        becomes `refunded` when `charge.refunded` arrives, which is seconds for
+        a card and days for some payment methods. A tool result shaped like a
+        completed action produces "your refund is complete", and the customer
+        then reads `paid` if they ask again.
+
+        So three things are done about it and none of them is an instruction in
+        the system prompt. `refund_requested` rather than `refunded`, so the
+        key itself is about the request. `order_status` is included *because*
+        it still says `paid` — it is the field that would otherwise be assumed,
+        which is the same argument `api/schemas.py` makes for putting it in the
+        response. And the note says plainly what has and has not happened.
+
+        `refund_status` is deliberately left out, and it is the interesting
+        omission: Stripe usually reports `succeeded` immediately for a card, and
+        a model holding two statuses called "succeeded" and "paid" will collapse
+        them into one sentence. The API returns it because an HTTP client can
+        hold both; this layer does not, because this reader will not. There is
+        no gap for the model to fill, because the note says what happened.
+
+        `refund_id` is left out for the reason the payment link is: an opaque
+        string the model has to carry is one it will eventually get wrong, and
+        no tool accepts one back. The order id is the reference a customer
+        needs, and it is returned.
+        """
+        if state.order_id is None:
+            return _refuse(
+                "no order has been placed in this conversation, so there is "
+                "nothing to refund. If the customer is asking about an order "
+                "from an earlier conversation, tell them this assistant can "
+                "only refund an order placed in the conversation it is having, "
+                "and that they should contact the shop about an older one."
+            )
+
+        refund = api.request("POST", f"/orders/{state.order_id}/refund")
+        return {
+            "order_id": refund["order_id"],
+            "refund_requested": True,
+            "amount_cents": refund["amount_cents"],
+            "currency": refund["currency"],
+            "order_status": refund["order_status"],
+            "note": (
+                "The refund has been requested and accepted, not completed. "
+                "The order status above is what it is right now and it has not "
+                "changed yet — it becomes 'refunded' once the payment provider "
+                "confirms the money has gone back, which is usually quick for "
+                "a card. Tell the customer their refund has been requested and "
+                "is on its way. Do not tell them it is complete, do not say "
+                "the money is back, and do not call this tool again to check: "
+                "use check_order_status."
+            ),
+        }
+
     return [
         ToolSpec(
             name="add_to_cart",
@@ -542,6 +613,24 @@ def build_commerce_tools(api: CommerceAPI, state: HoldsCartState) -> list[ToolSp
             ),
             args_model=CheckOrderStatusArgs,
             fn=check_order_status,
+        ),
+        ToolSpec(
+            name="request_refund",
+            description=(
+                "Ask for a full refund of the order placed in this "
+                "conversation. Takes no arguments, and refunds the whole order "
+                "— there is no way to refund one line of it. Before it runs, "
+                "the shop shows the customer the order and asks them to "
+                "confirm; if they decline, this call comes back as an error "
+                "saying so and nothing is refunded. It reports a refund that "
+                "has been *requested*, not one that has arrived: the order "
+                "stays 'paid' until the payment provider confirms, so read the "
+                "result and use check_order_status afterwards rather than "
+                "assuming. Only an order that was actually paid can be "
+                "refunded; anything else comes back as an error explaining why."
+            ),
+            args_model=RequestRefundArgs,
+            fn=request_refund,
         ),
     ]
 

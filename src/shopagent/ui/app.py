@@ -83,15 +83,11 @@ OPENERS = (
     "I need something for when it's pouring outside",
 )
 
-WAITING_FOR_YOU = (
-    "Waiting for your confirmation. Nothing has been ordered and nothing has "
-    "been charged."
-)
-
-# The dialog's own heading. It says what is being decided rather than what to
-# press, because the two buttons already say that and the summary underneath is
-# the part worth reading.
-CONFIRM_TITLE = "Confirm this purchase"
+# The dialog's heading and the sentence behind it both come from
+# `PendingApproval` — see `ui/session.py`, where they are chosen. Which
+# question is being asked is a fact about the tool, and this file decides
+# nothing. Two tools reach the gate now, and "Confirm this purchase" over a
+# refund would be a heading contradicting the summary underneath it.
 
 # The panel beside the conversation. A basket, and one button.
 CART_TITLE = "Your basket"
@@ -317,8 +313,8 @@ def _draw_message(message: turns.ChatMessage) -> None:
             _draw_activity(message)
 
 
-@st.dialog(CONFIRM_TITLE, dismissible=False)
-def _ask_to_confirm(session: turns.BrowserSession, summary: str) -> None:
+@st.dialog("Confirm", dismissible=False, width="medium")
+def _ask_to_confirm(session: turns.BrowserSession, pending: turns.PendingApproval) -> None:
     """Put the parked question to the customer, and carry their answer back.
 
     **The summary is printed verbatim and is never rebuilt here.**
@@ -342,7 +338,21 @@ def _ask_to_confirm(session: turns.BrowserSession, summary: str) -> None:
     because `st.dialog` is a fragment — the default rerun would redraw the
     dialog and not the transcript the answer just produced.
     """
-    st.code(summary, language=None)
+    # `st.dialog`'s own title is fixed at decoration time and cannot vary per
+    # call, so the question's real heading is the first thing inside it. The
+    # generic one above it cannot be removed either: Streamlit raises
+    # `StreamlitAPIException: A non-empty title argument has to be provided for
+    # dialogs`, measured with a throwaway app rather than assumed.
+    #
+    # So the modal carries "Confirm", then "Confirm this refund", then the
+    # gate's own "About to refund this whole order:" — three headings for one
+    # fact, which this project objects to everywhere else. It is kept anyway,
+    # and the reason is the action rather than the layout: dropping the middle
+    # one would leave the only per-tool signal inside a grey code block, and a
+    # person clicking quickly could approve a refund thinking it was a
+    # purchase. Neither is reversible. Repetition is the cheaper mistake.
+    st.subheader(pending.title, anchor=False)
+    st.code(pending.summary, language=None)
     decline, confirm = st.columns(2)
     if decline.button("Cancel", use_container_width=True, key="confirm-no"):
         with st.spinner("Cancelling…"):
@@ -474,7 +484,7 @@ if pending is not None:
     # deliberately the sentence without the summary. The summary belongs to the
     # dialog; printing it twice on one screen would be two things to approve.
     with st.chat_message("assistant"):
-        st.info(WAITING_FOR_YOU)
+        st.info(pending.waiting)
 
 picked = _draw_openers(session) if not session.transcript else None
 
@@ -499,7 +509,7 @@ if session.cap_reached:
 # page that is already in its answered state. Only one dialog may be open per
 # script run, which is exactly the number of questions the gate ever parks.
 if pending is not None:
-    _ask_to_confirm(session, pending.summary)
+    _ask_to_confirm(session, pending)
 
 asked = typed or picked
 if asked:
