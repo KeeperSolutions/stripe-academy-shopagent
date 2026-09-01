@@ -184,7 +184,7 @@ python scripts/create_schema.py   # exits 2 if a column or foreign key is missin
 # 7. verify
 docker compose exec db psql -U shopagent -d shopagent \
   -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
-pytest tests/ -v          # 1137 pass; add -m network for the ones that cost money
+pytest tests/ -v          # 1190 pass; add -m network for the ones that cost money
 ```
 
 Step 6 matters on any database that predates a schema change: `create_all`
@@ -272,12 +272,12 @@ python scripts/run_evals.py --only the_happy_path_reaches_a_payment_page
                                         # `tail`
 
 # tests
-pytest tests/ -v                        # 1180 collected: 1137 pass, 20 skip,
+pytest tests/ -v                        # 1233 collected: 1190 pass, 20 skip,
                                         # 23 deselected because they cost money
 pytest tests/ -m network                # the 4 embedding tests and the 3 chain runs;
                                         # these cost money and need uvicorn running
 pytest tests/ -m stripe                 # the 16 that call Stripe in test mode (free)
-pytest tests/ -m db                     # the 430 that need Postgres; they skip
+pytest tests/ -m db                     # the 460 that need Postgres; they skip
                                         # with a reason when it is unreachable
 ```
 
@@ -371,9 +371,31 @@ wrote. The chat input is disabled while that question is open, because a new
 message would silently void it. The payment link is rendered from state the
 shop wrote, never from the model's prose; the model is not given the URL at all.
 
+**The basket sits in the sidebar and is read from the shop, not from the
+conversation.** Lines, quantities and a total, re-read over HTTP on every draw
+and costing no model call — a panel rendered from the last message would keep
+showing a line that was removed two turns ago. Nothing can be taken out of it:
+changing a basket is something you ask for, the same reason a card has no Add
+button.
+
+Its one button is **Checkout**, and it is not a second route to payment. It
+dispatches `create_checkout` through the same guarded registry the model
+reaches, so the same gate parks the same question, built from the same
+`view_cart` read. What it skips is the model's decision to call the tool — which
+the customer has just made by clicking. It is disabled on an empty basket, while
+a confirmation is open, and once the spend cap is reached.
+
+**The page Stripe redirects back to reads your order and reports it.** Paid,
+still confirming, cancelled or refunded — a sentence for each, and none of them
+names anything from this repository. It writes nothing: only a signed delivery
+from Stripe moves an order to `paid`. It also says the conversation is waiting
+in the tab you came from, because the payment button opens a new one and
+following the page's own link starts a fresh session with an empty transcript.
+
 | Setting | Default | What it does |
 |---|---|---|
 | `UI_SPEND_CAP_USD` | `0.50` | what one browser session may spend on model calls. Checked at the door of a turn, never inside one, so the ceiling is the cap plus one turn — `run_tool_loop` is not opened for it. When it is reached the input is disabled and the conversation stays readable. |
+| `UI_BASE_URL` | `http://localhost:8501` | where this page runs, so the checkout pages can offer a way back to it. A third URL, separate from `APP_BASE_URL` and `COMMERCE_API_BASE_URL`, because the browser interface is a separate server on a separate port. |
 
 `.streamlit/config.toml` sets `toolbarMode = "minimal"`, which drops the Deploy
 button and the developer menu while keeping the rerun control — the one thing in
@@ -384,6 +406,13 @@ Measured end to end on D11: search, add to cart, confirm in the dialog, pay with
 order is paid" from `check_order_status` — a status written by a signed
 `checkout.session.completed` and by nothing else. Five webhook deliveries, all
 200. `docs/screenshots/d11-06-paid-end-to-end.png`.
+
+Driven again through the basket button in the follow-up: two items, **Checkout**
+from the sidebar, confirm, pay, and back — €244.98, `pending → paid`, five
+deliveries, $0.002371 for the whole conversation.
+`docs/screenshots/d11-07-basket-panel-with-checkout.png`,
+`d11-07b-button-reaches-the-gate.png` and
+`d11-08-success-page-reads-the-order.png`.
 
 ## Eval results
 

@@ -1674,6 +1674,131 @@ manufacture a defect report about code that is correct**, which is the same
 lesson as the `grep -c` entry above, arriving from the other direction on the
 same day.
 
+## Day 11 follow-up — findings
+
+**A page that asserts a fact it did not read goes stale faster than anybody can
+read it.** The success page told every returning shopper that "the order has not
+been marked paid yet", and it was right about the *session* and had never looked
+at the *order*. Measured on the live run: the browser landed on the page and the
+order was already `paid` — the five signed deliveries had been processed at
+09:05:11 and 09:05:14, which is inside the time it takes to focus a tab. So the
+one sentence a customer reads about their own money contradicted the shop, in
+the direction of alarming them. The fix is not a better sentence, it is a
+`SELECT`: the page reports the status and no longer has an opinion of its own.
+The D7 rule it looked like it was protecting is untouched and now asserted from
+three statuses rather than one — **reporting is not deciding**, and the page
+still writes nothing.
+
+**A leak sweep that drives one branch measures one branch.** The first version
+of the test forbidding project vocabulary on the customer-facing pages drove the
+happy path and passed. A deliberate mutation putting "the Day 8 webhook
+endpoint" into the unconfigured-Stripe branch survived it — which is the same
+shape as the leak being fixed, because the sentence that sat on this page for
+four days was in a branch nobody was rereading either. The test now drives all
+ten renderings the two pages can produce, and four separate leak mutations, one
+per rare branch, each fail it. **The branches that leak are the ones nobody
+looks at, so a sweep has to enumerate branches rather than sample them.**
+
+**Two of ten mutations survived, and only one of them was a weak test.** The
+guard refusing a checkout click past the spend cap could be deleted with every
+test still green, because the scenario built the session with a cap of nothing —
+so `send` refused the turn that fills the basket, the click met an *empty*
+basket, and it was refused for that reason instead. The scenario never reached
+the branch. Filling the basket first and lowering the cap onto it afterwards is
+what makes the mutation fail. This is the same defect the D10 entry records
+about a probe exercising a neighbouring operation, and it is now the third time
+this project has caught it: **a surviving mutation is a question about the
+scenario before it is a question about the assertion.**
+
+**The button had to be defended structurally, because behaviour cannot see the
+difference.** Dispatching `create_checkout` on `self._setup.registry` instead of
+`self._registry` passes every behavioural test there is — the gate still parks,
+the summary still comes from the cart, the order is still placed under the same
+locks. What it skips is `TracedRegistry` and `RecordingRegistry`, so a checkout
+started from the button would be missing from the trace and from the activity
+panel: invisible in exactly the surface built to make tool calls visible. One
+AST assertion on the single `dispatch` in `request_checkout` is what catches it,
+and it is the same mechanism `tests/test_lifecycle.py` uses on `transition()`.
+
+**The agreement between the button and the gate is one assertion and it is not
+the button's own.** `ui.CHECKOUT_TOOL` is asserted to be a member of
+`guardrails.CONFIRM_BEFORE`. The whole argument for a checkout button is that
+`create_checkout` is a tool the gate stops; the day that name falls out of the
+set — renamed, split, the gate narrowed — the button silently stops being a
+request for confirmation and becomes a second way to buy something, with nothing
+failing anywhere near it.
+
+**A docstring left behind by the step that superseded it is a lie with a
+citation.** `ui/app.py` opened with "**The confirmation gate is not wired up
+here** — that is step 3", written on step 2 and still there four commits later
+with the modal sitting sixty lines below it. Nothing failed, because nothing
+tests prose. It was found by reading the file in order to add to it, which is
+the only way it ever would have been.
+
+**The live run cost $0.002371 and the model never saw a payment link.** Five
+turns: a search, a two-item add, the follow-up turn the button's confirmation
+drove, and a status check. The order went `pending → paid` on a signed
+`checkout.session.completed`, the agent answered "Yes, your payment went
+through. The order status is `paid`" from `check_order_status`, and the basket
+panel emptied itself the moment the cart became an order — read from the shop,
+not from the message that said so.
+
+**A receipt this shop never sent was promised on the page for one commit.** The
+success page said "Stripe has emailed you a receipt", which reads like a fact
+and is a guess about a third party's configuration. Checked against the live
+payment rather than argued about: `charge.receipt_number` is **null** — Stripe
+sets it only once a receipt has actually been sent — and `receipt_email` is null
+on the PaymentIntent *and* on the Charge, because nothing in
+`payments/checkout.py` sets it. The shopper's address reaches
+`session.customer_details.email` and stops there. On top of that, test mode
+emails no receipts at all unless the dashboard is configured to, which is a
+setting this repository neither reads nor owns.
+
+Removing it turned up four more of the same kind, none of which needed an API
+call — they only needed reading the sentence as a promise instead of as prose:
+
+- **"This usually takes a few seconds."** True of a card and false of a
+  delayed-notification method, which settles in days. Which methods are offered
+  is a dashboard setting `payments/checkout.py` deliberately does not restrict,
+  so the page was making a claim about a configuration it had chosen not to
+  control.
+- **"You will be told the moment it lands."** There is no push of any kind. The
+  assistant answers when asked, through `check_order_status`.
+- **"If you were charged, the payment will be returned to your card."** Nobody
+  issues that refund. `paid -> cancelled` is not in the transition table, so a
+  cancelled order was never paid — and the replacement still does not claim the
+  opposite, because telling a charged shopper they were not charged is the one
+  answer this file already refuses to give.
+- **"You can pay for it whenever you like", and "say so in the conversation and
+  the items will be released."** The first is contradicted by this system's own
+  behaviour: a Checkout Session expires and `checkout.session.expired` cancels
+  the order and releases its stock. The second promised something the assistant
+  has no tool for — there are five commerce tools and none of them cancels an
+  order.
+
+The lesson is narrower than "check your copy". **Every one of these was written
+by somebody who knew the system, and each is a sentence about a part of it they
+were not looking at** — the dashboard, the transition table, the tool list, the
+expiry handler. Prose is the one artefact in this repository with no compiler
+and no test, so it is the place where a belief about a neighbouring module
+survives longest. The guard is now a word sweep over all ten renderings, and
+each of the seven promises was put back by mutation and fails it.
+
+**`pytest tests/` did not work on a fresh clone, and `python -m pytest tests/`
+did.** `test_the_handler_takes_no_body_parameter` imports `walk_api_routes` from
+`tests.test_api_auth` rather than keeping a second copy of the route walker,
+which needs the repository root on `sys.path` — and `python -m pytest` puts the
+working directory there while bare `pytest` does not. So the suite passed for
+whoever typed the first form and failed for whoever typed the second, which is
+the form the README gives. `pythonpath = ["."]` in `pyproject.toml` fixes it;
+both commands now return the same 1190 passed, 20 skipped, 23 deselected, and
+collection is unchanged at 1233 with no duplicated node ids.
+
+It is the same class of defect as D10's unpinned `langfuse`: **a repository that
+works on the machine it was written on.** Neither was visible to anybody who
+already had it working, and both were found by someone typing the documented
+command instead of the habitual one.
+
 ## Known gaps
 
 Every entry carries the day it was written. **Open** entries are grouped by
@@ -2148,15 +2273,43 @@ session layer and not at it, and there is no test that can be written for the
 part above. The honest statement is that the *shop* is the same and the
 *driver* is not.
 
-**A conversation does not survive a restart, or a reload.** *(D11.)* Everything
-one tab holds — the transcript, the `ConversationMemory` with its cart and order
-ids, the cost — is in `st.session_state`, which is per websocket session. A
-server restart, a hard refresh, or a customer returning by URL rather than by
-tab all produce an empty chat and an agent that cannot answer about an order it
-placed a minute earlier. The order is safe in Postgres; the *conversation's
-handle on it* is not. The payment round trip is fine because `st.link_button`
-opens a new tab, but that is one path being lucky rather than the state being
-durable.
+**A conversation does not survive a restart, or a reload.** *(D11, narrowed in
+the follow-up.)* Everything one tab holds — the transcript, the
+`ConversationMemory` with its cart and order ids, the cost — is in
+`st.session_state`, which is per websocket session. A server restart, a hard
+refresh, or a customer returning by URL rather than by tab all produce an empty
+chat and an agent that cannot answer about an order it placed a minute earlier.
+The order is safe in Postgres; the *conversation's handle on it* is not.
+
+The follow-up did not fix this and could not: it is a fact about where the state
+lives. What it did was stop the shop being silent about it. The success page now
+says the conversation is waiting in the tab it came from and offers its link as
+the fallback, spelling out that following it starts a fresh conversation.
+Measured on the live run — the original tab held its full transcript and its
+$0.002060 while the link opened a second session at $0.000000 beside it. The
+round trip is still fine because the payment button opens a new tab, which is
+one path being lucky rather than the state being durable.
+
+**The basket panel is one HTTP request per rerun, and Streamlit reruns a lot.**
+*(D11 follow-up.)* `BrowserSession.cart()` reads `GET /cart/{id}` every time the
+page is drawn, which is every click, every keystroke that submits, and every
+dialog answer. It costs no model call and that was the requirement it was
+written against — but against a remote API rather than localhost it is a round
+trip a person waits for, and there is no caching because a cached basket is the
+stale panel the live read exists to prevent. The shape of the fix is an
+invalidation signal from the tools that change a cart, which is state the
+conversation would have to carry and does not.
+
+**A second entry point into the checkout is kept in step by two assertions
+about this one button.**
+*(D11 follow-up.)* The basket button dispatches `create_checkout` through the
+same `GuardedRegistry` the model reaches, so nothing the gate protects is
+bypassed. That argument holds only while `create_checkout` is a tool the gate
+stops, which is asserted — `ui.CHECKOUT_TOOL` must be in
+`guardrails.CONFIRM_BEFORE` — and while `request_checkout` dispatches on
+`self._registry`, which is asserted structurally. Both are real guards. What
+neither covers is a *third* caller added later that reaches the tool some other
+way: the guards are written about this one button, not about the class of them.
 
 **There is no rate limit, only a spend cap.** *(D11.)* `UI_SPEND_CAP_USD` stops
 one browser session at $0.50 and is checked at the door of a turn, so the real
@@ -2164,13 +2317,17 @@ ceiling is the cap plus one turn. Nothing stops *many* sessions: a new tab is a
 new cap, and there is no per-IP or per-process limit anywhere. Adequate for a
 demo on one machine and not for anything reachable.
 
-**`ui/app.py` has no tests.** *(D11.)* Everything it renders is decided in
-`ui/session.py`, `ui/cards.py` and `ui/colors.py`, all of which are covered —
-and the page itself is exercised only by hand, with screenshots as the record.
-Two things about it *are* asserted by parsing the file: that it formats no money
-and performs no division, and that `ui/session.py` beneath it never imports
-Streamlit. Everything else about the page is claimed by a screenshot, which is
-evidence that something worked once rather than a test that it still does.
+**`ui/app.py` has no tests that run it.** *(D11.)* Everything it renders is
+decided in `ui/session.py`, `ui/cards.py` and `ui/colors.py`, all of which are
+covered — and the page itself is exercised only by hand, with screenshots as the
+record. What *is* asserted is asserted by parsing the file: that it formats no
+money and performs no division, that `ui/session.py` beneath it never imports
+Streamlit, and — added in the D11 follow-up — that the basket panel returns
+before its button on an empty or unreadable basket, that the button is disabled
+while a confirmation or the cap stands, and that the panel holds no control but
+the checkout. Those are real guards and every one of them was falsified by
+mutation, but they read structure rather than behaviour: they would all pass over
+a page that crashed on the first render.
 
 **The spend cap is per session and the cost meter is per process.** *(D11.)*
 `UsageTracker` is built per `BrowserSession`, so two tabs each get their own
@@ -2261,8 +2418,12 @@ write, so its safety rests on verification running before anything else rather
 than on being read-only. `PUBLIC_PATHS` in `tests/test_api_auth.py` records all
 three, and the sweep fails on a fourth nobody decided on.
 
-The success page also deliberately does not mark the order paid, and says so on
-the page: a redirect is a URL anybody can open.
+The success page also deliberately does not mark the order paid: a redirect is a
+URL anybody can open. It used to *say* that on the page, in the project's own
+words, and the D11 follow-up removed the sentence rather than the rule. It now
+reads the order's real status and reports it — which is a `SELECT` beside the
+place a write would go, and is asserted from three statuses rather than argued
+for in prose.
 
 ---
 

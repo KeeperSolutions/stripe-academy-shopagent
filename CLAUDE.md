@@ -1449,6 +1449,121 @@ ${cap}"` and rendered the cost inside a maths block with the cap swallowed
 entirely. Found by looking at the page, not by a test — which is the honest
 account of it and the reason the screenshots are taken rather than assumed.
 
+**The basket panel has one button, and it is not a second route to payment.**
+D11 decided the panel would be read-only, on the argument that a second way to
+reach a charge contradicts a demo built to show an agent. The follow-up reverses
+that for exactly one implementation, and *which* implementation is the whole of
+the reasoning. Refused: a button calling `POST /orders` and
+`POST /orders/{id}/checkout` from the page — that really is a second route, past
+the gate, past the memory, with no summary anybody approved. Also refused: a
+button that types "proceed to checkout" into the conversation as though the
+customer had; it adds no route but inherits the variance D10 measured and D11
+hit live, where the model answers a request to check out with prose instead of a
+tool call, so the button would sometimes do nothing.
+
+What is built instead dispatches `create_checkout` through
+`self._registry` — the same `RecordingRegistry(TracedRegistry(GuardedRegistry))`
+the model's loop is handed. The gate parks the same question, built from the
+same `view_cart` dispatch and rendered through the same `money.format_amount`;
+`_spend` still re-reads the basket and refuses an approval given for a different
+one; the order is still placed under `place_order`'s locks. **The one thing
+bypassed is the model's decision to call the tool, and the customer has just
+made that decision by clicking.**
+
+Two assertions carry the argument, because behaviour cannot. `ui.CHECKOUT_TOOL`
+must be a member of `guardrails.CONFIRM_BEFORE` — the day that name falls out of
+the set the button silently stops being a request for confirmation. And
+`request_checkout` must contain exactly one `dispatch`, on `self._registry`:
+`self._setup.registry` is the `GuardedRegistry` itself and passes every
+behavioural test, while skipping the tracing and the recording, so a checkout
+started from the button would be missing from the trace and from the activity
+panel — invisible in exactly the surface built to make tool calls visible. That
+is an AST test, the mechanism `tests/test_lifecycle.py` uses on `transition()`.
+
+**The panel reads the shop on every draw and the transcript never.** A
+`ChatMessage` holds what was true when it was written; a basket does not stay
+that way, and another client holding the API key can change one — the gate binds
+the model, not the shop. `BrowserSession.cart()` therefore issues `GET
+/cart/{id}` through `ToolSetup.api`, which is the *same* client the five
+commerce tools were built over, using `memory.cart_id`, which the model has
+never seen and never will. It costs no model call, which is what makes it safe
+to redraw on every rerun; the cost is one HTTP round trip per rerun, recorded as
+a gap rather than cached away, because a cached basket is the stale panel the
+live read exists to prevent.
+
+Nothing is removed from the panel. There is no per-line control for the same
+reason a product card has no Add button: changing what is in a basket is
+something the customer asks for, and a panel that could take a line out would be
+the second shopping interface the whole layout argues against. The one button is
+disabled on an empty or unreadable basket — a checkout over a basket nobody
+could read is a button whose total is unknown — and while a confirmation is
+parked or the spend cap is reached, because the follow-up turn an answer drives
+is a model call.
+
+**`ToolSetup.api` exists for the panel and carries `memory`'s limit.** The
+commerce client is exposed on the setup for the same reason the memory is, and
+under the same rule: nothing there is put in front of the model. A second client
+would be a second connection pool, and a second cart id would be a panel drawing
+an empty basket beside a conversation that had filled one.
+
+**`ui_base_url` is a third URL and not a reuse of either other one.**
+`app_base_url` is where a browser reaches the commerce API, `commerce_api_base_url`
+is where the agent process reaches it, and this is the Streamlit process — a
+separate server on a separate port, which can move without either of them
+moving. It is used in one place, and what it produces is described on the page
+as the fallback it is: the payment button opens Stripe in a new tab, so the
+conversation is almost always still open in the tab behind, and following the
+link starts a *new* browser session with an empty transcript. Measured on the
+live run — the original tab kept its transcript and its $0.002060 while the link
+opened a second session at $0.000000 beside it.
+
+**The checkout pages report an order's status and still decide nothing.** D7's
+rule is unchanged and is the reason these pages are unauthenticated at all: they
+read and never write, and only a signed delivery from Stripe may move an order
+to `paid`. What changed is that the success page used to *assert* a status it
+had never read — "the order has not been marked paid yet" — which was true of
+the session and a guess about the order, and went stale in about a second:
+measured on the live run, the five deliveries were processed inside the time it
+takes to focus a tab, so the page contradicted the shop about the customer's own
+money. Every branch is now a `SELECT`, every status has its own sentence
+including the two a shopper is unlikely to arrive on, and
+`test_reading_the_success_page_never_moves_an_order` asserts the rule from three
+of them rather than one.
+
+**Nothing on those two pages names this repository.** They are the only thing a
+customer reads who never opened the code, and the old text sent them a
+development day by number, the word "webhook", and an HTTP route to call. None
+of that is a fact about their order. The guard is a sweep over *every* rendering
+either page can produce — ten of them, including the unconfigured-Stripe branch
+and the unreadable-session branch — because the first version drove the happy
+path only and a mutation putting "the Day 8 webhook endpoint" into a rare branch
+survived it. **The branches that leak are the ones nobody rereads, which is how
+the original sentence lasted four days.**
+
+**And nothing on them promises what this system does not control.** A second
+sweep, over the same ten renderings, for the words a promise is made of. Five
+sentences were removed for failing it and each named a part of the system its
+author was not looking at: an emailed receipt (the dashboard), a settlement time
+in seconds (the payment methods this code deliberately does not restrict), a
+notification (there is no push — `check_order_status` answers when asked), a
+refund on a cancelled order (`paid -> cancelled` is not in the transition
+table, so nobody issues one), and an order the customer could pay for "whenever
+you like" or cancel by asking (the expiry handler closes the first, and there is
+no cancel tool for the second).
+
+The receipt is the one that was **measured rather than reasoned about**, and it
+is the reason the rule is a sweep and not a review: against the live payment,
+`charge.receipt_number` is null — Stripe sets it only once a receipt has
+actually been sent — and `receipt_email` is null on the PaymentIntent and on the
+Charge, because nothing in `payments/checkout.py` sets it. The shopper's address
+reaches `session.customer_details.email` and stops there.
+
+Prose is the only artefact in this repository with no compiler and no test,
+which is where a belief about a neighbouring module survives longest. A word
+list rather than a sentence list, because the sentences get rewritten and the
+promises are what must not come back.
+
+
 ## Commands
 
 **The runnable command list lives in `README.md`, and deliberately only there.**
